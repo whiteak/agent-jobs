@@ -52,14 +52,14 @@
       startup (interrupted job records + `taskqueue.startup`), `taskqueue.job_finished` in
       `process_job`, the card on the project and plan pages, `POST /queue/<folder>`,
       project-record settings (which agent runs tasks, best-of-N on/off).
-- [ ] `web/tests/test_u04b_queue.py`: queue from an approved plan, prompt content, best-of-N rule,
+- [x] `web/tests/test_u04b_queue.py`: queue from an approved plan, prompt content, best-of-N rule,
       notes check, estimate, milestone progress, stop vs skip, cutoff, restart recovery, the
       branch keeping, the card HTML, the routes — plus fake-agent runs through `process_job`
       (dependency order + chained commits, checks of a task, a failure that stops vs skips, the
       "don't start after" time, and the notes note in the job record).
-- [ ] Full suite passes with the gate's command; smoke-serve the board on a free port (never
+- [x] Full suite passes with the gate's command; smoke-serve the board on a free port (never
       8090) and click the queue with curl.
-- [ ] AGENT_REPORT.md section for this job.
+- [x] AGENT_REPORT.md section for this job.
 
 ---
 

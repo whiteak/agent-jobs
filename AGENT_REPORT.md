@@ -148,3 +148,154 @@ running and port 8123 is free.
    the wrap is used, not that podman runs. The podman path itself is untouched; a real board
    sends these same commands through `jail/run-local.sh sandbox-run`.
 - Nothing installed, no network used, stdlib only, no CDN. No test deleted, skipped or weakened.
+
+---
+
+## Job 08 — Upgrade 4b: run the approved plan as a queue
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md has the findings and the step list for this job, all ticked.
+
+Commits in this job (on top of `5b3efad`, job 07's 4a work):
+
+- `4b205d6` job 07 residue: the 4a PLAN.md left uncommitted in the shared copy (committed as-is
+  so this job's diffs stay clean)
+- `e092197` U04b: `web/taskqueue.py` + the `jobboard.py` hooks + the project/plan page card
+- `e51099b` U04b: the 61 in-process tests; fixes they found (the queue lock deadlocked
+  `action → start_next`, a job page follow-up link, the mode `<select>`)
+- `c695c1a` U04b: the fake-agent queue runs (dependency order, chained commits, task checks,
+  stop vs skip, best-of-N, the notes check, the cutoff, a board that died mid-task)
+- `00bbc17` U04b: pressing **Resume** past the "don't start new tasks after" time clears that
+  time — the card says "press Resume to carry on", so pressing it has to carry on
+
+### Files changed
+
+| File | What it is |
+| --- | --- |
+| `web/taskqueue.py` | **new** (643 lines, `# U04b`) — the glue between an approved plan and the board's worker. It does **not** reimplement the queue: the state machine is the given `agentjobs_upgrades/plan.py` (`Queue`, `load_plan`, `order`, `next_task`, `mark`, `recover`, `set_cutoff`, `progress`, `job_prompt`), already unit-tested in `tests/test_rest.py`. What is new: the queue file `QUEUES/<folder>.json`, the task prompt, `start_next` / `job_finished` / `startup` / `action`, the AGENT_NOTES check, the estimate, the card HTML. |
+| `web/jobboard.py` | +59 lines: `QUEUES` (env `JOBBOARD_QUEUES`, outside anything the sandbox mounts); `check_record` refuses a task record that lies about `task_id` / `task_try` / `notes_before`; `worker()` now runs `mark_interrupted()` then `taskqueue.startup(...)`; `process_job` calls `taskqueue.job_finished(m, queue_ctx())`; the queue card on `/project/<folder>` and `/plan/<folder>`; one route `POST /queue/<folder>` for every button; `queue_ctx()` hands the board's tools to taskqueue (no circular import). |
+| `web/tests/test_u04b_queue.py` | **new**, 72 tests (61 in-process + 11 that run real jobs through `process_job` in a child process with the fake agent). |
+| `PLAN.md` | this job's findings and steps, all ticked. |
+
+Nothing else was touched: `agentjobs_upgrades/*`, `planning.py`, `attempts.py`, `safegit.py`,
+`upgrades.py`, `dashboard.py` and every earlier test file are unchanged, and the `# JAIL:`,
+`# U01`, `# U05`, `# U07`, `# VOICE` blocks all still work (the full suite runs them).
+
+### How each requirement is met
+
+1. **"Approve plan" turns the tasks into queued jobs, in dependency order.** The approve button
+   writes `QUEUES/<folder>.json` from the **approved record** (never from the agent-writable
+   `tasks.json` in the folder), in `plan.order()` order, and it still runs nothing — 4a's
+   "Plan approved. Nothing runs until you start the tasks." is unchanged; the card then offers
+   **Start the tasks**. Every task job is `plan.job_prompt`: a 10-line summary of the outline,
+   that task's milestone taken from the project's `ROADMAP.md` (falling back to the milestone and
+   its task titles if there is no ROADMAP), the task prompt, its acceptance criteria, and "Read
+   AGENT_NOTES.md first… add 2–5 lines of lessons when you finish", plus where the task sits
+   ("You are task 2 of 3 in a plan Jason already approved").
+2. **One job at a time, each from the previous job's final commit.** `start_next` queues exactly
+   **one** job; the board's single worker is what keeps them one at a time, so a task also waits
+   politely behind any other job on the board. The new job is a follow-up of the previous task's
+   job (`parent`), runs in the same folder on `agent/<folder>`, and the queue records that job's
+   `base` commit at the start and its `end` commit at the finish — the test asserts
+   `t2.base == t1.end` and that the t2 job's own `git_start` is that same commit. Checks (from
+   the task itself, `checks_source: "the approved plan"`, or the project's `AGENT_CHECKS.json`),
+   fix rounds, checkpoints and the watchdog are the normal job path — nothing new there. Tasks of
+   size **M**, or a task that already failed once, get best-of-N when the project ticked "Try big
+   tasks…": the record simply carries `attempts`, which is how U05 is reached.
+3. **A task fails: stop (default) or skip its dependents.** `plan.Queue.mark` does it; the card
+   shows `failed` and `skipped` plainly, the job's timeline says "Task t2 failed, so the queue
+   stopped…" or "…3 task(s) that depend on it were skipped", and **Run it again** puts one task
+   back in the queue. A task you **stopped** yourself goes back as `interrupted` and the queue
+   pauses instead of blaming it.
+4. **The queue is on disk and survives a restart.** On board start `mark_interrupted()` marks the
+   running job `interrupted` (as before) and `taskqueue.startup()` turns the task that was running
+   into `interrupted`, notes the checkpoint it continues from (its last checkpoint commit is
+   stored as `resume_from` and named on the timeline), and starts it again **resuming that job's
+   session** — the two-boot test kills the board mid-task and shows the task running twice, the
+   second run with `task_try 2` and `resume` set. A `paused`, `stopped` or `ready` queue is never
+   started by a restart.
+5. **The project page card.** `Tasks · <name>`: status line (`running`, `paused`, `stopped after
+   a failed task`, …), `3 of 5 tasks done`, `1 failed or skipped`, `2 left - about 1h 25m`, a
+   progress bar, **Now:** with a link to the running task's job (or why nothing is starting),
+   milestone lines (`M1 - it runs: 1 of 2 tasks`), the task table (state, try number, its job,
+   Run it again), the buttons **Start the tasks / Pause / Resume / Cancel**, and the settings form:
+   which agent runs the tasks, **If a task fails** (Stop the queue / Skip the tasks that depend on
+   it), **Don't start new tasks after** `06:30`, and the best-of-N tick.
+6. **The AGENT_NOTES.md check.** Before a task's job starts the queue stores the hash of
+   `AGENT_NOTES.md`; when the job ends and the file is unchanged, the job record gets
+   `notes_note` ("AGENT_NOTES.md was not changed by this task - no lessons for the tasks after
+   it.", or "No AGENT_NOTES.md in the project folder - …"), the line goes on the job's timeline
+   and shows on the job page.
+
+### Verified
+
+- Gate command, as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 550 tests in 178.471s` / `OK`** (baseline before this job: 478 tests, OK; this job
+  adds 72). No test deleted, skipped or weakened; the earlier suites (4a's 35, U05's 38,
+  `test_rest.py`, the jail and dashboard ones) pass untouched.
+- The new module alone: `python3 -W ignore -m unittest tests.test_u04b_queue` →
+  `Ran 72 tests in 37.790s / OK`. Its `Runs` and `Restart` classes start a child process with
+  `JOBBOARD_JAIL=host JOBBOARD_FAKE=1` and drive the real `process_job`, so dependency order,
+  chained commits, a task's own checks failing the task, stop vs skip, best-of-N with a real
+  winner, the notes note and a board killed mid-task are all exercised end to end, not mocked.
+- Served the real board once on port **8123** with its own state folders (`JOBBOARD_PORT=8123
+  JOBBOARD_JOBS/WORK/PLANS/QUEUES=…`), seeded two projects (one `ready` queue, one `stopped` with
+  a failed task and its job record) and curled: `/projects` lists both; `/project/notes-a` shows
+  `ready to start`, `M1 - it runs: 0 of 2 tasks`, `3 left - about 1h 25m`, `Start the tasks`,
+  `Don't start new tasks after`; `/project/notes-b` shows `stopped after a failed task`,
+  `1 of 3 tasks done`, `1 failed or skipped`, `Run it again`; `/plan/notes-a` carries the same
+  card; the job page shows `task t1 of …` and the missing-lessons line; `POST
+  /queue/notes-a act=setup` answered `303 → /project/notes-a?note=saved` and the queue file on
+  disk kept `on_fail: skip` and the `06:30` cutoff. Nothing started by itself. Server stopped and
+  the port verified closed.
+
+### Try it by hand
+
+1. `cd web && JOBBOARD_PORT=8123 python3 jobboard.py`, open the printed
+   `http://127.0.0.1:8123/?t=…` link.
+2. Projects → make a plan for a project → **Approve plan**. The project page now has the
+   **Tasks** card: the tasks in dependency order, all `waiting`, and "Start the tasks".
+3. Press **Start the tasks**. The first task becomes `running now` with a link to its job; when
+   that job finishes, the next one is queued automatically (one at a time — a task waits behind
+   anything else already on the board).
+4. Watch the card: `M1 - it runs: 1 of 2 tasks`, `2 left - about 1h 05m`, and **Now:** with the
+   current task. Open a task's job: its page says `task t2 of <project>`; after a retry also
+   `run 2 of this task`; if the agent wrote no lessons, a line says so.
+5. Let a task fail: with **Stop the queue** the rest wait and the card says the queue stopped;
+   with **Skip the tasks that depend on it** they go `skipped` and unrelated tasks carry on.
+   **Run it again** under a failed, skipped or interrupted task puts just that task back.
+6. **Pause** stops new starts (the running task finishes), **Resume** carries on, **Cancel** also
+   stops the job that is running. Set **Don't start new tasks after** `06:30`: past that time the
+   card says "No new task starts after 06:30 - press Resume to carry on", and Resume clears it.
+7. Restart the board (`Ctrl-C`, start it again) while a task runs: the job says `Interrupted`,
+   the card shows the task starting again (its job is resumed by session id, and the timeline
+   names the checkpoint it continues from). A queue you had paused stays paused.
+
+### Unfinished / assumed
+
+- **Approve does not launch.** 4a's rule ("Nothing runs until you start the tasks") and 4b's
+  wording ("Approve plan turns the tasks into queued jobs") pull apart, so approving writes the
+  queue — tasks `queued`, in dependency order, on disk — and the card's **Start the tasks**
+  launches it. Both suites' wording is kept.
+- **Restart re-runs the interrupted task in the folder as it stands** (resuming its session), and
+  records + displays the last checkpoint commit as where it left off. It does **not** hard-`reset`
+  the folder to that commit: an agent may have committed work after the last checkpoint, and
+  rolling back is U02's explicit button, not something to do silently. Say the word if you want
+  the automatic rollback instead.
+- **Best-of-N count and early stop come from the board settings** (`attempts` 2–4, `stop_early`),
+  not from a per-task choice: a size-M task (or a task's 2nd run) gets N attempts when the
+  project ticked the box. U05's rule is untouched, so the rest of the attempts are skipped only
+  when the **first** attempt passed cleanly — a task that already failed once really does use all
+  N (that is the point of the box).
+- The **time-left estimate** is rough on purpose: S = 20 min, M = 45 min (what the planner prompt
+  promises), recalibrated once real tasks have finished with measured seconds, and a best-of-N task
+  counts one try per attempt.
+- The cutoff is stored as the **next** occurrence of that clock time (`plan.set_cutoff`), so
+  "06:30" pressed at 22:00 means tonight; after it passes, nothing new starts until Resume or a
+  new time.
+- Only one queue per project, and it follows the approved record. Editing the plan after starting
+  the tasks means approving again; a queue that is `running`, `paused` or `stopped` is never
+  silently replaced — approving again replaces only a `finished`/`ready` one.
+- No network, no installs, stdlib only. `~/agent-sandbox` untouched: every test uses its own temp
+  `HOME`/state folders, and the smoke run used its own folders under `/tmp` and port 8123.
