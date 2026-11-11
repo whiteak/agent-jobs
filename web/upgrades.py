@@ -600,8 +600,8 @@ def handover(m, root, last_error=""):
 
 # ------------------------------------------------------------------ status + HTML
 
-LABELS = {"passed": "Done ✓", "unverified": "Not verified", "needs_review": "Needs review",   # U07 badges
-          "stuck": "Stuck – needs a look", "failed": "Failed ✗", "aborted": None}
+LABELS = {"passed": None, "unverified": "Done – not verified", "needs_review": "Needs review",
+          "stuck": "Stuck – needs a look", "failed": "Checks failed", "aborted": None}
 
 
 def overlay_status(s, m):
@@ -620,7 +620,7 @@ def overlay_status(s, m):
     if b and s["state"] in ("FINISHED", "FAILED") and m.get("status") != "safety_stop":
         s["verify"] = b
         s["tone"] = b.get("colour", "")
-        lab = LABELS.get(v.get("status"))
+        lab = b.get("text") if v.get("status") == "passed" else LABELS.get(v.get("status"))
         if lab:
             s["label"] = lab[:60]
         if s["state"] == "FAILED" and v.get("status") in ("failed", "stuck"):
