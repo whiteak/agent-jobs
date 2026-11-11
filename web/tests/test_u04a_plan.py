@@ -673,6 +673,21 @@ class Pages(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("already exists", html)
 
+    def test_a_folder_that_is_already_a_project_is_not_started_again(self):
+        """Picking an existing folder is how you plan inside it - but a folder that already has a
+        project record here must not have that record (outline, plan, approval) thrown away."""
+        write_plan(jobboard.WORK / self.folder, GOOD_PLAN)
+        planning.approve(jobboard.PLANS, planning.load(jobboard.PLANS, self.folder),
+                         jobboard.WORK / self.folder, GOOD_PLAN)
+        code, html, _ = self.fetch("/project/new", {"name": "the same thing", "kind": "web",
+                                                    "folder": self.folder, "outline": "Something else."})
+        self.assertEqual(code, 400)
+        self.assertIn("is already a project here", html)
+        rec = planning.load(jobboard.PLANS, self.folder)
+        self.assertEqual(rec["name"], "My Notes")
+        self.assertEqual(rec["outline"], "A notes app that works offline.")
+        self.assertTrue(rec["approved_at"])            # the approved plan is still there
+
     def test_a_missing_outline_is_refused_with_what_was_typed_kept(self):
         code, html, _ = self.fetch("/project/new", {"name": "half-app", "kind": "web", "outline": ""})
         self.assertEqual(code, 400)

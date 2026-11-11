@@ -2263,6 +2263,11 @@ class H(http.server.BaseHTTPRequestHandler):
             fields, errs = planning.project_form(form)
             if not errs and fields["new"] and (WORK / fields["folder"]).exists():
                 errs = ["That folder already exists. Pick it from the folder list instead."]
+            if not errs and planning.load(PLANS, fields["folder"]):
+                # one record per folder: starting it again would throw away that project's
+                # outline, its plan and what Jason approved
+                errs = [f"{fields['folder']} is already a project here. Open it and change its "
+                        f"outline there instead of starting it again."]
             if errs:
                 return self.send(render(header() + planning.new_project_body(folders(), fields, errs)), code=400)
             note = ""
