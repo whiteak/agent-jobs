@@ -371,9 +371,12 @@ def plan_prompt(plans, folder, errors=None):
     return planner_prompt(rec, errors)
 
 
-def plan_finished(m, *, plans, work, new_job, session_of=lambda jid: None, job_dir=None):
+def plan_finished(m, *, plans, work, new_job, session_of=lambda jid: None, job_dir=None,
+                  requeue=True):
     """A planning job ended: look at what it wrote. An unusable plan goes back to the planner
-    once, automatically, with the errors in its prompt. Returns the retry's job id or None."""
+    once, automatically, with the errors in its prompt. Returns the retry's job id or None.
+    requeue=False is for a job that was refused before it ran (see jobboard): the project still
+    has to stop saying the planner is working, but a job that never ran queues nothing."""
     if not m or not m.get("plan_job") or m.get("kind") == "bench":
         return None
     folder, jid = m.get("folder"), m.get("id")
@@ -400,6 +403,10 @@ def plan_finished(m, *, plans, work, new_job, session_of=lambda jid: None, job_d
     if m.get("plan_retry"):
         tl("The plan is still not valid: " + "; ".join(errs[:5]))
         return None
+    if not requeue:
+        tl("The plan job never started (the board refused its record), so nothing was planned. "
+           "Still to fix: " + "; ".join(errs[:5]))
+        return None
     child = new_job(m["mode"], folder, planner_prompt(rec, errs), m.get("offline", False),
                     resume=session_of(jid), parent=jid, extra=plan_extra(retries=1))
     tl(f"The plan was refused ({len(errs)} problems) - the planner got them back "
@@ -416,6 +423,8 @@ def state_line(st):
     if st["state"] == "running":
         return ("The planner is working on it.", "mut")
     if st["state"] == "invalid":
+        if st["missing"]:      # no file at all: "0 problems" would be a lie and no use
+            return ("The planner wrote no tasks.json - press Make a plan again.", "bad")
         return (f"The plan is not usable yet ({len(st['errors'])} problem"
                 f"{'s' if len(st['errors']) != 1 else ''}).", "bad")
     if st["state"] == "approved":

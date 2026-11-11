@@ -17,14 +17,15 @@ r"""Upgrade 4a: an outline becomes a plan Jason can check before anything runs.
 * State    - none | running | draft | invalid | approved; approval stored outside the folder;
              a plan edited after approval is a draft again.
 * Finished - plan_finished: a good plan becomes a draft and nothing runs; a refused plan goes
-             back to the planner once, with the errors in its prompt, and not a second time.
+             back to the planner once, with the errors in its prompt, and not a second time; a
+             plan job the worker refused (requeue=False) leaves the project waiting for nothing.
 * Run      - a canned planner output through the fake agent in a child process
              (JOBBOARD_JAIL=host + JOBBOARD_FAKE=1): the plan lands in the folder and on the
              board; a refused plan gets exactly one re-plan.
 * Pages    - the real handler served in-process on its own port: the new-project page and its
-             POSTs, the project page ("Make a plan" queues a job, runs nothing), the plan
-             review page and its one POST (save / approve / move / drop / add), the guard and
-             unknown projects.
+             POSTs, the project page ("Make a plan" queues a job, runs nothing; a job the worker
+             refused says so instead of "the planner is working"), the plan review page and its
+             one POST (save / approve / move / drop / add), the guard and unknown projects.
 
 Nothing here calls the model server (127.0.0.1:8080) or starts a real agent.
 """
@@ -340,6 +341,13 @@ class State(unittest.TestCase):
         self.rec["plan_status"] = "running"
         self.assertEqual(self.st()["state"], "running")
 
+    def test_a_planner_that_wrote_no_file_is_said_plainly(self):
+        self.rec["plan_status"] = "invalid"        # plan_finished says this when tasks.json is absent
+        line, cls = planning.state_line(self.st())
+        self.assertEqual(cls, "bad")
+        self.assertIn("no tasks.json", line)
+        self.assertNotIn("0 problem", line)        # never "the plan has 0 problems"
+
     def test_a_valid_plan_is_a_draft_that_nothing_runs(self):
         write_plan(self.root, GOOD_PLAN)
         st = self.st()
@@ -404,14 +412,14 @@ class Finished(unittest.TestCase):
         m.update(kw)
         return m
 
-    def finish(self, m):
+    def finish(self, m, **kw):
         def new_job(mode, folder, job, offline, resume=None, parent=None, extra=None):
             self.started.append({"mode": mode, "folder": folder, "job": job, "resume": resume,
                                  "parent": parent, "extra": extra})
             return {"id": "20261111-120001-beef", "status": "queued"}
         return planning.plan_finished(m, plans=self.plans, work=self.work, new_job=new_job,
                                       session_of=lambda jid: "fake-12345678",
-                                      job_dir=lambda jid: self.jdir)
+                                      job_dir=lambda jid: self.jdir, **kw)
 
     def test_any_other_job_is_left_alone(self):
         self.assertIsNone(planning.plan_finished({"id": "x", "folder": "my-app"}, plans=self.plans,
@@ -446,6 +454,15 @@ class Finished(unittest.TestCase):
         self.assertEqual(self.started, [])
         self.assertEqual(planning.load(self.plans, "my-app")["plan_status"], "invalid")
         self.assertTrue(any("no tasks.json" in e["text"] for e in timeline(self.jdir)))
+
+    def test_a_plan_job_that_never_ran_queues_nothing_behind_itself(self):
+        """jobboard calls this with requeue=False when the worker refused the record: the project
+        must stop waiting for a job that never started, and nothing may be queued for it."""
+        write_plan(self.work / "my-app", [T("t1", acc=())])   # invalid: no acceptance criteria
+        self.assertIsNone(self.finish(self.rec(), requeue=False))
+        self.assertEqual(self.started, [])
+        self.assertEqual(planning.load(self.plans, "my-app")["plan_status"], "invalid")
+        self.assertTrue(any("never started" in e["text"] for e in timeline(self.jdir)))
 
     def test_a_record_for_a_project_that_was_never_registered_is_still_kept(self):
         write_plan(self.work / "my-app", GOOD_PLAN)
@@ -676,6 +693,25 @@ class Pages(unittest.TestCase):
         self.assertIn("Notes, offline.", m["job"])
         self.assertEqual(planning.load(jobboard.PLANS, self.folder)["plan_status"], "running")
         self.assertIn("The planner is working on it", self.fetch(f"/project/{self.folder}")[1])
+
+    def test_a_plan_job_the_worker_refused_leaves_nothing_waiting(self):
+        """The worker re-checks every queued record and may refuse one. The project must then say
+        the plan was not made, not go on claiming "the planner is working on it"."""
+        rec = planning.load(jobboard.PLANS, self.folder)
+        rec["plan_status"] = "running"
+        planning.save(jobboard.PLANS, rec)
+        m = jobboard.new_job("local-qwen", self.folder, "Plan the app", False,
+                             extra=dict(planning.plan_extra(), plan_retry=99))   # over 3: refused
+        self.assertFalse(jobboard.process_job(m["id"]))
+        done = jobboard.load_meta(m["id"])
+        self.assertEqual(done["status"], "failed")
+        self.assertIn("Refused", done["fail_note"])
+        self.assertNotEqual(planning.load(jobboard.PLANS, self.folder)["plan_status"], "running")
+        html = self.fetch(f"/project/{self.folder}")[1]
+        self.assertNotIn("The planner is working on it", html)
+        self.assertIn("no tasks.json", html)
+        mine = [mm for _, mm in jobboard.all_job_dirs() if mm["folder"] == self.folder]
+        self.assertEqual([mm["status"] for mm in mine], ["failed"])   # nothing queued behind it
 
     def test_the_outline_is_saved_and_shown_again(self):
         code, html, url = self.fetch(f"/project/edit/{self.folder}", {"outline": "Notes with tags",

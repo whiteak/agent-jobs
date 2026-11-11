@@ -264,6 +264,16 @@ def started_text(mode):
     """U07: the timeline's 'started' row names the agent that ran, in its own short words."""
     return f"Started ({AGENT_NAMES.get(mode, mode)})"
 
+def plan_hook(m, requeue=True):
+    """U04a: after a planning job, look at the plan it left. requeue=False on the paths where the
+    record was refused before anything ran: the project must stop saying "the planner is working
+    on it", and a job that never ran must not queue another one behind itself."""
+    try:
+        planning.plan_finished(m, plans=PLANS, work=WORK, new_job=new_job,
+                               session_of=session_of, job_dir=job_dir, requeue=requeue)
+    except Exception:
+        pass
+
 def process_job(name):
     """Take one queued record (by directory name) through to finished. The
     safety re-check happens here, right before anything runs: a record that
@@ -276,6 +286,7 @@ def process_job(name):
         m.update(status="failed", finished=time.time(),
                  fail_note=f"Refused: the job record failed the safety check ({problem})")
         save_meta(m, name)
+        plan_hook(m, requeue=False)   # U04a: a project never waits on a job that was refused
         return False
     if m.get("kind") == "bench":
         # mark it running BEFORE starting the runner: Stop and the live pills
@@ -316,6 +327,7 @@ def process_job(name):
         if not ok:
             m.update(status="failed", finished=time.time(), fail_note=jailcfg.selftest_failure_note(out))
             save_meta(m, name)
+            plan_hook(m, requeue=False)   # U04a: a project never waits on a job that was refused
             try: notify_finished(m, False)
             except Exception: pass
             phone_notify(m)   # U09b
@@ -328,11 +340,8 @@ def process_job(name):
     run_planned(m, name)                           # U01/U05: agent + watchdog + gate, or N fresh attempts
     m = load_meta(name)
     maybe_auto_attempts(m)                         # U05: "try fresh attempts" without the button
-    try:   # U04a: a planning job's plan is checked here; an unusable one goes back once, by itself
-        planning.plan_finished(m, plans=PLANS, work=WORK, new_job=new_job,
-                               session_of=session_of, job_dir=job_dir)
-    except Exception:
-        pass
+    # U04a: a planning job's plan is checked here; an unusable one goes back once, by itself
+    plan_hook(m)
     try:   # U04b: the queue records this task (and whether it left its lessons) and queues the next
         taskqueue.job_finished(m, queue_ctx())
     except Exception:
