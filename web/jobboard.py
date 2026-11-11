@@ -2,8 +2,10 @@
 """Job board: a local web page for the sandboxed coding agent.
 
 Start:  python3 ~/agent-sandbox/web/jobboard.py      then open the link it prints.
-Listens on 127.0.0.1:8090 only. Every request needs the secret key from the printed link
-(kept as a cookie), so other websites open in the browser cannot start jobs.
+Listens on 127.0.0.1:8090 only - unless you turn on phone access on the Access page (upgrade
+9a), when it listens on one more address and everything that is not this PC logs in with a
+password. Every request also needs the secret key from the printed link (kept as a cookie), so
+other websites open in the browser cannot start jobs.
 
 Jobs run one at a time (the GPU serves one stream) through ~/agent-sandbox/agent, inside the
 rootless Podman sandbox. Job records live in ~/agent-sandbox/state/jobs/<id>/ - OUTSIDE the
@@ -30,6 +32,8 @@ import taskqueue  # U04b: an approved plan runs as a queue of tasks, one job at 
 import visioncheck  # U06: screenshot the app and ask the model whether it looks right
 import androidcheck  # U06b: the same for an Android app - install it and start it on a device
 import decisions  # U08: Approve & merge / Ask for changes / Reject, for a person at the page only
+import phoneaccess  # U09a: phone access (off by default), the password login, the Access page
+import phonelayout  # U09a: the phone layout, the home-screen manifest and its icons
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -62,6 +66,12 @@ SETTINGS_FILE = Path(os.environ.get("JOBBOARD_SETTINGS") or (SANDBOX / "state" /
 # U09b: phone alerts (ntfy). The server is empty by default = off, and the topic starts
 # random. Kept next to the board settings, outside anything the sandbox can write.
 NOTIFY_FILE = Path(os.environ.get("JOBBOARD_NOTIFY") or (SANDBOX / "state" / "notify-settings.json"))
+# U09a: phone access. OFF by default, so the board keeps listening on 127.0.0.1 only; the file
+# holds the listen address to take on the next restart and only a salted PBKDF2 hash of the
+# password. Same rule as every other record: outside anything the sandbox mounts, so a job can
+# neither turn the door open nor read the hash.
+ACCESS_FILE = Path(os.environ.get("JOBBOARD_ACCESS") or (SANDBOX / "state" / "access-settings.json"))
+BOUND = HOST          # U09a: what main() actually listens on (the Access page says so)
 # U04a: project records (the outline, the plan's state, the APPROVED tasks). Like the job
 # records these live outside anything the sandbox mounts, so a planner can never approve its
 # own plan or move a plan onto another folder.
@@ -1322,7 +1332,7 @@ def folders():
 # ---------------------------------------------------------------- web
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent Jobs</title><style>
+<title>Agent Jobs</title><meta name="theme-color" content="#2f6fdb"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon-192.png"><style>
 :root{--bg:#f6f5f2;--card:#fff;--fg:#1d1d1b;--mut:#6b6a66;--line:#e2e0da;--acc:#2f6fdb;--ok:#2e7d4f;--bad:#c0392b;--warn:#b7791f;--code:#f0efeb}
 @media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#1f1f1d;--fg:#ecebe7;--mut:#a09f9a;--line:#33322f;--acc:#6ea1ff;--ok:#5cc28a;--bad:#ff7b6b;--warn:#e8b04f;--code:#2a2a27}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
@@ -1374,10 +1384,9 @@ a.btn{display:inline-block;background:var(--acc);color:#fff;border-radius:7px;pa
 .bundle-paste{min-height:160px;font:12px/1.4 ui-monospace,monospace;margin-top:8px}
 details summary{cursor:pointer}
 .act{max-width:300px}
-@media (max-width:640px){.bact{font-size:16px}.act{max-width:none}.btitle{font-size:22px}.clamp{max-width:none}}
-</style></head><body><div class="wrap">@@BODY@@</div></body></html>"""
+</style>@@PHONE@@</head><body><div class="wrap">@@BODY@@</div></body></html>"""
 
-def render(body): return PAGE.replace("@@BODY@@", body)
+def render(body): return PAGE.replace("@@BODY@@", body).replace("@@PHONE@@", phonelayout.CSS)
 
 def esc(s): return html.escape(str(s), quote=True)
 
@@ -1392,9 +1401,12 @@ def header(extra=""):
     st = basalt_status()
     cls = "ok" if st == "loaded" else "bad"
     return (f'<header><h1><a href="/" style="color:inherit;text-decoration:none">Agent jobs</a></h1>'
+            f'<span class="topst" id="topst"></span>'   # U09a: the sticky bar shows the running job
+            f'<nav class="nav">'
             f'<a href="/projects">Projects</a> <a href="/project/new">New project</a> '   # U04a
             f'<a href="/bench">Bench</a> <a href="/notify">Phone</a> '   # U09b
-            f'<span>Model: <b class="{cls}">{esc(st)}</b></span> <a href="http://127.0.0.1:8080/" target="_blank">GPU stats</a>{extra}</header>')
+            f'<a href="/access">Access</a> '   # U09a: phone access and its password
+            f'<span>Model: <b class="{cls}">{esc(st)}</b></span> <a href="http://127.0.0.1:8080/" target="_blank">GPU stats</a>{extra}</nav></header>')
 
 def mode_opts(selected=""):
     """The agent modes for a form. The hidden fake mode stays out of every page (U01)."""
@@ -1488,7 +1500,7 @@ def home_page():
 {attempts.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False))}
 <p class="hint">Jobs run one at a time. When the agent finishes, the board runs the project's checks in the sandbox and sends failures back for fix rounds. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
 <button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
-{upgrades.CSS}{badges.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
+{upgrades.CSS}{badges.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table class="jobs"><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
 <script>
 (function(){{
 // Refresh only the job list, never the form, so typing is never lost.
@@ -1515,6 +1527,10 @@ function setPills(map){{for(const jid in map){{const el=document.getElementById(
 async function stats(){{try{{const r=await fetch('/api/statuses');if(r.ok){{const d=await r.json();setPills(d.statuses);
  let live=null;for(const jid in d.statuses){{const s=d.statuses[jid];if(!live&&(s.state==='WORKING'||s.state==='STUCK'))live=s}}
  if(live){{const p=live.pill_extra?' '+live.pill_extra:(live.steps_total?' '+live.steps_done+'/'+live.steps_total:'');document.title=TIT[live.state]+p+' '+(live.state==='STUCK'?'Stuck?':TW[live.state])+' \\u2013 '+live.short}}
+ // U09a: the sticky top bar names the job running now, so a phone shows the current status
+ // without scrolling back to the top of the list.
+ const top=document.getElementById('topst');
+ if(top)top.innerHTML=live?'<span class="pill s-'+live.state+'">'+GL[live.state]+' '+eh((live.short||'')+' - '+TW[live.state]):'';
 }}}}catch(e){{}}setTimeout(stats,3000)}}
 stats();
 // Keep an unsent draft in this browser, so even a reload or closed tab doesn't lose it.
@@ -1603,6 +1619,10 @@ const feed=document.getElementById('feed'),banner=document.getElementById('banne
 // U07: live log - styled rows, long output collapsed to 10 lines, search, auto-scroll that pauses when you scroll up
 const logq=document.getElementById('logq'),follow=document.getElementById('follow'),tl=document.getElementById('tl');
 let tlLast=+(tl?tl.dataset.last:0)||0;
+// U09a: a phone shows the newest 10 timeline rows; this button brings in the rest (the rows
+// are already on the page, so it costs no round trip and the live stream keeps appending).
+const tlm=document.getElementById('tlmore');
+if(tlm)tlm.onclick=()=>{{if(tl)tl.classList.add('open');tlm.hidden=true}};
 function atBottom(){{return feed.scrollTop+feed.clientHeight>=feed.scrollHeight-30}}
 let stick=true;feed.addEventListener('scroll',()=>{{stick=atBottom();follow.textContent=stick?'Following':'Paused - scroll to the bottom to follow'}});
 function match(d){{const q=(logq.value||'').trim().toLowerCase();d.hidden=!!q&&!d.textContent.toLowerCase().includes(q)}}
@@ -1657,6 +1677,9 @@ function apply(j){{const tn=j.tone?' t-'+j.tone:'';banner.className='card banner
  document.getElementById('bsteps').innerHTML=stepsH(j);
  const prog=j.steps_total?' '+j.steps_done+'/'+j.steps_total:'';
  document.title=TIT[j.state]+prog+' '+(j.state==='STUCK'?'Stuck?':TW[j.state])+' \\u2013 '+jobShort;
+ // U09a: the sticky top bar keeps the current status in reach on a phone
+ const top=document.getElementById('topst');
+ if(top)top.innerHTML='<span class="pill s-'+j.state+(j.tone?' t-'+j.tone:'')+'">'+GL[j.state]+' '+eh(j.label)+prog+'</span>';
  const live=['QUEUED','WORKING','STUCK'].includes(j.state);
  if(!live){{const sf=document.getElementById('stopform');if(sf)sf.remove();
   if(prev&&['QUEUED','WORKING','STUCK'].includes(prev)&&!document.getElementById('rl')){{const a=document.createElement('a');a.id='rl';a.className='hint';a.href='';a.textContent=' Reload the page to see the report and follow up.';document.getElementById('bfoot').appendChild(a)}}}}
@@ -1709,10 +1732,12 @@ if(cb)cb.onclick=()=>{{cb.disabled=true;cb.textContent='Building bundle...';
     return render(body)
 
 
-def notify_page(errors=(), note="", form=None):
+def notify_page(errors=(), note="", form=None, token_field="", token=""):
     """U09b: the phone-alerts settings page (server, topic, token, events, quiet hours,
-    a test button, and what the last sends did)."""
-    return render(header() + notifycfg.page_body(NOTIFY_FILE, errors, note, form, READONLY))
+    a test button, and what the last sends did). U09a: its Save button carries the upgrade 8
+    form token, so the settings need the human-only secret like everything else dangerous."""
+    return render(header() + notifycfg.page_body(NOTIFY_FILE, errors, note, form, READONLY,
+                                                 token_field, token))
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -1720,21 +1745,45 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a): pass
 
+    def remote(self):
+        """U09a: the address the request came from, which decides whether it has to log in.
+        Tests stand in for a phone by patching this one method - this sandbox has no second
+        network interface to connect through."""
+        return self.client_address[0] if self.client_address else ""
+
+    def host_ok(self, acc=None):
+        """Host must be a name the board is actually reachable at, never whatever a script
+        puts there. With phone access on, that includes the address it listens on."""
+        acc = phoneaccess.load(ACCESS_FILE) if acc is None else acc
+        return self.headers.get("Host", "") in phoneaccess.hosts(PORT, acc)
+
     def guard(self, post=False):
-        host = self.headers.get("Host", "")
-        if host not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+        acc = phoneaccess.load(ACCESS_FILE)          # U09a: off until Jason turns it on
+        if not self.host_ok(acc):
             self.send_error(403, "Bad host"); return False
-        q = urllib.parse.urlparse(self.path).query
-        given = urllib.parse.parse_qs(q).get("t", [None])[0]
-        cookie = re.search(r"(?:^|;\s*)jb=([^;]+)", self.headers.get("Cookie", ""))
-        if given and secrets.compare_digest(given, TOKEN):
-            self.send_response(303); self.send_header("Set-Cookie", f"jb={TOKEN}; HttpOnly; SameSite=Strict; Path=/")
-            self.send_header("Location", "/"); self.end_headers(); return False
-        if not (cookie and secrets.compare_digest(cookie.group(1), TOKEN)):
-            self.send_error(403, "Open the link printed when the job board started"); return False
+        # U09a: two ways in. From this PC: the token in the link the board printed, kept as a
+        # cookie, exactly as before. From anywhere else (your phone): the password login, which
+        # has to stand on its own - that link and its token never leave this machine.
+        if phoneaccess.from_this_pc(self.remote()):
+            q = urllib.parse.urlparse(self.path).query
+            given = urllib.parse.parse_qs(q).get("t", [None])[0]
+            cookie = re.search(r"(?:^|;\s*)jb=([^;]+)", self.headers.get("Cookie", ""))
+            if given and secrets.compare_digest(given, TOKEN):
+                self.send_response(303); self.send_header("Set-Cookie", f"jb={TOKEN}; HttpOnly; SameSite=Strict; Path=/")
+                self.send_header("Location", "/"); self.end_headers(); return False
+            if not (cookie and secrets.compare_digest(cookie.group(1), TOKEN)):
+                self.send_error(403, "Open the link printed when the job board started"); return False
+        elif not phoneaccess.signed_in(ACCESS_FILE, self.remote(), self.headers):
+            # a phone that has not logged in sees nothing: no page, no data, no job touched
+            if post:
+                self.send_error(403, "Log in on your phone first, then try that again")
+                return False
+            self.send_response(303)
+            self.send_header("Location", "/login?next=" + urllib.parse.quote(self.path[:200]))
+            self.end_headers(); return False
         if post:
             origin = self.headers.get("Origin")
-            if origin and origin not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"):
+            if origin and origin not in phoneaccess.origins(PORT, acc):
                 self.send_error(403, "Bad origin"); return False
         return True
 
@@ -1787,6 +1836,46 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def redirect(self, to):
         self.send_response(303); self.send_header("Location", to); self.end_headers()
+
+    # ---------------------------------------------------------------- U09a: login and access
+
+    def login_page(self, q):
+        """GET /login - all a phone can see before it logs in. No nav, no job data, no token."""
+        if not self.host_ok():
+            return self.send_error(403, "Bad host")
+        note = "Logged in." if (q.get("ok") or [""])[0] == "1" else ""
+        return self.send(render(phoneaccess.login_form(note=note, next_path=(q.get("next") or ["/"])[0])))
+
+    def login_post(self):
+        """POST /login - taken before the guard on purpose: a phone has neither the board's
+        cookie nor a session yet. Five wrong tries from one address locks it for 5 minutes;
+        the password itself is only ever compared against a PBKDF2 hash."""
+        if not self.host_ok():
+            return self.send_error(403, "Bad host")
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(min(n, 200000)).decode("utf-8", "replace"))
+        nxt = (form.get("next", ["/"])[0])
+        ok, msg, sid = phoneaccess.try_login(ACCESS_FILE, self.remote(), (form.get("password", [""])[0]))
+        if not ok:
+            return self.send(render(phoneaccess.login_form(errors=[msg], next_path=nxt)), code=403)
+        self.send_response(303)
+        self.send_header("Set-Cookie", phoneaccess.cookie_header(sid))   # HttpOnly, SameSite=Strict, 30 days
+        self.send_header("Location", nxt if nxt.startswith("/") and not nxt.startswith("//") else "/")
+        self.end_headers()
+
+    def access_page(self, errors=(), note="", form=None, code=200):
+        """The Access page. Its Save button carries the upgrade 8 form token, so turning phone
+        access on (and changing the password) needs the human-only secret, not just a login."""
+        sid, hdrs = decisions.session_for(self.headers)
+        body = render(header() + phoneaccess.page_body(ACCESS_FILE, PORT, errors, note, form,
+                                                       READONLY, BOUND, decisions.TOKEN_FIELD,
+                                                       decisions.token_for(sid)))
+        return self.send(body, headers=hdrs, code=code)
+
+    def secret_form_only(self, field):
+        """U08 gate for the settings forms: True when the POST carries the session cookie and
+        that session's own token (the same rule the approve/merge buttons use)."""
+        return decisions.allowed(self.command, self.headers.get("Cookie"), field)
 
     def decide(self, jid, get):
         """U08: Approve & merge / Ask for changes / Reject / Undo. They only work from the job
@@ -1911,17 +2000,33 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/favicon.ico":  # browsers request this before login: no cookie needed
             self.send_response(204); self.end_headers(); return
+        up = urllib.parse.urlparse(self.path)
+        # U09a: what Chrome asks for before it will offer "Add to Home screen". Static, holds no
+        # job data, and a phone that has not logged in still wants them.
+        if up.path in ("/manifest.webmanifest", "/manifest.json"):
+            return self.send(phonelayout.manifest(), "application/manifest+json; charset=utf-8")
+        if up.path in ("/icon-192.png", "/icon-512.png"):
+            return self.send(phonelayout.icon_png(int(up.path[6:-4])), "image/png")
+        if up.path == "/login":            # the page a phone sees before anything else
+            return self.login_page(urllib.parse.parse_qs(up.query))
         if not self.guard(): return
         u = urllib.parse.urlparse(self.path); parts = u.path.strip("/").split("/")
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/": return self.send(home_page())
         if u.path == "/api/rows": return self.send(job_rows())
         if u.path == "/bench": return self.send(bench_page())
+        if u.path == "/access":   # U09a: phone access - the save needs the U08 secret token
+            note = "Saved." if (q.get("ok") or [""])[0] == "1" else ""
+            if (q.get("out") or [""])[0] == "1":
+                note = "Every phone is signed out."
+            return self.access_page(note=note)
         if u.path == "/notify":   # U09b: phone alerts
             note = "Saved." if (q.get("ok") or [""])[0] == "1" else ""
             if (q.get("test") or [""])[0] == "1":
                 note += " The test is on its way - its result appears under Recent sends."
-            return self.send(notify_page(note=note))
+            sid, hdrs = decisions.session_for(self.headers)   # U09a: so its Save is gated too
+            return self.send(notify_page(note=note, token_field=decisions.TOKEN_FIELD,
+                                         token=decisions.token_for(sid)), headers=hdrs)
         if u.path == "/projects":   # U04a: the projects and their plans
             recs = planning.projects(PLANS)
             states = {r["folder"]: planning.state_line(planning.plan_state(PLANS, r, WORK / r["folder"]))
@@ -2029,6 +2134,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if urllib.parse.urlparse(self.path).path == "/login":
+            return self.login_post()      # U09a: before the guard - a phone has no cookie yet
         if not self.guard(post=True): return
         if READONLY:
             return self.send_error(403, "This job board runs read-only: starting or stopping jobs is disabled")
@@ -2089,10 +2196,27 @@ class H(http.server.BaseHTTPRequestHandler):
             m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"],
                         parent=prev["id"], extra=carry or None)
             return self.redirect(f"/job/{m['id']}")
+        if parts == ["access"]:   # U09a: the settings still need the U08 secret, not just a login
+            if not self.secret_form_only(get(decisions.TOKEN_FIELD)):
+                return self.send_error(403, "Open the Access page in your browser first - "
+                                            "its Save button carries your own token")
+            errors, note = phoneaccess.save_form(ACCESS_FILE, form, PORT, BOUND)
+            if errors:
+                return self.access_page(errors=errors, note=note, form=form, code=400)
+            if form.get("logout"):
+                self.send_response(303)
+                self.send_header("Set-Cookie", phoneaccess.cookie_gone())
+                self.send_header("Location", "/access?out=1"); self.end_headers(); return
+            return self.redirect("/access?ok=1")
         if parts == ["notify"]:   # U09b: save the phone-alert settings (and maybe test one)
+            if not self.secret_form_only(get(decisions.TOKEN_FIELD)):   # U09a: same secret gate
+                return self.send_error(403, "Open the Phone page in your browser first - "
+                                            "its Save button carries your own token")
             errors, test = notifycfg.save_form(NOTIFY_FILE, form)
             if errors:
-                return self.send(notify_page(errors=errors, form=form), code=400)
+                sid, _h = decisions.session_for(self.headers)
+                return self.send(notify_page(errors=errors, form=form, token_field=decisions.TOKEN_FIELD,
+                                             token=decisions.token_for(sid)), code=400)
             return self.redirect("/notify?ok=1" + ("&test=1" if test else ""))
         if parts == ["fetch"]:   # JAIL: Download packages (form button or job page)
             folder = get("newfolder") or get("folder")
@@ -2262,13 +2386,30 @@ def main():
     if not READONLY:   # U01: create the settings file with the defaults, so it is easy to find
         upgrades.load_settings(SETTINGS_FILE, write_defaults=True)
         notifycfg.settings(NOTIFY_FILE, write_defaults=True)   # U09b: and the phone settings
+        phoneaccess.load(ACCESS_FILE, write_defaults=True)     # U09a: off, address left to fill in
     if READONLY:
         print("Read-only mode: no worker thread, jobs are never changed.", flush=True)
     else:
         threading.Thread(target=worker, daemon=True).start()
-    srv = http.server.ThreadingHTTPServer((HOST, PORT), H)
+    # U09a: where to listen. Phone access off (the default) = 127.0.0.1 only, so a phone cannot
+    # reach the board at all. The address from the Access page is taken up here, at start-up
+    # only - it never changes while jobs are running. A bad address is said out loud and the
+    # board still comes up local.
+    global BOUND
+    acc = phoneaccess.load(ACCESS_FILE)
+    want = phoneaccess.bind_host(acc, HOST)
+    try:
+        srv = http.server.ThreadingHTTPServer((want, PORT), H)
+    except OSError as ex:
+        if want != HOST:
+            print(f"Could not listen on {want} ({str(ex)[:140]}) - listening on {HOST} only, "
+                  f"so no phone can reach this board.", flush=True)
+        want = HOST
+        srv = http.server.ThreadingHTTPServer((want, PORT), H)
+    BOUND = want
     print(f"Job board running. Open: http://127.0.0.1:{PORT}/?t={TOKEN}", flush=True)
     print(f"Phone alerts: {notifycfg.status_line(NOTIFY_FILE)}", flush=True)   # U09b
+    print(f"Phone access: {phoneaccess.status_line(acc, PORT, BOUND)}", flush=True)   # U09a
     srv.serve_forever()
 
 

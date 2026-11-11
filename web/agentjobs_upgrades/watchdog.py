@@ -60,12 +60,15 @@ GIT_NET = {"push", "fetch", "pull", "clone", "ls-remote", "submodule"}
 # reads its background-shell files there. ~/.claude stays: a supervised job's home has real credentials.
 # ~/.local/state/agentjobs is the approve/merge secret (upgrade 8): it is never mounted into the
 # container anyway, so a job that goes looking for it is stopped rather than politely refused.
+# state/access-settings.json + state/phone-sessions.json (upgrade 9a) are the same kind of thing:
+# a password hash and the live phone session ids.
 SECRET_PATH_RE = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/home/[^/\s'\"]+|/root)/("
     r"\.ssh|\.gnupg|\.aws|\.netrc|\.git-credentials|\.password-store|\.docker|\.kube"
     r"|\.local/share/keyrings|\.mozilla|\.config/(google-chrome|chromium|BraveSoftware|"
     r"Code|gh|git|rclone|qwen)|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
-    r"basalt_config|agent-sandbox/(web|state/secrets)|\.local/state/agentjobs)"
+    r"basalt_config|agent-sandbox/(web|state/secrets|state/(access-settings|phone-sessions)\.json)"
+    r"|\.local/state/agentjobs)"
     r"|/etc/(shadow|sudoers)|/proc/\d+/environ")
 URL_RE = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]+", re.I)
 HOST_PORT_RE = re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(\d{2,5})\b")

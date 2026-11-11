@@ -81,6 +81,10 @@ a.cbadge,span.cbadge{display:inline-block;padding:2px 8px;border-radius:99px;fon
  border:1px solid currentColor;text-decoration:none;white-space:nowrap}
 .cbadge.ok{color:var(--ok)}.cbadge.bad{color:var(--bad)}.cbadge .cbm{font-weight:700}
 td.chk .cbadges{margin:4px 0 0}
+/* U09a: a check badge is a link, so on a phone it has to be big enough to hit */
+@media (max-width:700px){
+a.cbadge,span.cbadge{display:inline-flex;align-items:center;min-height:44px;padding:0 12px;font-size:13px}
+}
 </style>"""
 
 

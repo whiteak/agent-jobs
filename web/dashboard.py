@@ -16,6 +16,7 @@ from pathlib import Path
 from agentjobs_upgrades import events as evm
 
 ACTIVE = ("queued", "running", "stopping")
+TL_PHONE_LATEST = 10      # U09a: timeline rows a phone shows before "Show all"
 
 # board event kind (upgrades.EventLog) -> timeline type; None = not on the timeline
 TL_KIND = {"checks": "checks", "fix_round": "fix_round", "checkpoint": "checkpoint",
@@ -165,10 +166,17 @@ def tl_row(ev):
 
 def timeline_card(job_dir):
     evs = timeline_for(job_dir).list()
-    rows = "".join(tl_row(e) for e in evs[-300:])
+    shown = evs[-300:]
+    rows = "".join(tl_row(e) for e in shown)
     empty = '' if rows else '<li class="mut tlempty">Nothing yet.</li>'
     last = evs[-1]["id"] if evs else 0
-    return (f'<div class="card"><h2>Timeline</h2><ul class="tl" id="tl" data-last="{last}">{rows}{empty}</ul></div>')
+    # U09a: on a phone only the newest 10 rows are shown and this button brings in the rest.
+    # The rows are all here already, so it costs no round trip, and the live stream keeps
+    # appending to the same list. Hidden on a PC by .tlall{display:none}.
+    more = (f'<div class="tlall"><button type="button" id="tlmore" class="ghost2">'
+            f'Show all {len(shown)} events</button></div>' if len(shown) > TL_PHONE_LATEST else "")
+    return (f'<div class="card"><h2>Timeline</h2><ul class="tl" id="tl" data-last="{last}">'
+            f'{rows}{empty}</ul>{more}</div>')
 
 
 def log_card(jid):
@@ -189,4 +197,15 @@ ul.tl li.ok{color:var(--ok)}ul.tl li.bad{color:var(--bad);font-weight:600}ul.tl 
 .feed .it.edit b{color:var(--warn)}.feed .it.read{color:var(--mut)}
 .feed .it.text{white-space:pre-wrap}
 button.more{background:none;color:var(--acc);border:0;padding:0;font-size:12px;cursor:pointer}
+.tlall{display:none}
+/* U09a: on a phone the timeline starts with the newest 10 rows and "Show all" opens the rest
+   (they are on the page already). The button is the job page script's, id="tlmore". */
+@media (max-width:700px){
+ul.tl li:nth-last-child(n+11){display:none}
+ul.tl.open li{display:flex}
+.tlall{display:block;margin-top:8px}
+ul.tl.open+.tlall{display:none}
+button.more{min-height:44px}
+.logbox{max-height:50vh}
+}
 </style>"""

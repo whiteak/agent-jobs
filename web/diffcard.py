@@ -57,6 +57,14 @@ tr.now td{outline:2px solid var(--acc);outline-offset:-2px}
 .dhead{padding:8px;font-weight:600;border-bottom:1px solid var(--line);word-break:break-all}
 .dmore2{margin:8px}
 .chold{margin-top:12px}
+/* U09a: a phone reads a diff in one column, so the side-by-side switch is not offered there
+   and a table opened on a wide screen falls back to unified after a resize (see the JS). */
+@media (max-width:700px){
+#chview{display:none}
+select.chref{width:100%;min-width:0}
+table.df td.tx{width:auto}
+.diffbox{max-height:55vh}
+}
 </style>"""
 
 
@@ -106,11 +114,13 @@ function side(S){ if(!S){return '<td class="ln"></td><td class="tx empty"></td>'
 function lineP(P){ var L=P[0],R=P[1],ch=(L&&L[1]!==' ')||(R&&R[1]!==' ');
   return '<tr class="'+(ch?'chg':'ctx')+'">'+side(L)+side(R)+'</tr>'; }
 function line(L){ return sbs?lineP(L):lineU(L); }
+function phone(){ return window.innerWidth<=700; }   // U09a: phones get the unified view only
 function row(cls,txt,attr){ var n=sbs?4:3;
   return '<tr class="'+cls+'"'+(attr?(' '+attr):'')+'><td colspan="'+n+'">'+esc(txt)+'</td></tr>'; }
 
 // ---- the rows for one file, with unchanged runs collapsed
 function build(d){
+  if(phone()&&sbs){ sbs=false; viewBtn.textContent='Side by side'; table.className='df'; }
   items=[]; at=0; chg=[]; chgAt={}; gaps={}; now=null; atChange=-1;
   tbody.innerHTML='';
   var lastNew=null, gid=0;
@@ -180,7 +190,7 @@ function nextChange(){
   nextBtn.textContent='Next change '+(atChange+1)+'/'+chg.length;
 }
 nextBtn.onclick=nextChange;
-viewBtn.onclick=function(){ sbs=!sbs; viewBtn.textContent=sbs?'One column':'Side by side';
+viewBtn.onclick=function(){ if(phone()){return;} sbs=!sbs; viewBtn.textContent=sbs?'One column':'Side by side';
   if(diff){build(diff); showTable();} };
 
 function showTable(){

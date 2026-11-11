@@ -381,8 +381,10 @@ def status_line(path, now=None):
     return "On."
 
 
-def page_body(path, errors=(), note="", form=None, readonly=False):
-    """The /notify card: server, topic, token, which events, quiet hours, a test button."""
+def page_body(path, errors=(), note="", form=None, readonly=False, token_field="", token=""):
+    """The /notify card: server, topic, token, which events, quiet hours, a test button.
+    U09a: `token_field`/`token` is the upgrade 8 form token, so the settings need the
+    human-only secret - a phone login alone cannot change them."""
     s = settings(path)
 
     def val(key, saved=""):
@@ -420,12 +422,15 @@ def page_body(path, errors=(), note="", form=None, readonly=False):
           'here.</p>') if readonly else ""
     note_html = f'<p class="ok">{html.escape(note)}</p>' if note else ""
     quiet_now = notify.in_quiet_hours(s, datetime.now())
+    tok = (f'<input type="hidden" name="{html.escape(token_field)}" '
+           f'value="{html.escape(token, quote=True)}">' if token_field and token else "")
     return f"""<div class="card"><h2>Phone alerts</h2>
 <p><b>{html.escape(status_line(path))}</b> {"<span class=\"hint\">Quiet hours are running now.</span>" if quiet_now else ""}</p>
 {note_html}{ro}
 <p class="hint">The job board posts to <code>&lt;server&gt;/&lt;topic&gt;</code> with ntfy, and the ntfy app on
 your phone shows it. Only titles, status and counts are ever sent - never code, diffs or log text.</p>
 <form method="post" action="/notify">
+{tok}
 <div class="row"><div><label>ntfy server</label>
 <input type="text" name="server" value="{html.escape(val("server", s.server))}" placeholder="http://192.168.1.20:2586">
 <span class="hint">Empty switches the phone alerts off.</span></div>
