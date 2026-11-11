@@ -188,17 +188,24 @@ def collect(m, k, git, base):
         git.run("commit", "-qm", f"attempt {k}: what was left in the folder")
     head = git.head() or ""
     files, lines, test_files = changes(git, base, head)
-    bundle = Path(git.repo) / ".git" / f"agentjobs-try-{k}.bundle"
-    git.run("bundle", "create", str(bundle), f"{base}..{branch}")
+    bundle = None
+    if head and head != base:                            # nothing changed: there is nothing to pack
+        bundle = Path(git.repo) / ".git" / f"agentjobs-try-{k}.bundle"
+        git.run("bundle", "create", str(bundle), f"{base}..{branch}")
     return {"commit": head, "files": files, "diff_lines": lines, "test_files_changed": test_files,
-            "bundle": str(bundle)}
+            "bundle": str(bundle) if bundle else None}
 
 
-def bring_home(m, work, bundle, branch):
-    """Put an attempt's branch into the project repo (from its bundle, never from the attempt
-    repo's own config). Raises GitError."""
-    _host_git(Path(work) / m["folder"]).run("-c", "protocol.file.allow=always", "fetch", "-q",
-                                           str(bundle), f"{branch}:refs/heads/{branch}")
+def bring_home(m, work, bundle, branch, sha=None):
+    """Put an attempt's branch into the project repo - from its bundle when it changed
+    anything, straight to the base commit when it did not. Never reads the attempt repo's
+    own config. Raises GitError."""
+    g = _host_git(Path(work) / m["folder"])
+    if bundle:
+        g.run("-c", "protocol.file.allow=always", "fetch", "-q", str(bundle),
+              f"{branch}:refs/heads/{branch}")
+    elif sha:
+        g.run("update-ref", f"refs/heads/{branch}", sha)
 
 
 def apply_winner(m, work, branch):
@@ -235,6 +242,13 @@ def prune_old(git, days=KEEP_DAYS, now=None):
 
 # ---------------------------------------------------------------- scores
 
+WORD = {"passed": "passed", "failed": "checks failed", "needs_review": "needs review",
+        "stuck": "stuck", "unverified": "not verified", "safety_stop": "safety stop",
+        "stopped": "stopped"}
+TONE = {"passed": "ok", "failed": "bad", "needs_review": "warn2", "stuck": "warn2",
+        "unverified": "warn", "safety_stop": "bad", "stopped": "mut"}
+
+
 def status_of(run_meta):
     """One finished attempt as bestofn sees it: the check result, or how the run itself ended."""
     st = (run_meta or {}).get("status")
@@ -248,11 +262,6 @@ def status_of(run_meta):
 def tests_passed(run_meta):
     res = (((run_meta or {}).get("verify") or {}).get("final") or {}).get("results") or []
     return sum(int(r.get("passed") or 0) for r in res)
-
-
-def trimmed_verify(run_meta):
-    v = (run_meta or {}).get("verify") or {}
-    return {k: v[k] for k in ("status", "banner", "timeline", "issues", "final") if k in v}
 
 
 def attempt_of(rec):
@@ -316,7 +325,7 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
         if (load(name) or {}).get("status") in ("stopping", "cancelled"):
             stopped, how = True, "stopped"
             break
-        update(name, phase=f"Attempt {k} of {n}", attempts_current=k)
+        update(name, status="running", phase=f"Attempt {k} of {n}", attempts_current=k)
         dashboard.tl_add(jd, "attempt", f"Attempt {k} of {n} started")
         folder = attempt_folder(m["folder"], jid, k)
         try:
@@ -327,11 +336,12 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
             dashboard.tl_add(jd, "attempt", note)
             break
         am = dict(m, folder=folder, resume=None, attempt_sub=attempt_sub(k), job=attempt_job(m, k))
+        t0 = time.time()
         out = run_one(am, name, k == 1) or {}
         extra, note = {}, None
         try:
             extra = collect(m, k, ag, base)
-            bring_home(m, work, extra["bundle"], attempt_branch(jid, k))
+            bring_home(m, work, extra["bundle"], attempt_branch(jid, k), extra["commit"])
             shutil.rmtree(work / folder, ignore_errors=True)
         except (GitError, OSError) as ex:
             note = (f"Attempt {k}'s branch could not be saved ({str(ex)[:150]}). Its copy is "
@@ -341,16 +351,16 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
                "test_files_changed": extra.get("test_files_changed", 0),
                "diff_lines": extra.get("diff_lines", 0), "files": extra.get("files", []),
                "commit": extra.get("commit", ""),
-               "seconds": round(float(out.get("finished") or 0) - float(out.get("started") or 0), 1),
+               "seconds": round(time.time() - t0, 1),
                "issues": (out.get("verify") or {}).get("issues") or [],
                "session": out.get("session"), "watchdog": len(out.get("watchdog") or []),
                "checkpoints": len(((out.get("checkpoints") or {}).get("checkpoints") or [])),
                "banner": ((out.get("verify") or {}).get("banner") or {}).get("text") or "",
-               "verify": trimmed_verify(out), "note": note}
+               "verify": out.get("verify") or {}, "note": note}
         log.append(rec)
         update(name, attempt_log=log, attempts_done=len(log))
         dashboard.tl_add(jd, "attempt",
-                         f"Attempt {k} of {n}: {STATUS_WORDS.get(rec['status'], rec['status'])}"
+                         f"Attempt {k} of {n}: {WORD.get(rec['status'], rec['status'])}"
                          + (f" - {rec['tests_passed']} tests passing" if rec["tests_passed"] else ""))
         if rec["status"] == "safety_stop":
             how = "safety_stop"
@@ -364,7 +374,6 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
 
     winner, ranked = bestofn.pick_winner([attempt_of(r) for r in log])
     by_k = {a["k"]: a for a in log}
-    chosen = winner or ({"k": ranked[0].k} if ranked else None)
     final = {"winner": (winner.k if winner else None), "why": bestofn.why(winner, ranked),
              "ranked": [a.k for a in ranked]}
 
@@ -374,20 +383,19 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
         dashboard.tl_add(jd, "failed", "Stopped: " + final["why"])
         return cur
 
+    best = (by_k.get(ranked[0].k) if ranked else None) or {}
     note = None
-    if chosen:
-        err = apply_winner(m, work, attempt_branch(jid, chosen["k"]))
-        if err:
-            note = err
-    best = by_k.get((ranked[0].k if ranked else None) or -1) or {}
-    if winner:
+    if winner:                                    # only a clean winner goes into the folder
         status, fail = "done", None
-    elif how == "safety_stop":
-        status, fail = "safety_stop", best.get("banner") or "Safety stop"
+        note = apply_winner(m, work, attempt_branch(jid, winner.k)) or None
     else:
-        status, fail = "failed", final["why"]
+        status, fail = (("safety_stop", best.get("banner") or "Safety stop") if how == "safety_stop"
+                        else ("failed", final["why"]))
+        if log:
+            note = ("Nothing was put in the folder: no attempt passed its checks. Each try is still "
+                    "on its own branch - pick one with 'Use this one instead'.")
     v = dict(best.get("verify") or {})
-    if status == "failed" and v.get("banner") and (v["banner"] or {}).get("colour") == "green":
+    if status == "failed" and (v.get("banner") or {}).get("colour") == "green":
         v["banner"] = {"colour": "red", "text": final["why"]}
     cur = update(name, status=status, finished=time.time(), phase=None, attempt_log=log,
                  attempts_final=final, attempts_current=0, attempts_note=note,
@@ -432,13 +440,6 @@ def retry_extra(m, cfg):
 
 # ---------------------------------------------------------------- the page
 
-WORD = {"passed": "passed", "failed": "checks failed", "needs_review": "needs review",
-        "stuck": "stuck", "unverified": "not verified", "safety_stop": "safety stop",
-        "stopped": "stopped"}
-TONE = {"passed": "ok", "failed": "bad", "needs_review": "warn2", "stuck": "warn2",
-        "unverified": "warn", "safety_stop": "bad", "stopped": "mut"}
-
-
 def _esc(x):
     return html.escape(str(x if x is not None else ""), quote=True)
 
@@ -451,12 +452,14 @@ def row_html(m, a, can_act, winner_k):
                f'onsubmit="return confirm(\'Use attempt {int(a["k"])} instead? The folder will '
                f'switch to its changes.\')"><input type="hidden" name="k" value="{int(a["k"])}">'
                f'<button class="ghost2">Use this one instead</button></form>')
-    files = "".join(f'<li>{_esc(f[0])} <span class="mut">+{f[1]} -{f[2]}</span></li>'
-                    for f in (a.get("files") or [])[:12])
-    more = len(a.get("files") or []) - 12
-    change = (f'<details><summary>{len(a.get("files") or [])} files, {_esc(a.get("diff_lines", 0))} lines'
-              + (f' ({more} more)' if more > 0 else '') + '</summary><ul>' + files + '</ul></details>'
-              if a.get("files") else '<span class="mut">nothing changed</span>')
+    items = a.get("files") or []
+    lis = "".join(f'<li>{_esc(f[0])} <span class="mut">+{f[1]} -{f[2]}</span></li>' for f in items[:12])
+    more = len(items) - 12
+    dl = int(a.get("diff_lines") or 0)
+    change = (f'<details><summary>{len(items)} file{"" if len(items) == 1 else "s"}, '
+              f'{dl} line{"" if dl == 1 else "s"}'
+              + (f' ({more} more)' if more > 0 else '') + f'</summary><ul>{lis}</ul></details>'
+              if items else '<span class="mut">nothing changed</span>')
     tests = f'{a.get("tests_passed", 0)} passing' + (f', {a.get("test_files_changed", 0)} test files'
                                                     if a.get("test_files_changed") else "")
     secs = float(a.get("seconds") or 0)
@@ -472,7 +475,9 @@ def card_html(m, jid, can_act, cfg=None):
     fin = m.get("attempts_final") or {}
     note = m.get("attempts_note")
     running = m.get("status") in ("queued", "running", "stopping")
-    if not log and not note and not (m.get("attempts") and running):
+    retry = can_act and not m.get("attempts") and not log \
+        and (m.get("verify") or {}).get("status") == "failed"      # failed after its fix rounds
+    if not log and not note and not retry and not (m.get("attempts") and running):
         return ""
     n = m.get("attempts_total") or m.get("attempts") or 0
     parts = []
@@ -496,8 +501,7 @@ def card_html(m, jid, can_act, cfg=None):
                      f'on their branch for {KEEP_DAYS} days.</p>')
     if note:
         parts.append(f'<p class="mut">{_esc(note)}</p>')
-    if can_act and not m.get("attempts") and not log \
-            and (m.get("verify") or {}).get("status") == "failed":
+    if retry:
         k = min(MAX_N, max(MIN_N, int((cfg or {}).get("attempts") or DEFAULT_N)))
         parts.append(f'<form method="post" action="/try-hard/{_esc(jid)}" style="margin-top:10px">'
                      f'<button class="ghost2">Try {k} fresh attempts</button> '
