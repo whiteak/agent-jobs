@@ -1,3 +1,90 @@
+# Job 03 (re-run) — Upgrade 8: approve / merge buttons
+
+## Findings
+
+- The engine is already written and tested: `web/agentjobs_upgrades/actions.py` —
+  `load_secret` (file, dir 0700 / file 0600), `form_token` = HMAC(secret, "form:"+sid),
+  `check_request` (POST + cookie session + matching form token), `merge_allowed`
+  (`MERGEABLE = {"passed"}`, else only a typed `MERGE`), `Decisions.merge` (clean tree
+  first; fast-forward when the target is an ancestor of the job branch, otherwise a
+  `Merge agent job <id>: <title>` commit; on a conflict `merge --abort` + `reset --hard`
+  back to the recorded target sha and the caller's branch is restored in `finally`),
+  `Decisions.undo_merge` (refuses when the target moved past the recorded `after`),
+  `Decisions.reject`/`unreject` (renames to `agent/rejected/<id>`, 14 days),
+  `change_request_prompt` (the request + the original prompt's first 15 lines).
+  `tests/test_rest.py::Actions` already covers ff / merge commit / conflict-leaves-nothing /
+  reject+undo / the token / the gate. **What is missing is all the glue**: no page buttons,
+  no routes, no branch choice, no follow-up jobs, no record/timeline entries, nothing
+  that ever calls `check_request`.
+- Pages and routes: `web/jobboard.py` (2237 lines). `job_page(jid)` (1515) is a stack of
+  cards; `can_act = not active and not READONLY and not folder_busy(folder)` is the guard
+  every finished-job button uses; `H.do_GET`/`H.do_POST` (1876/1994) are `if` chains behind
+  `H.guard()` (Host must match `jobboard.PORT`, `jb=` cookie, Origin check for POSTs).
+  Buttons post to `/push/<jid>`, `/recheck/<jid>`, `/followup/<jid>` … — so the new
+  decision routes fit the same shape.
+- Where board git runs on a project: always `upgrades.git_for(m, root)` =
+  `SafeGit(root, wrap=make_wrap(root, folder, "agentgit-<jid>"))`. `SafeGit` adds
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never
+  -c credential.helper= …` plus `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, so the
+  repo's own (agent-planted) config and hooks are not trusted; the wrap puts the whole
+  call inside the job's own jail (`jail/run-local.sh sandbox-run` → `podman-local.sh`:
+  `--network none`, only the project folder mounted). `JOBBOARD_JAIL=host` (tests) runs it
+  straight on the temp folder. Pushing is only ever `jailcfg.push_branch` →
+  `jail/push-agent-branch.sh`, and it refuses anything that is not
+  `agent/...` (`BRANCH_RE`), so "merge into main" staying local is already the rule.
+- Branch names in a job: base = `m["git_branch_start"]` (written by `record_git_start`,
+  jobboard.py:619, before the agent runs); a best-of-N winner is put on `agent/<job id>`
+  (`attempts.job_branch`); a normal agent commits on a branch it made itself
+  (`agent/<task>`), and 4a projects start on `agent/<folder>` (`planning.branch_of`).
+  So the job branch has to be *found*: the folder's current `agent/...` branch, else
+  `agent/<jid>`, else the newest `agent/...` ref that has commits the target does not.
+- The checks gate: `m["verify"]["status"]` ∈ passed / unverified / needs_review / stuck /
+  failed / aborted (from `verify.VerifyGate`, shown by `upgrades.overlay_status`), and
+  `m["verify_off"]` / no `verify` at all = "weren't run". Only `passed` is mergeable
+  without typing MERGE.
+- Timeline: `events.ICONS` already has `approved` ✅ / `merged` 🔀 / `rejected` 🗑, so
+  decision rows land in the U07 timeline with an icon and no new kinds.
+- Follow-up: `/followup/<jid>` (jobboard.py:2045) needs `prev["session"]` and carries the
+  U01 fields — "Ask for changes" reuses `new_job(mode, folder, prompt, offline,
+  resume=session, parent=jid, extra=carry)`; a conflict-fix job is the same call with a
+  different prompt (works without a session too).
+- The secret and the jail (checked, not assumed): `jail/podman-local.sh jail_local_args`
+  mounts **only** the job's project folder (`/work/<name>` over an empty tmpfs `/work`),
+  `state/home-local` → `/home/agent`, `state/android-sdk` → `/opt/android-sdk` and two jail
+  scripts; `jail/agent-jail.sh` (bwrap) gives a fake empty `/home/agent` and refuses
+  `$HOME/.local*` as a project folder. A secret at `~/.local/state/agentjobs/secret`
+  (actions.DEFAULT_SECRET) is therefore never inside the container. I add
+  `.local/state/agentjobs` to `watchdog.SECRET_PATH_RE` so a job that goes looking for it
+  is a safety stop, and a test that reads the jail script's own `-v` mounts.
+- Test command (`AGENT_CHECKS.json`, the verify gate): `cd web && PYTHONDONTWRITEBYTECODE=1
+  python3 -W ignore -m unittest discover -s tests`. Baseline before my changes: **635 tests,
+  OK**.
+
+## Steps
+
+- [ ] PLAN.md (this file) committed before the code.
+- [ ] `web/decisions.py` (new glue, `# U08`): the secret file + session cookie + form token
+      (`decide_allowed`), which branch a job worked on and which it merges into, the Decide
+      card (Approve & merge / Ask for changes / Reject + Merge anyway + Undo + Ask Qwen to fix
+      the conflict), and `action()` doing merge / undo-merge / reject / undo-reject /
+      changes-requested / fix-conflict through `actions.Decisions`, writing the record
+      (`decision_log`) and the timeline.
+- [ ] `jobboard.py` hooks: `import decisions`, the decision card on the job page, the `aj=`
+      HttpOnly cookie on `GET /job/<id>`, and the POST routes that refuse anything without
+      the secret token.
+- [ ] `watchdog.SECRET_PATH_RE`: `.local/state/agentjobs` is a private location.
+- [ ] Tests `web/tests/test_u08_decide.py`: temp repos — fast-forward, merge commit,
+      conflict leaves nothing and offers the fix job, merge blocked when checks failed,
+      "Merge anyway" needs the typed word, the request without the cookie/token is rejected
+      (and a GET is), reject + undo (+ the branch rename), undo merge and undo refusing when
+      something was committed on top, the follow-up jobs' prompts, the card states, the
+      record + timeline rows, the "Not pushed" rule, and that the jail never mounts the
+      secret.
+- [ ] Full suite green with the gate's command; PLAN ticked; AGENT_REPORT.md section for
+      this job (including how the sandbox can't read the secret).
+
+---
+
 # Job 01 — Upgrade 7a: live dashboard, part 1 (timeline + live log)
 
 ## Findings
