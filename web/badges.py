@@ -70,6 +70,15 @@ def _esc(x):
     return html.escape(str(x if x is not None else ""), quote=True)
 
 
+CSS = """<style>
+.cbadges{margin:8px 0 0;display:flex;gap:6px;flex-wrap:wrap}
+a.cbadge,span.cbadge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600;
+ border:1px solid currentColor;text-decoration:none;white-space:nowrap}
+.cbadge.ok{color:var(--ok)}.cbadge.bad{color:var(--bad)}.cbadge .cbm{font-weight:700}
+td.chk .cbadges{margin:4px 0 0}
+</style>"""
+
+
 def badges_html(m, jid=None):
     """The same badges as HTML for the jobs list (the job page builds them from the JSON)."""
     out = ""

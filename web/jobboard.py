@@ -20,6 +20,9 @@ import jobstatus
 import reviewbundle
 import upgrades   # U01: verify gate, git checkpoints, runaway watchdog
 import dashboard  # U07: timeline, live updates (SSE), live log, badges
+import badges     # U07b: one badge per check, linking to its output
+import diffcard   # U07b: the Changes card (file list + diff viewer)
+import diffview   # U07b: what the job changed (git in the jail, parsed diffs)
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -596,6 +599,7 @@ def status_for(m):
     s = upgrades.overlay_status(s, m)   # U01: checks banner, safety stop, gate phase
     s["badge"], s["badge_colour"] = dashboard.badge(m, s)   # U07: jobs-list badge + checks result
     s["checks"] = dashboard.checks_cell(m)
+    s["check_badges"] = badges.badges(m, m.get("id"))   # U07b: one badge per check
     return s
 
 def session_of(jid):
@@ -1287,11 +1291,13 @@ def job_rows():
     for m in all_jobs()[:50]:
         s = status_for(m)
         bench = m.get("kind") == "bench"  # bench rows: folder "-", link to the bench page
+        cbadges = "" if bench else badges.badges_html(m, m["id"])   # U07b: build ✓ / tests 41/42 ✗
+        chk = esc(dashboard.checks_cell(m)) + (f'<div class="cbadges">{cbadges}</div>' if cbadges else "")
         rows += (f'<tr><td class="now"><a href="/{"bench/run" if bench else "job"}/{m["id"]}">{fmt_time(m["created"])}</a></td>'
                  f'<td class="st" id="p-{m["id"]}">{status_pill(s)}</td>'
                  f'<td>{esc(m["mode"])}{" (offline)" if m.get("offline") else ""}</td><td>{esc(m["folder"]) or "-"}</td>'
                  f'<td class="jobtxt" title="{esc(m["job"])}">{"&#8627; " if m.get("parent") else ""}{esc(m["job"])}</td><td>{dur(m)}</td>'
-                 f'<td class="chk">{esc(dashboard.checks_cell(m))}</td></tr>')   # U07: checks result
+                 f'<td class="chk">{chk}</td></tr>')   # U07: checks result
     return rows or '<tr><td colspan=7 class=mut>No jobs yet.</td></tr>'
 
 def home_page():
@@ -1310,7 +1316,7 @@ def home_page():
 {upgrades.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False)["fix_rounds"])}
 <p class="hint">Jobs run one at a time. When the agent finishes, the board runs the project's checks in the sandbox and sends failures back for fix rounds. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
 <button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
-{upgrades.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
+{upgrades.CSS}{badges.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
 <script>
 (function(){{
 // Refresh only the job list, never the form, so typing is never lost.
@@ -1398,6 +1404,7 @@ def job_page(jid):
 <div class="bact" id="bact"{' style="display:none"' if not s['current_action'] else ''}>{esc(s['current_action'] or '')}</div>
 <div class="bwarn" id="bstuck"{' hidden' if s['state'] != 'STUCK' else ''}>{esc(stuck_text(s))}</div>
 {upgrades.verify_line_html(s)}
+<div class="cbadges" id="bchecks">{badges.badges_html(m, jid)}</div>
 <div class="bsum{' bad' if s['state'] == 'FAILED' else ''}" id="bsum">{esc(summary)}</div>
 <div class="bstats mut" id="bstats">{stats_text(s)}</div>
 <div id="bsteps">{steps_html(s)}</div>
@@ -1406,7 +1413,7 @@ def job_page(jid):
 {bundle_html}{u01_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
-<div class="card"><h2>Changes</h2><pre id="git" class="mut">Loading...</pre></div>
+{diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
 <div class="card"><h2>Build outputs</h2>{f'<ul>{out_html}</ul>' if outs else '<span class="mut">None found yet (APK, AAB, EXE, ZIP...).</span>'}</div>
 <script>
 (function(){{
@@ -1476,17 +1483,19 @@ function apply(j){{const tn=j.tone?' t-'+j.tone:'';banner.className='card banner
  if(prev&&['QUEUED','WORKING','STUCK'].includes(prev)&&(j.state==='FINISHED'||j.state==='FAILED')){{beep(j.state==='FINISHED');
   if('Notification'in window&&Notification.permission==='granted'){{try{{new Notification(j.state==='FINISHED'?'Agent job finished':'Agent job failed',{{body:jobShort}})}}catch(e){{}}}}
   setTimeout(()=>location.reload(),4000);}}  // bring in the Report/Changes/Follow up cards; the Reload link stays as fallback
+ if(j.check_badges){{document.dispatchEvent(new CustomEvent('jobbadges',{{detail:j}}))}}   // U07b: check badges in the banner
  prev=j.state}}
 async function pollStatus(){{try{{const r=await fetch('/api/status/'+jid);if(r.ok)apply(await r.json())}}catch(e){{}}setTimeout(pollStatus,3000)}}
 // U07: one live stream for status, log and timeline; reconnects by itself (Last-Event-ID),
 // falls back to polling after repeated failures
+function act(){{document.dispatchEvent(new CustomEvent('jobactivity'))}}   // U07b: the Changes card refreshes on this
 let fails=0;
 function startStream(){{if(!window.EventSource){{startPolling();return}}
  const es=new EventSource('/api/jobs/'+jid+'/events?log='+off+'&last='+tlLast);
  es.addEventListener('open',()=>{{fails=0}});
  es.addEventListener('status',e=>{{try{{apply(JSON.parse(e.data))}}catch(x){{}}}});
- es.addEventListener('log',e=>{{try{{const d=JSON.parse(e.data);if(d.from<off)return;addItems(d.items);off=d.next}}catch(x){{}}}});
- es.addEventListener('job',e=>{{try{{addTl(JSON.parse(e.data))}}catch(x){{}}}});
+ es.addEventListener('log',e=>{{try{{const d=JSON.parse(e.data);if(d.from<off)return;addItems(d.items);off=d.next;act()}}catch(x){{}}}});
+ es.addEventListener('job',e=>{{try{{addTl(JSON.parse(e.data));act()}}catch(x){{}}}});
  es.addEventListener('end',()=>{{es.close()}});
  // reconnect ourselves with the CURRENT log offset and timeline id (the server also honours Last-Event-ID)
  es.onerror=()=>{{es.close();fails++;if(fails>=3)startPolling();else setTimeout(startStream,2000)}}}}
@@ -1515,7 +1524,8 @@ if(cb)cb.onclick=()=>{{cb.disabled=true;cb.textContent='Building bundle...';
  const got=t=>{{if(wres&&wres.then)wres.then(()=>show(t),()=>byText(t));else byText(t);}};
  txt.then(got).catch(()=>{{cb.textContent='Could not build the bundle';reset(3000);}});}};
 }})();
-</script>"""
+</script>
+<script>{diffcard.JS}</script>"""
     return render(body)
 
 
@@ -1570,6 +1580,25 @@ class H(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
+    def changes_json(self, jid, q, one_file=False):
+        """U07b: /api/changes/<jid>[?ref=] is the file list for one view;
+        /api/changes/<jid>/file?path=&ref= is one file's diff. The project is read
+        through the job's jail (diffview), never on the host."""
+        m = load_meta(jid)
+        if not m or m.get("kind") == "bench":
+            return self.send_error(404)
+        ref = (q.get("ref") or ["all"])[0]
+        try:
+            git = diffview.git_for(m, WORK)
+            if one_file:
+                d = diffview.file_diff(m, git, ref, (q.get("path") or [""])[0])
+                code = 404 if d.get("error") else 200
+            else:
+                d, code = diffview.summary(m, git, ref), 200
+        except Exception as ex:            # a strange folder must not take the page down
+            d, code = {"ok": False, "error": f"could not read the project ({str(ex)[:150]})"}, 200
+        return self.send(json.dumps(d, ensure_ascii=False, default=str), "application/json", code=code)
+
     def redirect(self, to):
         self.send_response(303); self.send_header("Location", to); self.end_headers()
 
@@ -1621,6 +1650,16 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.send(json.dumps({"items": items, "next": nxt, "status": m["status"], "dur": dur(m)}), "application/json")
         if len(parts) == 3 and parts[:2] == ["api", "git"] and load_meta(parts[2]):
             return self.send(git_info(load_meta(parts[2])["folder"]), "text/plain; charset=utf-8")
+        if len(parts) == 3 and parts[:2] == ["api", "changes"] and load_meta(parts[2]):   # U07b
+            return self.changes_json(parts[2], q)
+        if len(parts) == 4 and parts[:2] == ["api", "changes"] and parts[3] == "file" and load_meta(parts[2]):
+            return self.changes_json(parts[2], q, one_file=True)
+        if len(parts) == 3 and parts[:2] == ["api", "check"] and load_meta(parts[2]):     # U07b: a check's output
+            got = badges.check_text(load_meta(parts[2]), (q.get("src") or [""])[0],
+                                    (q.get("n") or [""])[0], job_dir(parts[2]))
+            if got is None:
+                return self.send_error(404)
+            return self.send(got[0], "text/plain; charset=utf-8")
         if len(parts) == 3 and parts[:2] == ["api", "bundle"] and load_meta(parts[2]):
             m = load_meta(parts[2])
             if m.get("kind") == "bench":

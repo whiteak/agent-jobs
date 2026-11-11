@@ -384,33 +384,37 @@ def bad_path(p):
 
 
 def _hunks(hunks, limit):
-    """Parsed hunks -> JSON rows (unified) + pair rows (side by side, from diffparse)."""
-    rows, cut = [], False
+    """Parsed hunks -> JSON rows (unified) + pair rows (side by side, from diffparse).
+    `limit` is a hard bound on rows, so one gigantic hunk still stops there."""
+    out, cut = [], False
     for h in hunks:
-        lines = [["nl" if k == "\\" else k, o, n, t] for (k, o, n, t) in h.lines]
-        pair = [[[l[0], l[1], l[2]] if l else None, [r[0], r[1], r[2]] if r else None]
-                for l, r in diffparse.side_by_side(h)]
-        rows.append({"o": h.old_start, "n": h.new_start, "header": h.header[:120],
-                     "lines": lines, "pair": pair})
-        limit -= len(lines)
         if limit <= 0:
             cut = True
             break
-    return rows, cut
+        if len(h.lines) > limit:
+            h = diffparse.Hunk(h.old_start, h.old_len, h.new_start, h.new_len, h.header,
+                               list(h.lines[:limit]))
+            cut = True
+        limit -= len(h.lines)
+        out.append({"o": h.old_start, "n": h.new_start, "header": h.header[:120],
+                    "lines": [["nl" if k == "\\" else k, o, n, t] for (k, o, n, t) in h.lines],
+                    "pair": [[[l[0], l[1], l[2]] if l else None, [r[0], r[1], r[2]] if r else None]
+                             for l, r in diffparse.side_by_side(h)]})
+    return out, cut
 
 
 def file_diff(m, git, ref, path):
     """One file's diff as rows the page can render (unified and side by side)."""
     if bad_path(path):
         return {"error": "bad path"}
-    pf = _cached(("probe", m.get("id")), REFS_TTL, lambda: probe(m, git))
+    pf = _cached(_ckey(git, "probe", m), REFS_TTL, lambda: probe(m, git))
     if pf.get("error"):
         return pf
     rng = _rng(m, ref, pf)
     if not rng:
         return {"error": "unknown revision"}
     # a rename needs both names in the pathspec, or git shows it as a plain new file
-    ent = next((e for e in _cached(("list", m.get("id"), ref or REF_ALL), SUMMARY_TTL,
+    ent = next((e for e in _cached(_ckey(git, "list", m, ref), SUMMARY_TTL,
                                    lambda: _list(m, git, ref, pf)).get("files", [])
                 if e.get("path") == path), None)
     old = ent.get("old", "") if ent and ent.get("old") != path else ""
@@ -447,6 +451,12 @@ _cache_lock = threading.Lock()
 CLEAN_AFTER = 300.0
 
 
+def _ckey(git, kind, m, ref=None):
+    """Cache key: the project folder is part of it, so a record can never pick up another
+    job's (or a recycled folder's) file list."""
+    return (kind, str(m.get("id") or ""), str(git.repo), _base(m)[:12], ref or REF_ALL)
+
+
 def _cached(key, ttl, fn):
     now = time.time()
     with _cache_lock:
@@ -465,12 +475,11 @@ def _cached(key, ttl, fn):
 
 def summary(m, git, ref=REF_ALL):
     """What the Changes card shows for one view: the picker, the range, the file list."""
-    jid = m.get("id")
-    pf = _cached(("probe", jid), REFS_TTL, lambda: probe(m, git))
+    pf = _cached(_ckey(git, "probe", m), REFS_TTL, lambda: probe(m, git))
     if pf.get("error"):
         return {"ok": False, "error": pf["error"]}
     ref = ref or REF_ALL
-    view = _cached(("list", jid, ref), SUMMARY_TTL, lambda: _list(m, git, ref, pf))
+    view = _cached(_ckey(git, "list", m, ref), SUMMARY_TTL, lambda: _list(m, git, ref, pf))
     if view.get("error"):
         return {"ok": False, "error": view["error"]}
     return {"ok": True, "ref": ref, "how": _how(m, ref, pf), "branch": pf["branch"],
