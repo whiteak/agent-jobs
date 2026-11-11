@@ -23,6 +23,7 @@ import dashboard  # U07: timeline, live updates (SSE), live log, badges
 import badges     # U07b: one badge per check, linking to its output
 import diffcard   # U07b: the Changes card (file list + diff viewer)
 import diffview   # U07b: what the job changed (git in the jail, parsed diffs)
+import notifycfg  # U09b: phone alerts (ntfy) - settings page, events, quiet hours
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -52,6 +53,9 @@ SESSION_RE = re.compile(r"[A-Za-z0-9-]{8,80}")           # agent session ids (re
 JOB_TEXT_MAX = 200000                                    # same cap as the web form read
 # U01: fix rounds + watchdog thresholds (written with the defaults on first start)
 SETTINGS_FILE = Path(os.environ.get("JOBBOARD_SETTINGS") or (SANDBOX / "state" / "agentjobs-settings.json"))
+# U09b: phone alerts (ntfy). The server is empty by default = off, and the topic starts
+# random. Kept next to the board settings, outside anything the sandbox can write.
+NOTIFY_FILE = Path(os.environ.get("JOBBOARD_NOTIFY") or (SANDBOX / "state" / "notify-settings.json"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # Bench auto-runs. Run data lives OUTSIDE the sandbox-visible folders; the worker
@@ -184,6 +188,7 @@ def worker():
         if m.get("status") == "running":
             m.update(status="interrupted", finished=time.time()); save_meta(m, name)
     while True:
+        phone_model_check()   # U09b: tells the phone when the model server goes away
         with queue_cv:
             while True:
                 q = [name for name, m in reversed(all_job_dirs()) if m["status"] == "queued"]
@@ -225,6 +230,7 @@ def process_job(name):
             notify_finished(m, m["status"] == "done")
         except Exception:
             pass
+        phone_notify(m)   # U09b
         return True
     if m.get("fetch_first") is True:   # JAIL: download packages first (separate sandbox, no AI)
         m.update(status="running", started=time.time(), fetch_result="downloading"); save_meta(m, name)
@@ -244,6 +250,7 @@ def process_job(name):
             save_meta(m, name)
             try: notify_finished(m, False)
             except Exception: pass
+            phone_notify(m)   # U09b
             return False
     m.update(status="running", started=time.time()); save_meta(m, name)
     dashboard.tl_add(job_dir(name), "started", f"Started ({MODES.get(m['mode'], m['mode']).split(':')[0]})")   # U07
@@ -256,6 +263,7 @@ def process_job(name):
         notify_finished(m, m["status"] == "done" and (m.get("verify") or {}).get("status") != "failed")
     except Exception:
         pass
+    phone_notify(m)   # U09b: job finished / waiting for you / safety stop
     try:  # review bundle saved with the job, so Copy/Download never wait
         build_review_md(m)
     except Exception:
@@ -555,6 +563,28 @@ def notify_finished(meta, ok):
             subprocess.run(cmd, env=env, capture_output=True, timeout=15)
         except Exception:
             pass
+
+def phone_notify(m):
+    """U09b: the phone notification for a finished job or bench run. Off unless Jason
+    set an ntfy server; the send happens on its own thread, so a job never waits for a
+    phone, and nothing here can raise into the worker."""
+    try:
+        extra = bench_overall_text(m["id"]) if m.get("kind") == "bench" else ""
+    except Exception:
+        extra = ""
+    try:
+        notifycfg.job_done(m, NOTIFY_FILE, extra)
+    except Exception:
+        pass
+
+def phone_model_check():
+    """U09b: once a minute, tell the phone when the model server stops answering.
+    Edge-triggered (one buzz while it stays down) and skipped entirely when phone
+    alerts are off, so nothing extra is ever requested."""
+    try:
+        notifycfg.model_check(NOTIFY_FILE, lambda: basalt_status() == "loaded")
+    except Exception:
+        pass
 
 def build_review_md(m):
     """Build the review bundle right after an agent job ends and save it to
@@ -1226,7 +1256,7 @@ def header(extra=""):
     st = basalt_status()
     cls = "ok" if st == "loaded" else "bad"
     return (f'<header><h1><a href="/" style="color:inherit;text-decoration:none">Agent jobs</a></h1>'
-            f'<a href="/bench">Bench</a> '
+            f'<a href="/bench">Bench</a> <a href="/notify">Phone</a> '   # U09b
             f'<span>Model: <b class="{cls}">{esc(st)}</b></span> <a href="http://127.0.0.1:8080/" target="_blank">GPU stats</a>{extra}</header>')
 
 STATE_GLYPH = {"WORKING": '<span class="dot"></span>', "QUEUED": "&#8230;", "FINISHED": "&#10003;",
@@ -1529,6 +1559,12 @@ if(cb)cb.onclick=()=>{{cb.disabled=true;cb.textContent='Building bundle...';
     return render(body)
 
 
+def notify_page(errors=(), note="", form=None):
+    """U09b: the phone-alerts settings page (server, topic, token, events, quiet hours,
+    a test button, and what the last sends did)."""
+    return render(header() + notifycfg.page_body(NOTIFY_FILE, errors, note, form, READONLY))
+
+
 class H(http.server.BaseHTTPRequestHandler):
     server_version = "jobboard"
 
@@ -1611,6 +1647,11 @@ class H(http.server.BaseHTTPRequestHandler):
         if u.path == "/": return self.send(home_page())
         if u.path == "/api/rows": return self.send(job_rows())
         if u.path == "/bench": return self.send(bench_page())
+        if u.path == "/notify":   # U09b: phone alerts
+            note = "Saved." if (q.get("ok") or [""])[0] == "1" else ""
+            if (q.get("test") or [""])[0] == "1":
+                note += " The test is on its way - its result appears under Recent sends."
+            return self.send(notify_page(note=note))
         if u.path == "/api/bench/rows": return self.send(bench_rows())
         if parts == ["bench", "compare"]:
             page = bench_compare_page((q.get("a") or [""])[0], (q.get("b") or [""])[0])
@@ -1729,6 +1770,11 @@ class H(http.server.BaseHTTPRequestHandler):
             m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"],
                         parent=prev["id"], extra=carry or None)
             return self.redirect(f"/job/{m['id']}")
+        if parts == ["notify"]:   # U09b: save the phone-alert settings (and maybe test one)
+            errors, test = notifycfg.save_form(NOTIFY_FILE, form)
+            if errors:
+                return self.send(notify_page(errors=errors, form=form), code=400)
+            return self.redirect("/notify?ok=1" + ("&test=1" if test else ""))
         if parts == ["fetch"]:   # JAIL: Download packages (form button or job page)
             folder = get("newfolder") or get("folder")
             jid = get("job") if JOB_ID_RE.fullmatch(get("job")) and load_meta(get("job")) else None
@@ -1872,15 +1918,21 @@ def main():
         notify_finished({"id": "test", "job": "Test notification from the job board"}, True)
         print("Sent one success notification (errors are ignored; check the desktop and sound).", flush=True)
         return
+    if "--test-phone" in sys.argv:   # U09b: fire one ntfy push and exit
+        sent, why = notifycfg.send_test(NOTIFY_FILE, background=False)
+        print("Phone alert sent - look at the ntfy app." if sent else f"Not sent: {why}", flush=True)
+        return
     old_jobs_notice()
     if not READONLY:   # U01: create the settings file with the defaults, so it is easy to find
         upgrades.load_settings(SETTINGS_FILE, write_defaults=True)
+        notifycfg.settings(NOTIFY_FILE, write_defaults=True)   # U09b: and the phone settings
     if READONLY:
         print("Read-only mode: no worker thread, jobs are never changed.", flush=True)
     else:
         threading.Thread(target=worker, daemon=True).start()
     srv = http.server.ThreadingHTTPServer((HOST, PORT), H)
     print(f"Job board running. Open: http://127.0.0.1:{PORT}/?t={TOKEN}", flush=True)
+    print(f"Phone alerts: {notifycfg.status_line(NOTIFY_FILE)}", flush=True)   # U09b
     srv.serve_forever()
 
 
