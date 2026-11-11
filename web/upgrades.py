@@ -28,6 +28,7 @@ from agentjobs_upgrades import checkpoints as cpm
 from agentjobs_upgrades import watchdog as wdm
 from agentjobs_upgrades.safegit import SafeGit
 import dashboard   # U07: timeline
+import visioncheck   # U06: vision checks (screenshot the app, ask the model)
 
 WEB = Path(__file__).resolve().parent
 JAIL_DIR = WEB.parent / "jail"
@@ -138,7 +139,7 @@ def stop_job_containers(jid, kill=False):
     if HOST_MODE:
         return
     try:
-        r = subprocess.run(["podman", "ps", "-q", "--filter", f"name=^agent(check|ckpt|git)-{jid}-"],
+        r = subprocess.run(["podman", "ps", "-q", "--filter", f"name=^agent(check|ckpt|git|shot)-{jid}-"],
                            capture_output=True, text=True, timeout=30)
         ids = r.stdout.split()
         if ids:
@@ -170,22 +171,36 @@ def checks_ok(v):
     if not isinstance(v, list) or not 1 <= len(v) <= CHECKS_MAX:
         return False
     for c in v:
-        if (not isinstance(c, dict) or not isinstance(c.get("name"), str) or not c["name"]
-                or len(c["name"]) > 80 or not isinstance(c.get("cmd"), str) or not c["cmd"].strip()
-                or len(c["cmd"]) > CHECK_CMD_MAX or "\x00" in c["cmd"]):
+        if not isinstance(c, dict) or not isinstance(c.get("name"), str) or not c["name"] \
+                or len(c["name"]) > 80:
             return False
         t = c.get("timeout_s", ck.DEFAULT_TIMEOUT)
         if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 7200:
+            return False
+        if c.get("type", "command") == "vision":       # U06: a screenshot + model check (no cmd)
+            if not visioncheck.check_ok(c):
+                return False
+            continue
+        if c.get("type", "command") != "command" or not isinstance(c.get("cmd"), str) \
+                or not c["cmd"].strip() or len(c["cmd"]) > CHECK_CMD_MAX or "\x00" in c["cmd"]:
             return False
     return True
 
 
 def job_checks(m):
     """The job's frozen checks (form or AGENT_CHECKS.json as it was at job start), or
-    None = read AGENT_CHECKS.json / detect at gate time."""
+    None = read AGENT_CHECKS.json / detect at gate time. U06: a vision check keeps its
+    type and its extra fields (open / spec / steps / size / mode), since it has no cmd."""
     if not m.get("checks"):
         return None
-    return [ck.Check(c["name"], c["cmd"], int(c.get("timeout_s", ck.DEFAULT_TIMEOUT))) for c in m["checks"]]
+    known = {"name", "cmd", "timeout_s", "type"}
+    out = []
+    for c in m["checks"]:
+        out.append(ck.Check(str(c.get("name") or ""), str(c.get("cmd", "")),
+                            int(c.get("timeout_s", ck.DEFAULT_TIMEOUT)),
+                            type=str(c.get("type", "command")),
+                            extra={k: v for k, v in c.items() if k not in known}))
+    return out
 
 
 def freeze_checks(m, root):
@@ -198,8 +213,14 @@ def freeze_checks(m, root):
     except Exception:
         return
     if src == "file" and checks:
-        lst = [{"name": c.name[:80], "cmd": c.cmd[:CHECK_CMD_MAX], "timeout_s": int(c.timeout_s)}
-               for c in checks if c.type == "command" and c.cmd.strip()][:CHECKS_MAX]
+        lst = []
+        for c in checks[:CHECKS_MAX]:
+            if c.type == "command" and c.cmd.strip():
+                lst.append({"name": c.name[:80], "cmd": c.cmd[:CHECK_CMD_MAX], "timeout_s": int(c.timeout_s)})
+            elif c.type == "vision":                   # U06
+                frozen = visioncheck.frozen(c)
+                if frozen:
+                    lst.append(frozen)
         if lst and checks_ok(lst):
             m["checks"] = lst
             m["checks_source"] = "AGENT_CHECKS.json at job start"
@@ -652,6 +673,8 @@ CSS = """<style>
 .feed .gate{font-weight:600}.feed .gate.ok{color:var(--ok)}.feed .gate.bad{color:var(--bad)}.feed .gate.warn{color:var(--warn)}.feed .gate.warn2{color:#d9631e}
 .feed .gate.bad{border:2px solid var(--bad);border-radius:7px;padding:8px}
 td.c-ok{color:var(--ok)}td.c-bad{color:var(--bad)}
+img.shot{width:230px;max-width:46vw;border:1px solid var(--line);border-radius:6px;margin:4px 8px 0 0;vertical-align:top;background:#fff}
+td.shots{padding-top:2px}ul.issues{margin:4px 0 0;padding-left:20px}
 </style>"""
 
 
@@ -662,9 +685,42 @@ def verify_line_html(s):
     return f'<div class="vline t-{esc(b.get("colour"))}" id="bverify">{esc(b.get("text"))}</div>'
 
 
-def _res_rows(results):
+def _vision_row(i, r, jid, src):
+    """One screenshot check: verdict, the screenshots, what the model saw wrong."""
+    v = r.get("verdict") or "inconclusive"
+    cls = "c-ok" if r.get("ok") else "c-bad"
+    mark = "&#10003;" if r.get("ok") else ("&#63;" if v == "inconclusive" else "&#10007;")
+    detail = str(r.get("cmd") or "vision") + " &middot; " + esc(r.get("mode", "advisory"))
+    if isinstance(r.get("asked"), int):
+        detail += " &middot; asked " + str(int(r["asked"])) + "x"
+    if r.get("url"):
+        detail += " &middot; " + esc(r["url"])[:80]
+    rows = (f'<tr><td class="{cls}">{mark} {esc(r.get("name"))}</td><td class="hint">{detail}</td>'
+            f'<td class="{cls}">{esc(visioncheck.WORD.get(v, v))}</td><td>{esc(r.get("seconds"))} s</td></tr>')
+    shots = [str(s) for s in (r.get("screenshots") or []) if str(s)]
+    if shots:
+        if jid and src:
+            pics = "".join(
+                f'<a href="/api/shot/{esc(jid)}?src={esc(src)}&amp;n={i}&amp;i={k}" target="_blank" '
+                f'title="Screenshot {k + 1} - click for full size">'
+                f'<img class="shot" src="/api/shot/{esc(jid)}?src={esc(src)}&amp;n={i}&amp;i={k}" '
+                f'alt="screenshot {k + 1}"></a>' for k in range(len(shots)))
+            rows += f'<tr><td colspan=4 class="shots">{pics}</td></tr>'
+        else:
+            rows += ('<tr><td colspan=4 class="hint">screenshots: '
+                     + ", ".join(esc(Path(s).name) for s in shots) + "</td></tr>")
+    if r.get("issues"):
+        rows += ('<tr><td colspan=4><ul class="issues">'
+                 + "".join(f"<li>{esc(x)}</li>" for x in list(r["issues"])[:20]) + "</ul></td></tr>")
+    return rows
+
+
+def _res_rows(results, jid=None, src=None):
     rows = ""
-    for r in results or []:
+    for i, r in enumerate(results or []):
+        if r.get("type") == "vision":                     # U06: a screenshot check
+            rows += _vision_row(i, r, jid, src)
+            continue
         counts = " / ".join(f"{r.get(k)} {k}" for k in ("passed", "failed", "skipped") if r.get(k) is not None)
         cls = "c-ok" if r.get("ok") else "c-bad"
         rows += (f'<tr><td class="{cls}">{"&#10003;" if r.get("ok") else "&#10007;"} {esc(r.get("name"))}</td>'
@@ -673,6 +729,13 @@ def _res_rows(results):
         if not r.get("ok") and r.get("first_error"):
             rows += f'<tr><td colspan=4><pre class="bad">{esc(r["first_error"][:3000])}</pre></td></tr>'
     return rows
+
+
+def _check_hint(c):
+    """One frozen check, as a short piece of HTML (a screenshot check has no command)."""
+    if c.get("type") == "vision":
+        return "<code>screenshot of %s</code>" % esc(str(c.get("open") or "")[:60])
+    return f"<code>{esc(c.get('cmd', ''))}</code>"
 
 
 def checks_card_html(m, jid, can_recheck):
@@ -691,7 +754,7 @@ def checks_card_html(m, jid, can_recheck):
     if fixed:
         src = m.get("checks_source") or "the new-job form"
         parts.append(f'<p class="hint">Checks from {esc(src)}: ' +
-                     ", ".join(f"<code>{esc(c['cmd'])}</code>" for c in fixed) + "</p>")
+                     ", ".join(_check_hint(c) for c in fixed) + "</p>")
     for rnd in (v or {}).get("rounds", []):
         summ = rnd.get("summary") or {}
         title = "After the agent finished" if rnd["round"] == 0 else f"After fix round {rnd['round']}"
@@ -699,7 +762,7 @@ def checks_card_html(m, jid, can_recheck):
         parts.append(f'<h3 style="font-size:14px;margin:12px 0 4px">{esc(title)}: <span class="t-{colour}">{esc(text)}</span></h3>')
         if summ.get("source") == "detected":
             parts.append('<p class="hint">Checks were detected from the project files.</p>')
-        rows = _res_rows(summ.get("results"))
+        rows = _res_rows(summ.get("results"), jid, "round%d" % int(rnd.get("round") or 0))
         if rows:
             parts.append(f'<div class="tbl"><table>{rows}</table></div>')
         if rnd.get("issues"):
@@ -713,7 +776,7 @@ def checks_card_html(m, jid, can_recheck):
         else:
             parts.append(f'<h3 style="font-size:14px;margin:12px 0 4px">Checked again at {when}: '
                          f'<span class="t-{colour}">{esc(text)}</span></h3>')
-            rows = _res_rows((rech.get("summary") or {}).get("results"))
+            rows = _res_rows((rech.get("summary") or {}).get("results"), jid, "recheck")
             if rows:
                 parts.append(f'<div class="tbl"><table>{rows}</table></div>')
     btn = ""
@@ -785,6 +848,17 @@ def new_job_fields(default_rounds):
 
 # ------------------------------------------------------------------ review bundle
 
+def _vision_md(r):
+    """Markdown lines for one screenshot check: verdict, what the model saw wrong, and the
+    screenshot file names (so whoever reviews the bundle can ask for the pictures)."""
+    out = [f"  - screen check `{r.get('name')}`: {r.get('verdict')} ({r.get('mode', 'advisory')})"]
+    for i in list(r.get("issues") or [])[:20]:
+        out.append(f"    - seen on screen: {i}")
+    for p in list(r.get("screenshots") or [])[:8]:
+        out.append(f"    - screenshot: {Path(str(p)).name}")
+    return out
+
+
 def bundle_section(m):
     """Markdown for the review bundle: verify rounds, guard issues, checkpoints, watchdog."""
     out = []
@@ -803,12 +877,19 @@ def bundle_section(m):
                 tag = "agent finished" if rnd["round"] == 0 else f"fix round {rnd['round']}"
                 out.append(f"- {tag}: {ck.banner_text(summ)[1]}")
                 for r in summ.get("results", []):
+                    if r.get("type") == "vision":                 # U06
+                        out += _vision_md(r)
+                        continue
                     counts = ", ".join(f"{r.get(k)} {k}" for k in ("passed", "failed", "skipped") if r.get(k) is not None)
                     out.append(f"  - `{r.get('cmd')}` exit {r.get('exit_code')}" + (f" ({counts})" if counts else ""))
                 for i in rnd.get("issues") or []:
                     out.append(f"  - CHEATING GUARD: {i}")
         if m.get("recheck") and (m["recheck"].get("summary")):
-            out.append(f"- checked again: {ck.banner_text(m['recheck']['summary'])[1]}")
+            summ = m["recheck"]["summary"]
+            out.append(f"- checked again: {ck.banner_text(summ)[1]}")
+            for r in summ.get("results", []):
+                if r.get("type") == "vision":
+                    out += _vision_md(r)
     cp = m.get("checkpoints")
     if cp or m.get("checkpoints_note"):
         out.append("\n## Checkpoints")

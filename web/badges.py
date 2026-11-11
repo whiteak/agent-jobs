@@ -59,6 +59,8 @@ def badges(m, jid=None):
         text = name + (f" {p}/{p + f}" if (p or f) else "")
         if r.get("timed_out"):
             text += " timed out"
+        if r.get("type") == "vision" and r.get("verdict") == "inconclusive":
+            text += " (not sure)"        # U06: the model could not tell
         out.append({"text": text, "ok": bool(r.get("ok")), "name": name,
                     "cmd": str(r.get("cmd") or "")[:300],
                     "seconds": r.get("seconds"),

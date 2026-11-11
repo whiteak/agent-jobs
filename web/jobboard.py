@@ -27,6 +27,7 @@ import notifycfg  # U09b: phone alerts (ntfy) - settings page, events, quiet hou
 import attempts   # U05: best-of-N for hard steps (fresh copies, ranking, Attempts card)
 import planning   # U04a: an outline -> a plan of milestones and tasks to check before anything runs
 import taskqueue  # U04b: an approved plan runs as a queue of tasks, one job at a time
+import visioncheck  # U06: screenshot the app and ask the model whether it looks right
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -456,6 +457,10 @@ def run_gate(ctx):
     m, name, jid = ctx.m, ctx.name, ctx.m["id"]
     maxr = m["fix_rounds"] if isinstance(m.get("fix_rounds"), int) else int(ctx.cfg["fix_rounds"])
     wrap = upgrades.make_wrap(ctx.root, m["folder"], f"agentcheck-{jid}")
+    # U06: a vision check screenshots the app in the same jail, then the board asks the
+    # model - which is idle here, because the gate only runs after the agent has stopped.
+    shots = visioncheck.runners(wrap=upgrades.make_wrap(ctx.root, m["folder"], f"agentshot-{jid}"),
+                                emit=ctx.ev.emit)
     tag = attempts.phase_tag(m)   # U05: "Attempt 2 of 3 - " while a hard job is being tried
     state = {"round": 0}
 
@@ -470,7 +475,7 @@ def run_gate(ctx):
         ctx.ev.emit("checks_start", "Running checks in the sandbox" + (f" after fix round {r}" if r else ""))
         ctx.ev.release()
         summary = ck.run_all(ctx.root, ctx.checks_root / "checks" / f"round-{r}", wrap,
-                             checks=upgrades.job_checks(m))
+                             checks=upgrades.job_checks(m), extra_runners=shots)
         if stopped():
             raise GateAbort("user_stop")
         return summary
@@ -1938,6 +1943,17 @@ class H(http.server.BaseHTTPRequestHandler):
             if got is None:
                 return self.send_error(404)
             return self.send(got[0], "text/plain; charset=utf-8")
+        if len(parts) == 3 and parts[:2] == ["api", "shot"] and load_meta(parts[2]):      # U06: a screenshot
+            p = visioncheck.shot_file(load_meta(parts[2]), (q.get("src") or [""])[0],
+                                      (q.get("n") or [""])[0], (q.get("i") or [""])[0], job_dir(parts[2]))
+            if p is None:
+                return self.send_error(404)
+            self.send_response(200); self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(p.stat().st_size))
+            self.send_header("Content-Disposition", f'inline; filename="{p.name}"')
+            self.end_headers()
+            with open(p, "rb") as f: shutil.copyfileobj(f, self.wfile)
+            return
         if len(parts) == 3 and parts[:2] == ["api", "bundle"] and load_meta(parts[2]):
             m = load_meta(parts[2])
             if m.get("kind") == "bench":
@@ -2133,8 +2149,11 @@ def u01_button(kind, jid, get):
         def go():
             try:
                 wrap = upgrades.make_wrap(root, m["folder"], f"agentcheck-{jid}")
+                # U06: "Run checks again" screenshots again too - the model is free, nothing is running
+                shots = visioncheck.runners(wrap=upgrades.make_wrap(root, m["folder"], f"agentshot-{jid}"),
+                                            emit=ev.emit)
                 summ = ck.run_all(root, job_dir(jid) / "checks" / f"again-{int(time.time())}", wrap,
-                                  checks=upgrades.job_checks(m))
+                                  checks=upgrades.job_checks(m), extra_runners=shots)
                 colour, text = ck.banner_text(summ)
                 ev.emit("checks", f"Checks run again: {text}", None, upgrades.TONE.get(colour, ""))
                 update_meta(jid, recheck={"running": False, "time": time.time(), "summary": summ})
