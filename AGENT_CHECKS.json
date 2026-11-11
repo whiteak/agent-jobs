@@ -1,0 +1,1 @@
+{"checks":[{"name":"web tests","cmd":"cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests","timeout_s":1800}]}
