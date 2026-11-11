@@ -1,3 +1,65 @@
+# Job 01 — Upgrade 7a: live dashboard, part 1 (timeline + live log)
+
+## Findings
+
+- Already here (WIP `9d3683f` from `agent/jobboard-u07`, merged into this shared copy; `656742c`
+  and `b433423` fixed its own broken bits): `web/dashboard.py` = `timeline_for`/`tl_add`
+  (`JOBS/<id>/timeline.jsonl` through `agentjobs_upgrades.events.JobEvents`), `job_stream()`
+  (SSE: `retry`, `job` events with ids, `log` batches with byte offsets, `status`, keepalive,
+  `end`), `badge`/`checks_cell`, the timeline + live-log cards and their CSS; routes
+  `/api/jobs/<id>/events` (`H.sse_job`, jobboard.py:1733, honours `Last-Event-ID` **and**
+  `?log=`/`?last=`) and `/api/raw/<id>` (last 8 MB); the job page's live-log JS (rows by kind,
+  10 lines + "Show more", search, follow/pause) and the Checks column in the jobs list.
+  `web/tests/test_u07_dashboard.py` already covers the SSE format, Last-Event-ID resume, the
+  log parser on the three real logs in `web/sample-jobs` and the badges. So this job is
+  "audit, finish, test, smoke, report", not a rewrite.
+- How the timeline gets filled: `upgrades.EventLog.emit` also calls `dashboard.tl_add` using
+  `dashboard.TL_KIND`, so everything upgrades 1–3 already emits lands there — `checks`,
+  `fix_round`, `needs_review` (from `verify.VerifyGate` via `upgrades.gate_emit`),
+  `checkpoint`/`checkpoint_skipped`/`checkpoint_error`/`rollback` (from `CheckpointManager`),
+  `watchdog`/`safety_stop` (from the watchdog, upgrades.py:497-505), `guard`, `restart`;
+  `queued`/`started`/`step`/`finished` come from `process_job`, and 4a/4b/5 call
+  `dashboard.tl_add` directly for `plan`/`queue`/`attempt`. `checks_start` is deliberately not
+  a timeline row. `verify["timeline"]` (a one-line summary string) is a different, older thing
+  and stays untouched.
+- Real gaps found: `events.ICONS` has no icon for the `attempt`/`plan`/`queue` rows those
+  modules add, so they fell back to "•"; nothing asserts that every kind the spec names gets a
+  row with icon/time/colour, that the page keeps the **polling fallback** when the stream
+  drops, or that a real fake-agent job writes the timeline (the U01 gate path is asserted
+  against `events.jsonl` but never against `timeline.jsonl`); the `.hit` CSS rule is dead.
+- Live-log rows: `jobboard.events()` classifies each line (`k` = text/think/tool/result/gate/
+  final/log, `cat` = cmd/edit/read/other through `tool_cat`), sends long results whole up to
+  20 000 chars (the page collapses to 10 lines) and returns the next byte offset so a reload
+  or a reconnect resumes where it left off.
+- Private copy: `JOBBOARD_PORT/JOBS/WORK/PLANS/QUEUES/SETTINGS/NOTIFY` put everything in my own
+  folders (`HOME` decides `SANDBOX`, where the web token goes); `JOBBOARD_FAKE=1` +
+  `JOBBOARD_JAIL=host` runs the fake agent. Never port 8090; 8091 is mine.
+- Test command (`AGENT_CHECKS.json`, the verify gate): `cd web && PYTHONDONTWRITEBYTECODE=1
+  python3 -W ignore -m unittest discover -s tests`. Baseline before my changes: **635 tests,
+  OK** (270 s).
+
+## Steps
+
+- [x] PLAN.md (this file) committed before the code.
+- [x] Run the suite as it stands (the 7a WIP is already merged) and record the count.
+      `Ran 635 tests in 270.529s — OK`.
+- [ ] Timeline polish: icons for the `attempt`/`plan`/`queue` rows, remove the dead `.hit` rule.
+- [ ] Tests in `web/tests/test_u07_dashboard.py`: a row with icon, time and colour for every
+      timeline kind the spec names (queued, started, step ticked, checks pass/fail, fix round,
+      checkpoint, rollback, watchdog, safety stop, finished, restart, needs review) + the whole
+      `EventLog` kind → timeline mapping; event text is escaped; `finished_text`; the board's
+      own `agentjobs` lines and unparsable lines in the live log; the page keeps the polling
+      fallback and the collapse/follow wording.
+- [ ] End-to-end proof: a fake-agent job (child process, temp folders, `JOBBOARD_JAIL=host`)
+      writes queued → started → step ticked → checks → finished into `timeline.jsonl`, and the
+      real `/api/jobs/<id>/events` route replays them with ids and the log offset.
+- [ ] Full suite green with the gate's command.
+- [ ] Smoke run: private copy on `127.0.0.1:8091` (own state folders, fake agent) — job page,
+      the live SSE stream watched as it grows, Last-Event-ID resume, raw log, list badges.
+- [ ] AGENT_REPORT.md section for this job; HANDOFF-7a.md marked resolved.
+
+---
+
 # Job 11 — Upgrade 6b: vision check, part 2 (Android)
 
 ## Findings
