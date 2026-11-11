@@ -437,6 +437,8 @@ def capture(project, spec, adb_path=None, serial: str = "", run: Callable = None
     if png is None:
         return _result(adb, st, {"error": "The device would not send a screenshot "
                                           "(screencap failed).", "fatal": True})
+    adb.note("the screen held still after %d screenshots" % shots if stable
+             else "the screen was still changing after %d screenshots - using the last one" % shots)
     died, crash = app_crashed(adb, st["pkg"])
     if died:
         return _result(adb, st, {"error": "App crashed on start - the screen never settled.",

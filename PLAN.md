@@ -55,7 +55,7 @@
 ## Steps
 
 - [x] PLAN.md (this file) committed before the code.
-- [ ] `web/agentjobs_upgrades/android.py` (new, tested engine): adb lookup, `devices`
+- [x] `web/agentjobs_upgrades/android.py` (new, tested engine): adb lookup, `devices`
       parsing, APK find under `app/build/outputs/apk/debug`, `install -r`, package
       detection (`pm list packages -3` diff, `applicationId` fallback),
       `cmd package resolve-activity --brief`, `am start -W`, crash detection (`pidof` +
@@ -64,11 +64,11 @@
       screenshot after each) and the `capture()`/`smoke()` sequences that answer in the 6a
       capture shape. Every device command goes through one `Adb.call(argv)` — argv only,
       no shell — with `run`/`sleep`/`now` injectable so the tests are fast.
-- [ ] Fake adb on PATH for the tests: a small python script (scenario + argv log through
+- [x] Fake adb on PATH for the tests: a small python script (scenario + argv log through
       env vars) covering devices, install ok/fail, package lists, resolve-activity,
       `am start`, `pidof`, logcat crash blocks, screencap (moving/steady frames) and the
       `input` steps.
-- [ ] `web/androidcheck.py` (new, `# U06b` glue): entry validation + frozen record for
+- [x] `web/androidcheck.py` (new, `# U06b` glue): entry validation + frozen record for
       `target: "android"` vision checks and `type: "android-smoke"`; device choice (check
       `device` → settings `android_device` → first connected, with an unfilled
       `{{ANDROID_DEVICE}}` treated as auto); clear errors (`No device`, `APK not built`,
@@ -76,20 +76,20 @@
       an Android `capture_fn`; `run_smoke` = install + start + 10 s without a crash (no
       model); `runners()` = `android-smoke` plus a `vision` that sends
       `target: "android"` here and everything else to 6a.
-- [ ] Two small additions in `visioncheck.run_check`: a capture that reports a real
+- [x] Two small additions in `visioncheck.run_check`: a capture that reports a real
       device-side failure (`fatal`) is a **fail**, not "not sure"; a skipped check gets a
       word and colour of its own.
-- [ ] Wiring: `upgrades.checks_ok`/`freeze_checks` accept both Android shapes;
+- [x] Wiring: `upgrades.checks_ok`/`freeze_checks` accept both Android shapes;
       `checks.detect_checks` adds a required `app runs` android-smoke check for a real
       Android app; settings get `android_device`; jobboard registers the Android runners
       in the gate and in "Run checks again"; the Checks card, the frozen-check hint, the
       badge text and the review bundle show the device, the package and the crash lines.
-- [ ] Tests `web/tests/test_u06b_android.py`: the engine against the fake adb (exact argv
+- [x] Tests `web/tests/test_u06b_android.py`: the engine against the fake adb (exact argv
       sequences: install, launch, crash, stable wait, steps), the three clear errors,
       no-device = skipped and never fatal, the model check on an Android screenshot, the
       smoke check pass/crash, `run_all` + banner + fix prompt, records
       (validate/freeze/detect), pages (card row, badge, bundle).
-- [ ] Full suite green; PLAN ticked; AGENT_REPORT.md section for job 11.
+- [x] Full suite green; PLAN ticked; AGENT_REPORT.md section for job 11.
 
 ---
 

@@ -129,6 +129,7 @@ class Engine(DeviceCase):
             self.assertIn(want, self.device_saw())
         self.assertEqual([c for c in seen if any(ch in c for ch in "|;&`$")], [])   # never a shell
         self.assertIn("$ install", cap["log"])
+        self.assertIn("the screen held still after 2 screenshots", cap["log"])
 
     def test_the_stable_wait_needs_two_matching_frames(self):
         self.scenario(frames=["a", "b", "c", "c", "c"])
@@ -139,6 +140,15 @@ class Engine(DeviceCase):
         self.assertEqual(shots, 4)                                   # a b c c -> the 3rd and 4th match
         self.assertEqual(len(waited), 3)
         self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_a_screen_that_keeps_moving_is_said_so_and_still_checked(self):
+        self.scenario(frames=["a", "b", "c", "d", "e"])
+        cap = ad.capture(self.project(), {"stable_gap_s": 0.2, "stable_max_s": 0.4},
+                         adb_path=str(FAKE_ADB), serial="emulator-5554")
+        self.assertFalse(cap["stable"])
+        self.assertIsNone(cap["error"])                 # a busy screen is not the app's fault
+        self.assertIn("the screen was still changing after 3 screenshots", cap["log"])
+        self.assertTrue(cap["shots"][0][1].startswith(b"\x89PNG"))   # the last frame is used
 
     def test_the_stable_wait_never_waits_longer_than_its_budget(self):
         self.scenario(frames=["a", "b", "c", "d", "e", "f", "g"])

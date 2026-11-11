@@ -505,3 +505,216 @@ purpose — a check you asked to be required that cannot run should be loud.
 - `~/agent-sandbox` untouched (its `state/web-token` only ever read); every test and the smoke run
   used their own temp folders, port 8123, and `JOBBOARD_READONLY=1`. No installs, no network,
   stdlib only.
+
+---
+
+## Job 11 — Upgrade 6b: vision check, part 2 (Android)
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md has the findings and the step list, all ticked.
+
+**The one thing that cannot work in this sandbox: there is no device.** Checked, not assumed —
+`adb` **is** installed (`/opt/android-sdk/platform-tools/adb`, on PATH), but
+`adb devices` → **no devices attached**, and there is **no emulator to start**
+(`/opt/android-sdk/emulator` and `system-images` are not in the image; `avdmanager` exists but
+there is nothing to create an AVD from and no network to fetch one). `~/agent-sandbox/state/
+android-sdk` does not exist in this container. So **no real phone or emulator was ever touched
+here**: the engine, the checks, the pages and the bundle are built and tested against **a fake adb
+script on PATH** (`web/tests/fixtures/fakeadb/adb`), and on this machine every Android check
+resolves to the honest skip the job asked for:
+
+```
+$ python3 -c "from agentjobs_upgrades import android; a=android.Adb('',android.find_adb(''));
+              print(android.devices(a), android.pick_device(a,''))"
+[] ('', 'No device connected - plug in a phone or start an emulator.')
+```
+
+That is reported as `skipped`, forced to `advisory`, and **does not fail the job** — which is
+exactly the ground rule for this job.
+
+Commits in this job (on top of `5a85117`, job 10's last commit):
+
+- `778ecb8` U06b: PLAN.md — findings (what 6a's `run_check` contract already gives me, where the
+  runners/records/pages are wired, adb is here but no device and no emulator package, and why adb
+  cannot run in the jail) plus the step list
+- `37a3da5` U06b: the device engine (`agentjobs_upgrades/android.py`)
+- `da14f79` U06b: the two checks (glue + gate/cards/bundle/settings wiring)
+- `debf33f` U06b: 40 tests against a fake adb on PATH
+- last commit: the device log now says whether the screen settled (`the screen held still after 2
+  screenshots` / `the screen was still changing after 3 screenshots - using the last one`) + 1 test;
+  PLAN.md ticks and this report (41 tests)
+
+### Files changed
+
+| File | What it is |
+| --- | --- |
+| `web/agentjobs_upgrades/android.py` | **new** (494 lines) — the tested engine: `find_adb`, `devices`/`pick_device`, `find_apk`, `install -r`, which app got installed (`pm list packages -3` diff → `applicationId` in `app/build.gradle` → the check's `pkg`), `cmd package resolve-activity --brief`, `am force-stop` + `am start -W`, crash detection (`pidof` + `logcat -d` blocks that name *our* package), `exec-out screencap -p`, the stable-screen wait, the `input tap/swipe/text/keyevent/wait` steps, and the two sequences `capture()` (6a's capture shape) and `smoke()`. Every device command is one `Adb.call(argv)` — argv only, never a shell — with `run`/`sleep`/`now`/`deadline` injectable so the tests are quick. |
+| `web/androidcheck.py` | **new** (318 lines, `# U06b`) — the glue: what a valid Android check entry is (`check_ok`) and its frozen record (`frozen`), the spec the engine is given, which device to use, the three clear errors, the result + log the gate wants, the "no device" skip, and `runners()` (adds `android-smoke`, and a `vision` that routes `target: "android"` here and everything else to 6a). |
+| `web/visioncheck.py` | three small additions: `spec_fn` (so a check's own fields reach the capture — that is how the APK and the steps get to the phone), a capture that reports `fatal` is a **fail** and not "not sure" (with `issue_extra`, i.e. the crash lines, in the issues), and the word `skipped` → "no device". The log label "browser output:" is now "capture log:". |
+| `web/upgrades.py` | `checks_ok`/`freeze_checks` accept `target: "android"` vision checks and `android-smoke`; settings gain `android_device` and `android_adb` (and `load_settings` now keeps text settings); the Checks card gets `_android_row` and names the device/app/crash in the vision row; `_check_hint` says "install and start the app on a phone" / "screenshot of the app on a phone"; the review bundle gets `_android_md`. |
+| `web/agentjobs_upgrades/checks.py` | `detect_checks` adds a **required** `app runs` `android-smoke` check for a real Android app (a `gradlew` **and** an `AndroidManifest.xml` under `app/src/main/`), so an Android project with no AGENT_CHECKS.json still has to start. `test_checks.py::test_gradle` (which pins the two gradle checks) stays true — a plain Gradle project gets no device check. |
+| `web/jobboard.py` | `run_gate` and "Run checks again" register the Android runners on top of the 6a ones (`androidcheck.runners(web=…, cfg=…)`). |
+| `web/badges.py` | a device check badges `… (no device)` when nothing was checked on, and keeps `… (not sure)` for an unsure screen check. |
+| `web/tests/fixtures/fakeadb/adb` | **new** (executable, 147 lines) — the fake device. |
+| `web/tests/test_u06b_android.py` | **new** (619 lines), 41 tests. |
+| `PLAN.md` | findings + steps. |
+
+`web/agentjobs_upgrades/vision.py`, `checks.py`, `verify.py` and `report.py` are used as written —
+`vision.check(votes=2)`, `to_check_result`, `checks.run_all(extra_runners=…)`,
+`summarize`'s advisory rule and `verify.build_fix_prompt`'s "Problems seen on screen:" block all do
+their part; the model half of requirement 3 **is** 6a: an Android check goes through
+`visioncheck.run_check(..., capture_fn=android.capture)`, so the PNGs are saved, sized and asked
+about exactly as a web screenshot is.
+
+### How each requirement is met
+
+1. **Target `android`** — `{"name": "the screen", "type": "vision", "target": "android",
+   "spec": "…", "apk": "app/build/outputs/apk/debug/app-debug.apk", "pkg": "com.example.app",
+   "steps": [{"tap": [360, 1900]}, {"text": "buy milk"}, {"key": "KEYCODE_ENTER"},
+   {"wait": 400}]}`:
+   * **Install** — `find_apk` takes the check's `apk` or globs `app/build/outputs/apk/debug/*.apk`
+     (also `*/build/outputs/apk/debug/` and `build/…`), then `adb install -r`.
+   * **Find and launch the main activity** — `adb shell cmd package resolve-activity --brief
+     <pkg>`, then `am force-stop` (so an old instance cannot fake a pass) and `am start -W`. The
+     package comes from the check, or from the third-party package list before/after the install,
+     or from `applicationId` in `app/build.gradle`.
+   * **Wait until the screen is stable** — `wait_stable`: two `exec-out screencap -p` 1 s apart
+     that are byte-identical, at most 20 s. A device that animates forever never settles: the last
+     frame is used and the log says `stable: false`.
+   * **The screenshot** — `adb exec-out screencap -p` (raw PNG over stdout, nothing written inside
+     the project folder).
+   * **Optional steps with a screenshot after each** — `input tap x y`, `input swipe x1 y1 x2 y2`,
+     `input text <t>` (spaces → `%s`), `input keyevent <KEYCODE_…>`, `{"wait": ms}`; the shots are
+     `start`, `step1…N`, `final`, and `final` is what the model is shown. A step the device refuses
+     is recorded and the check carries on.
+2. **The device** — the check's `"device"`, else the board's setting `android_device`, else the
+   first entry in `adb devices`; a `{{ANDROID_DEVICE}}` nobody filled in counts as unset (auto).
+   **No emulator is ever started** (the spec forbids it while the model is busy, and this image has
+   no emulator anyway); there is nothing to stop, and the app itself is `force-stop`ped before each
+   start so every check begins clean.
+3. **Then the same model check as 6a** — the capture answers in 6a's shape, so
+   `visioncheck.run_check` sizes it (≤1280 px), saves the PNGs under `JOBS/<id>/checks/round-N/`,
+   writes `check-<name>.log` (the adb transcript + both model answers), asks twice
+   (`vision.check(votes=2)`) and returns the `checks.run_all` dict. `/api/shot` serves the pictures
+   with no new route.
+4. **Clear errors** — `No device connected - plug in a phone or start an emulator.` /
+   `APK not built - there is no debug APK under app/build/outputs/apk/debug.` (also
+   `APK not built: <rel> is not a file inside the project folder`, and
+   `APK not built: <pkg> has no launcher activity to open`) /
+   `App crashed on start - it was not still running after 10 seconds.` (smoke) and
+   `App crashed on start - the screen never settled.` (screen check), with the **logcat lines in
+   the result** (`crash`, and the same lines in `issues` → "Problems seen on screen:" in the fix
+   prompt, the card and the bundle). A crash is found with `pidof` *and* `logcat -d` blocks
+   (`FATAL EXCEPTION`, `Fatal signal`, `ANR in`, `beginning of crash`, `has died`) that name our
+   package; a device with no `pidof` still gets a verdict from logcat, and another app's crash is
+   never blamed on ours. An install the device refused and a start it refused are their own errors.
+5. **`android-smoke`, required by default** — `{"name": "app runs", "type": "android-smoke",
+   "mode": "required"}`: install, start, the app must still be running after 10 s (`hold_s` 1–120),
+   **no model, no screenshots**. `detect_checks` gives it to any real Android app automatically, so
+   a project with no AGENT_CHECKS.json cannot pass the gate with an app that will not start. A
+   check with no device is `skipped` + `advisory`, so it never fails a job; no APK, a refused
+   install and a crash are real fails that start a fix round.
+
+### Verified
+
+- Gate command, as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 633 tests in 266.201s` / `OK`** (baseline before this job: **592 tests, OK**; +41).
+  Nothing deleted, skipped or weakened — the earlier suites (`test_checks`, `test_u01`,
+  `test_u06a_vision`, the JAIL/U07/VOICE ones) all still pass untouched.
+- The new file alone: `python3 -W ignore -m unittest tests.test_u06b_android` →
+  `Ran 41 tests in 79.734s / OK`. It really runs the fake binary as a subprocess through PATH, so
+  what is asserted is the exact argv the device would see, e.g.
+  `-s d install -r <apk>`, `-s d shell pm list packages -3`, `-s d shell cmd package
+  resolve-activity --brief com.example.app`, `-s d shell am force-stop …`,
+  `-s d shell am start -W -n com.example.app/.MainActivity`, `-s d shell logcat -c/-d -t 200`,
+  `-s d exec-out screencap -p`, `-s d shell input tap 360 1900`, `-s d shell input text buy%milk`.
+  Covered: install ok/refused; the activity lookup and a refused start; which app got installed
+  (pm diff, `applicationId`, and "the device would not say which app it is"); the stable wait
+  needing **two matching frames** (frames `a,b,b` → stable after 3 shots; `a,b,c,…` → not stable,
+  still proceeds, and the log says *the screen was still changing after 3 screenshots — using the
+  last one*) and never waiting past its own budget; crash by `pidof`, crash by logcat only
+  when `pidof` does not exist, another app's crash ignored; steps sent in order with a shot after
+  each and a refused step reported but not fatal; `tap`/`swipe` arity, printable text,
+  `KEYCODE_*`/digit keys; the APK outside the project folder refused; no device and no adb;
+  settings → device; `hold_s`; the model being asked **twice** over a phone screenshot (in-process
+  fake model server) and **not asked at all** when the device said it crashed; `checks.run_all` →
+  `failed` → `build_fix_prompt` carrying `App crashed on start` + `FATAL EXCEPTION`; the frozen
+  record and the rejects (`../x.apk`, an absolute path, a junk `pkg`/`device`, a 3-number tap);
+  `detect_checks` for an app vs a plain Gradle project; the card row, the badge and the bundle.
+- One run **outside the tests**, end to end (`checks.run_all` + the fake adb + a throw-away Android
+  project in `/tmp`: `gradlew`, `app/src/main/AndroidManifest.xml`,
+  `app/build/outputs/apk/debug/app-debug.apk`, `app/build.gradle`):
+
+  ```
+  detected: [('build', 'command'), ('tests', 'command'), ('app runs', 'android-smoke', {'mode': 'required'})]
+  == app stays up ==  ('green', 'Checks passed')            verdict=pass    device=demo-5554 pkg=com.example.notes
+  == app crashes ==   ('red', 'Checks failed: app runs')   verdict=fail    + "Problems seen on screen: E AndroidRuntime: FATAL EXCEPTION: main" in the fix prompt
+  == no device ==     ('yellow', 'Done – not verified …')  verdict=skipped (advisory), no fix round
+  ```
+
+### Try it by hand (with a phone plugged in)
+
+1. `adb devices` must list the phone (USB debugging on). Optionally set the serial in the board's
+   settings (`android_device`) — leave it empty to use the first device.
+2. In the project's `AGENT_CHECKS.json`:
+
+   ```json
+   {"checks": [
+     {"name": "app runs", "type": "android-smoke", "mode": "required"},
+     {"name": "the notes screen", "type": "vision", "target": "android",
+      "steps": [{"tap": [360, 1900]}, {"text": "buy milk"}, {"key": "KEYCODE_ENTER"}],
+      "spec": "a list of notes and a + button bottom right", "mode": "required"}]}
+   ```
+
+   With no AGENT_CHECKS.json an Android app gets the `app runs` smoke check by default.
+3. Run a job. After the agent finishes, the Checks card shows
+   `✓ app runs · android: install + start app-debug.apk · required · emulator-5554 · com.example.app · the app ran`
+   and the screen check's row with the phone's screenshot (click for full size). The badge opens
+   the log: the adb transcript, `stable: true`, both model answers, the verdict.
+4. Break the app so it dies at launch: the job ends *Checks failed: app runs*, the timeline says
+   `Device check "app runs": the app did not run`, and the fix round's prompt contains
+   *Problems seen on screen:* followed by the `FATAL EXCEPTION` lines.
+5. Unplug the phone: the row reads `no device`, the log says *No device connected — plug in a
+   phone or start an emulator.*, and the job is **not** failed for it.
+6. **Download .md**: `- device check \`app runs\`: fail (required)` / `- device emulator-5554, app
+   com.example.app, apk app-debug.apk` / `- logcat: E AndroidRuntime: FATAL EXCEPTION: main`.
+
+### Unfinished / assumed
+
+- **No real device or emulator was used here** (see the top). Every Android claim above is verified
+  against the fake adb: the argv, the parsing of real `adb devices`/`pm list packages`/
+  `resolve-activity`/`am start -W`/logcat/screencap output shapes, and the PNG bytes. What a real
+  device may still need: a device that needs `adb wait-for-device` or a `adb root`/`adb tcpip`
+  step first, foldables/emulators whose `screencap` is slow (the defaults are 120 s for one adb
+  command, 300 s for the install and 60 s for a screenshot, inside a whole-check budget of
+  `timeout_s` — 1200 s for a detected check, so a stalled device cannot hold the gate), and apps whose
+  launcher activity is not the one `resolve-activity` returns (put `"pkg"`/fix the manifest).
+- **adb runs on the host, not in the jail.** This is a decision, not an oversight:
+  `jail/podman-local.sh` starts every job container with `--network none` and no USB, so a
+  container has no way to reach a device — and the project's own code still never runs on the host.
+  The guard rails are: one `Adb.call(argv)` that never goes through a shell, the device words are
+  fixed, the APK path is resolved and must stay inside the project folder, `pkg`/`device`/step text
+  are validated (a serial is `[A-Za-z0-9._:-]`, text is printable ASCII, keys are `KEYCODE_*`), and
+  nothing is written inside the project folder (screenshots come back as bytes, like 6a's driver).
+  The device is outside the sandbox's blast radius either way — if one is connected, a check can
+  install and tap on it. Say the word if you want Android checks limited to a fixed allow-list of
+  serials, or off unless `android_device` is set.
+- `{{ANDROID_DEVICE}}` in a check is treated as "not filled in" (use the first device), so a spec
+  copied verbatim cannot point at a device called `{{ANDROID_DEVICE}}`.
+- The **smoke check is not run at checkpoints or in best-of-N ranking** (same as 6a's screen
+  checks) — only at the gate and by "Run checks again". A `required` one still decides the job.
+- A user **Stop** pressed during the smoke check's 10 s hold is not interrupted mid-sleep; the
+  check's own `timeout_s` budget bounds it (that is what keeps a device check from stalling the
+  gate).
+- A phone screenshot is portrait; 6a's resizer only shrinks, so a 1080-wide phone picture is sent
+  as it came (≤1280 already). A tablet in landscape gets downscaled.
+- No Android check was added to **this repo's own** `AGENT_CHECKS.json` — with no device here it
+  would only ever say "no device". The `app runs` default appears for Android projects, not here.
+- The screen-stability comparison is exact PNG bytes, so a screen with a blinking cursor or a
+  spinner never reports `stable: true`; the check proceeds with the last frame and the log says so.
+  `"stable"` is in the result for the page; a tolerance-based compare is possible if real apps need it.
+- The board never starts or stops an emulator (nothing to start here, and the spec forbids it while
+  the model is busy). If you want the board to boot an AVD for a check, that is a separate slice —
+  it needs an emulator in the image and a rule for who owns it.
+- `~/agent-sandbox` untouched; no installs, no network, stdlib only; no push.
