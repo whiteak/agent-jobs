@@ -130,20 +130,27 @@
 - [x] PLAN.md (this file) committed before the code.
 - [x] Run the suite as it stands (the 7a WIP is already merged) and record the count.
       `Ran 635 tests in 270.529s — OK`.
-- [ ] Timeline polish: icons for the `attempt`/`plan`/`queue` rows, remove the dead `.hit` rule.
-- [ ] Tests in `web/tests/test_u07_dashboard.py`: a row with icon, time and colour for every
+- [x] Timeline polish: icons for the `attempt`/`plan`/`queue` rows, remove the dead `.hit` rule.
+      (`f66d147`)
+- [x] Tests in `web/tests/test_u07_dashboard.py`: a row with icon, time and colour for every
       timeline kind the spec names (queued, started, step ticked, checks pass/fail, fix round,
       checkpoint, rollback, watchdog, safety stop, finished, restart, needs review) + the whole
       `EventLog` kind → timeline mapping; event text is escaped; `finished_text`; the board's
       own `agentjobs` lines and unparsable lines in the live log; the page keeps the polling
-      fallback and the collapse/follow wording.
-- [ ] End-to-end proof: a fake-agent job (child process, temp folders, `JOBBOARD_JAIL=host`)
+      fallback and the collapse/follow wording. (`f66d147`, 11 tests)
+- [x] End-to-end proof: a fake-agent job (child process, temp folders, `JOBBOARD_JAIL=host`)
       writes queued → started → step ticked → checks → finished into `timeline.jsonl`, and the
       real `/api/jobs/<id>/events` route replays them with ids and the log offset.
-- [ ] Full suite green with the gate's command.
-- [ ] Smoke run: private copy on `127.0.0.1:8091` (own state folders, fake agent) — job page,
+      (`f66d147`, `ARealJobFillsIt`)
+- [x] Re-run (12 Nov): audit what 7a still owed. One real bug, found by the 8091 smoke run —
+      the `started` row cut the `MODES` label at its colon, so the timeline read
+      "Started (Local" / "Started (Fake agent (tests only". `AGENT_NAMES` + `started_text()`
+      and 1 test plus 1 end-to-end assertion. (`28e8795`)
+- [x] Full suite green with the gate's command. `Ran 732 tests in 283.280s — OK`
+      (731 before my change: 635 at `cb1346a` + 96 from job 03's uncommitted U08 tests).
+- [x] Smoke run: private copy on `127.0.0.1:8091` (own state folders, fake agent) — job page,
       the live SSE stream watched as it grows, Last-Event-ID resume, raw log, list badges.
-- [ ] AGENT_REPORT.md section for this job; HANDOFF-7a.md marked resolved.
+- [x] AGENT_REPORT.md section for this job; HANDOFF-7a.md marked resolved.
 
 ---
 

@@ -1,5 +1,212 @@
 # Agent Jobs — work log
 
+## Job 01 — Upgrade 7a: live dashboard, part 1 (timeline + live log)
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md has the findings and the step list for this job, all ticked.
+
+This job ran twice. The first pass found that 7a was **already merged but unproven** (WIP
+`9d3683f` from `agent/jobboard-u07`, its own breakage fixed later in `656742c` / `b433423`) and
+wrote the missing tests plus the icon polish, then stopped before the smoke run and the report.
+The re-run (12 Nov) finished the last three steps and audited what was left.
+
+Commits in this job:
+
+- `2c8bb3e` PLAN.md — findings (what 7a already gave, how the timeline gets filled, the gaps I
+  actually found) and the step list
+- `f66d147` 11 more tests (every timeline kind with icon/time/colour, the whole `EventLog` →
+  timeline mapping, escaped event text, the board's own gate lines as log rows, the polling
+  fallback, the log controls, and one real fake-agent job whose `timeline.jsonl` the real
+  `/api/jobs/<id>/events` route replays); icons for the `attempt`/`plan`/`queue` rows the other
+  upgrades add; dead `.hit` CSS rule dropped
+- `28e8795` the one real bug the smoke run caught: the timeline's `started` row was built by
+  cutting the mode label at its colon, so it wrote `Started (Local` for a real agent and
+  `Started (Fake agent (tests only` for the fake one. Now `AGENT_NAMES` + `started_text()` put a
+  short agent name in the row: `Started (Qwen Code)`, `Started (fake agent)`. 1 new test plus 1
+  end-to-end assertion (the commit message says "2 more tests"; the suite moved 731 → 732).
+- last commit: PLAN.md steps ticked, `HANDOFF-7a.md` marked resolved, this section.
+
+### Files changed
+
+| File | What it is |
+| --- | --- |
+| `web/dashboard.py` | the 7a feature (192 lines, already merged): `timeline_for`/`tl_add` over `JOBS/<id>/timeline.jsonl`, `job_stream()` (SSE), `tl_row`/`timeline_card`/`log_card`, `badge`/`checks_cell`, `TL_KIND`. **Unchanged by this job** apart from dropping the dead `.hit` rule (`f66d147`). |
+| `web/jobboard.py` | this job: `AGENT_NAMES` + `started_text()` and the `started` row (`28e8795`). The routes (`/api/jobs/<id>/events` → `H.sse_job`, `/api/raw/<id>`, `/api/events`, `/api/statuses`) and the job page's live script were already there. |
+| `web/agentjobs_upgrades/events.py` | `ICONS` gained `attempt`/`plan`/`queue` (`f66d147`), so no timeline row falls back to `•`. |
+| `web/tests/test_u07_dashboard.py` | **now 33 tests** (11 added by `f66d147`, 1 more here). |
+| `HANDOFF-7a.md` | every open item marked resolved, with the commit that resolved it; the original note kept below unchanged. |
+| `PLAN.md` | findings + steps for this job, all ticked. |
+
+Nothing in `agentjobs_upgrades/` was rewritten; the timeline is fed through the engines that
+already exist (`upgrades.EventLog.emit` → `dashboard.TL_KIND` → `tl_add`, and `tl_add` calls for
+`queued`/`started`/`step`/`finished`, `plan`, `queue`, `attempt`). The `# JAIL:`, `# U01`, `# U05`,
+`# U06`, `# U07`, `# U08` and `# VOICE` blocks all still work — the full suite runs them.
+
+### How each requirement is met
+
+1. **SSE instead of polling, with a fallback.** One `EventSource` per job page on
+   `/api/jobs/<id>/events?log=<offset>&last=<timeline id>`; the server (`H.sse_job` →
+   `dashboard.job_stream`) sends `retry: 3000`, timeline rows with `id:` lines, `log` batches with
+   byte offsets, a `status` row only when it changed, `: keepalive` every 15 s and `end` after the
+   job settles. `onerror` reconnects with the *current* offsets; after 3 failures the page falls
+   back to the old `/api/events/` + `/api/status/` polling (`startPolling`), so a dropped stream
+   never leaves a dead page.
+2. **Timeline per job.** `JOBS/<id>/timeline.jsonl` through `events.JobEvents`:
+   `{id, time, type, text, data}`, ids 1..n, so `Last-Event-ID` resumes exactly where the browser
+   stopped. Rows are a vertical list with icon + time + text; `events.ICONS` covers every kind the
+   spec names (queued 🕒, started ▶, step ☑, checks 🧪, fix round 🔧, checkpoint 📌, rollback ↩,
+   watchdog 🐕, safety stop ⛔, needs review ⚠, restart 🔄, finished 🏁, plus attempt/plan/queue),
+   and `tl_row` colours the row from `data.colour` (checks) or the kind (stop/rollback/warn).
+   The card shows the newest 300 rows and says where the stream resumes (`data-last`).
+3. **Readable live log.** `jobboard.events()` classifies each line of `events.jsonl`
+   (`k` = text/think/tool/result/gate/final/log, `cat` = cmd/edit/read/other through `tool_cat`),
+   so commands, file edits, reads and model messages are separately styled rows; results over
+   10 lines are sent whole and collapsed on the page with **Show more (N more lines)** / Show less;
+   auto-scroll follows while you are at the bottom and says **Paused - scroll to the bottom to
+   follow** when you scroll up; the search box filters the rows already on the page;
+   **Show raw log** (`/api/raw/<id>`, last 8 MB) is kept.
+4. **Jobs list.** `dashboard.badge` gives Working / Queued / Done ✓ / Failed ✗ / Not verified /
+   Needs review / Safety stop (plus Stuck, Interrupted, Done for pre-gate jobs), the row keeps its
+   `Time` duration and gains a **Checks** column (`checks_cell`: `42 passed`, `1 failed`,
+   `needs review`, `not checked`, `none found`), and the same badge text drives the status pill.
+   U07b's per-check badges render inside that cell.
+5. **Banner, checklist and notifications kept.** The status banner, step checklist, tab title,
+   stuck line, beep and the "Enable alerts" button are untouched and asserted in
+   `Pages.test_job_page_has_timeline_log_and_keeps_banner`; the `status` rows on the stream feed
+   them exactly as the old 3 s poller did.
+
+### Tests — exact commands and results
+
+First pass, before any of this job's changes (`cb1346a`):
+`Ran 635 tests in 270.529s` / `OK`.
+
+Re-run, before my change (the shared copy also holds job 03's **uncommitted** U08 tests, 96 of
+them, so the tree is 731, not 635):
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+→ Ran 731 tests in 284.000s
+→ OK
+```
+
+After `28e8795` (same, the command in `AGENT_CHECKS.json`, so the verify gate runs it):
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+→ Ran 732 tests in 283.280s
+→ OK
+```
+
+The 7a module alone: `… -m unittest discover -s tests -p "test_u07_dashboard.py"` →
+`Ran 33 tests in 19.063s / OK`. No test was deleted, skipped or weakened — the two
+`test_u07_dashboard` expectations that were wrong were corrected to what the code and the
+`sample-jobs/20261107-180819-71a7` fixture really do (job 02's report records that).
+
+What the 33 tests cover: SSE (`id`/`event`/one `data:` line, `retry`, `log` batch offsets, `status`
+sent once, keepalive, `end` for a gone job and after a finished one); `Last-Event-ID` resume sends
+only newer rows; `tl_add` never raises; the full `EventLog` kind → timeline mapping
+(`checks_start` deliberately excluded, `guard` → needs review, the three checkpoint variants →
+one kind); a row for every kind with icon, `HH:MM:SS` and colour; event text cannot inject HTML;
+the card keeps the newest 300 rows and the `data-last` resume id; `finished_text`; the log parser
+on the three real logs in `web/sample-jobs` (tool categories and order, resume from a byte offset,
+a half-written last line not consumed, a 30 000-char output cut with a pointer to the raw log,
+the board's own `agentjobs` gate lines as rows, unparsable lines still shown, a job with no log);
+all seven badges plus `checks_cell`; the routes in-process on their own port (stream 200/404/403,
+resume with `?log=` + `Last-Event-ID`, raw log, the list's Checks column, `/api/statuses`
+badge+checks, the polling fallback and every live-log control on the page); and one real
+fake-agent job through `process_job` — its `timeline.jsonl` (queued → started → step → checkpoint
+→ checks → rollback → fix_round → checks → finished, ids 1..n, colour on the checks row) replayed
+by the real route, with a resume that asks for nothing it already has.
+
+### Smoke run on 127.0.0.1:8091 (never 8090)
+
+One throwaway driver (`/tmp/u07a_smoke.py`, not part of the repo: the routes are already covered
+in-process) that starts the **real** `jobboard.py` as a child with its own state folders —
+temp `HOME`, `JOBBOARD_JOBS/WORK/PLANS/QUEUES/SETTINGS/NOTIFY` all under it, `JOBBOARD_FAKE=1`,
+`JOBBOARD_JAIL=host`, `JOBBOARD_PORT=8091` — in a temp project folder (git repo, `PLAN.md`,
+`AGENT_CHECKS.json` with a unittest check), POSTs a fake-agent scenario through the real form,
+reads the stream, then stops the server and verifies the port is closed. Key output:
+
+```
+[stream] Content-Type text/event-stream; charset=utf-8; 9 timeline rows, 4 log batches
+         (log offset 3301), 10 status rows, retry line 'retry: 3000'
+[stream] timeline ids as they arrived: [(1, 0.0), (2, 0.0), (3, 2.0), (4, 2.0), (5, 5.0),
+         (6, 5.0), (7, 5.0), (8, 6.0), (9, 6.0)]
+[stream] closed the connection on purpose at t=9.0s (last id 9, log offset 3301)
+[job] ended: state=FINISHED badge='Done ✓' checks='1 passed' elapsed=5s
+[resume] Last-Event-ID 9 + ?log=3301: timeline=[] log_batches=0 end=('end', {'status': 'done'})
+[stream] full replay ids=[1, 2, 3, 4, 5, 6, 7, 8, 9], log next=[3301], ends ('end', {'status': 'done'})
+[timeline.jsonl] 1:queued, 2:started, 3:step, 4:checkpoint, 5:checks, 6:rollback, 7:fix_round,
+                 8:checks, 9:finished
+   19:15:00 queued    Queued
+   19:15:00 started   Started (fake agent)
+   19:15:01 step      Step ticked: make the calculator better
+   19:15:01 checkpoint Checkpoint after step 1: 1 tests passing
+   19:15:04 checks    Checks failed: tests (1 failed)
+   19:15:04 rollback  Your last changes made things worse (passing tests dropped from 1 to 0)…
+   19:15:04 fix_round Fix round 1 started
+   19:15:05 checks    Checks passed (1 tests)
+   19:15:05 finished  Finished - Checks passed (1 tests)
+[list] header has <th>Checks</th>: True; <th>Time</th>: True
+[list] row: … | ✓ Done ✓ 1/2 | fake | smoke-proj | … | 0m 05s | 1 passed tests 1/1 ✓
+[api/statuses] badge='Done ✓' checks='1 passed'
+[page] Timeline/Live log/search/Show raw log/banner/EventSource/fails>=3 polling/Show more/
+       Paused…/tl data-last/bsteps/Enable alerts: all yes; timeline rows: 9;
+       icons: ['↩','▶','☑','🏁','📌','🔧','🕒','🧪']
+[raw] text/plain; charset=utf-8, 3301 bytes | without the cookie: 403 as expected
+[log rows] next offset 3301; kinds {final: 2, gate: 7, result: 2, text: 1, tool/edit: 2}
+[board] stopped, port 8091 is closed again
+```
+
+The first smoke run (before `28e8795`) is what showed `started  Started (Fake agent (tests only)`
+and sent this job's only code fix. Nothing is left running; ports 8090 and 8080 were never
+touched by the smoke copy (8080 was only checked for being free/used, never queried).
+
+### Try it by hand
+
+1. `cd web && JOBBOARD_PORT=8091 python3 jobboard.py` (your own state folders if you want them
+   separate), open the printed `http://127.0.0.1:8091/?t=…` link.
+2. Start a job. On the job page the **Live log** fills up by itself: `$ command` rows in green,
+   `✎ Edit`/`write_file` rows in amber, reads grey, model text plain, gate lines (checks, fix
+   rounds, checkpoints, the watchdog) in their own tone, the final answer in a box.
+3. A long output shows its first 10 lines and **Show more (N more lines)**; click it again to
+   collapse. Type in **Search the log** to filter, scroll up and the corner says
+   *Paused - scroll to the bottom to follow*, scroll back down and it follows again.
+   **Show raw log** opens the whole file.
+4. The **Timeline** card grows row by row: 🕒 Queued, ▶ Started (Qwen Code), ☑ Step ticked: …,
+   📌 Checkpoint, 🧪 Checks failed/passed (coloured red/green), ↩ rollback, 🔧 fix round,
+   ⛔ safety stop, 🏁 Finished - Checks passed (…).
+5. Kill the board's connection (or block the stream): after three failed reconnects the page
+   quietly falls back to polling, so the log and the banner keep moving.
+6. Back on the list, each row shows the badge (Working / Queued / Done ✓ / Failed ✗ / Not
+   verified / Needs review / Safety stop), its `Time` and the **Checks** cell (`42 passed`,
+   `1 failed`, `needs review`, `not checked`) with U07b's per-check badges under it.
+
+### Unfinished / assumed
+
+- **Nothing of 7a is unfinished.** Every item in `HANDOFF-7a.md` is resolved, and all five
+  requirements are implemented and tested (see the mapping above).
+- The smoke run used the **fake agent** with `JOBBOARD_JAIL=host`, exactly like the U01 and U07
+  tests: it proves the stream, the timeline, the log reader and the badges on a real board, not
+  that podman runs. On the live board the same job's checks and git calls still go through
+  `jail/run-local.sh`; nothing about the jail was touched here.
+- Keep the smoke driver out of the repo (it is in `/tmp`); its checks are the in-process tests'
+  job. Say the word if you want it committed as `web/tests/smoke_8091.py`.
+- The timeline is a **second view**: `events.jsonl` keeps everything (the live log reads it),
+  `timeline.jsonl` holds only the rows worth showing, each one's text cut to 1000 characters by
+  `dashboard.tl_add`, and the card sends only the newest 300 rows (`data-last` tells the stream
+  where to continue). The file itself has no cap - it stays small because only board milestones
+  go into it. `verify["timeline"]` (an older one-line summary string in the record) is separate
+  and untouched.
+- The live-log search filters the rows already fetched; it does not search the raw file (the raw
+  log link is there for that).
+- The `started` row now uses `AGENT_NAMES`; a mode not in that dict shows its own key
+  (`Started (some-new-mode)`) rather than a cut label. A new agent mode should add a name there.
+- No network, no installs, stdlib only, no CDN, no new JS library. `~/agent-sandbox` was never
+  touched: every test and the smoke copy use their own `HOME`/state folders under `/tmp`.
+
+---
+
 ## Job 02 — Upgrade 7b: live dashboard, part 2 (diff viewer + check badges)
 
 Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push
