@@ -515,6 +515,8 @@ class Jobs(unittest.TestCase):
         tl = [e["text"] for e in self.timeline()]
         self.assertIn("Attempt 3 of 3 started", tl)
         self.assertIn("Attempt 2 of 3: passed - 2 tests passing", tl)
+        self.assertIn("All 3 attempts tried", tl)      # they ran out, nothing was skipped
+        self.assertNotIn("No more attempts: attempt 3 passed cleanly", tl)
 
     def test_early_stop_after_one_clean_try_when_the_job_is_not_hard(self):
         self.project()
@@ -689,6 +691,25 @@ class Run(unittest.TestCase):
         self.assertEqual(out["fail_note"], "Stopped before all attempts finished.")
         self.assertEqual([a["k"] for a in out["attempt_log"]], [1])
         self.assertEqual(started, ["proj-try1-ab12"], "no further try starts after Stop")
+
+    def test_a_try_that_came_back_stopped_does_not_start_the_next_one(self):
+        """The real run_agent_job writes status="stopped" into the record itself, so by the
+        time the loop looks there is no "stopping" left to find - Stop still wins."""
+        started = []
+
+        def agent(am, name, fresh, rec):
+            started.append(am["folder"])
+            rec.update(status="stopped", finished=1.0)     # exactly what run_agent_job leaves
+            return dict(rec)
+
+        out, _ = self.drive(agent)
+        self.assertEqual(out["status"], "stopped")
+        self.assertEqual(out["fail_note"], "Stopped before all attempts finished.")
+        self.assertEqual([a["k"] for a in out["attempt_log"]], [1])
+        self.assertEqual([a["status"] for a in out["attempt_log"]], ["stopped"])
+        self.assertEqual(started, ["proj-try1-ab12"], "no further try starts after Stop")
+        tl = [json.loads(l)["text"] for l in (self.jdir / "timeline.jsonl").read_text().splitlines()]
+        self.assertIn("Stopped after attempt 1 of 2: no more tries", tl)
 
     def test_a_try_whose_branch_will_not_come_home_keeps_its_folder(self):
         def agent(am, name, fresh, rec):

@@ -299,6 +299,13 @@ def attempt_job(m, k):
     return m["job"]
 
 
+def stop_pressed(m):
+    """Stop was pressed for this job. The board writes "stopping" while it works, but a run
+    that Stop caught writes "stopped" itself before returning (run_agent_job does), so both
+    count here - looking only for "stopping" would start the next try after Stop."""
+    return (m or {}).get("status") in ("stopping", "cancelled", "stopped", "interrupted")
+
+
 # ---------------------------------------------------------------- the run
 
 def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
@@ -332,7 +339,7 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
     stopped, how, note = False, None, None
 
     for k in range(1, n + 1):
-        if (load(name) or {}).get("status") in ("stopping", "cancelled"):
+        if stop_pressed(load(name)):
             stopped, how = True, "stopped"
             break
         update(name, status="running", phase=f"Attempt {k} of {n}", attempts_current=k)
@@ -376,11 +383,16 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
         if rec["status"] == "safety_stop":
             how = "safety_stop"
             break
-        if (load(name) or {}).get("status") in ("stopping", "cancelled"):
+        if stop_pressed(load(name)) or stop_pressed(out):
             stopped, how = True, "stopped"
+            dashboard.tl_add(jd, "attempt", f"Stopped after attempt {k} of {n}: no more tries")
+            break
+        if len(log) >= n:
+            dashboard.tl_add(jd, "attempt", f"All {n} attempts tried")
             break
         if not bestofn.should_continue([attempt_of(r) for r in log], n, hard, stop_early):
-            dashboard.tl_add(jd, "attempt", f"No more attempts: attempt {k} passed cleanly")
+            first = next((r["k"] for r in log if attempt_of(r).clean_pass), k)
+            dashboard.tl_add(jd, "attempt", f"No more attempts: attempt {first} passed cleanly")
             break
 
     winner, ranked = bestofn.pick_winner([attempt_of(r) for r in log])
