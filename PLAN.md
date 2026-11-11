@@ -1,6 +1,84 @@
-# Job 06 — Upgrade 5: best-of-N for hard steps
+# Job 07 — Upgrade 4a: requirements → plan
 
 ## Findings
+
+- Server + pages: `web/jobboard.py` (2022 lines). `main()` starts `worker()` +
+  `http.server.ThreadingHTTPServer` on `127.0.0.1:PORT` (`jobboard.PORT`, env `JOBBOARD_PORT`);
+  routes live in `H.do_GET`/`H.do_POST` behind `H.guard()` (Host must match `jobboard.PORT`,
+  `jb=` cookie). `render(body)` wraps a page, `header()` is the top bar, `esc()` escapes.
+- Job life: `new_job(mode, folder, job, offline, resume=, parent=, extra=)` →
+  `JOBS/<id>/meta.json` (env `JOBBOARD_JOBS`, outside everything the sandbox mounts) →
+  `worker()` → `process_job(name)` → `check_record()` (safety re-check) → jail self-test (only
+  for `local-*` modes) → `record_git_start` → `upgrades.freeze_checks` → `run_planned`
+  (`run_agent_job`, or `attempts.run_best_of_n` when the record asks for tries) →
+  `maybe_auto_attempts` → notify → `build_review_md`. Project folders: `WORK/<folder>`
+  (env `JOBBOARD_WORK`), `folders()` lists them and hides attempt folders.
+- A finished job can queue a follow-up job from the worker thread: `maybe_auto_attempts` and
+  `hard_retry` call `new_job(..., parent=..., extra=...)`. That is the pattern for "send the
+  errors back to the planner once".
+- **`H.do_POST` parses the body with `urllib.parse.parse_qs` WITHOUT `keep_blank_values`**, so
+  an empty field disappears from its list. A repeating card form therefore cannot align
+  same-name multi-values — the plan form names every field with its card index
+  (`tid1`, `title1`, `prompt1`, …) and the server reads them in index order.
+- The button that was pressed arrives as a form field (`<button name="move" value="t3:up">`),
+  which is how one endpoint does save / approve / reorder / delete / add.
+- Given logic (use, don't rewrite): `agentjobs_upgrades/plan.py` — `TASK_FIELDS`/`REQUIRED`,
+  `SCHEMA` (draft 2020-12 JSON Schema for the task list), `validate(tasks) -> [errors]`
+  (required fields, unknown fields, id charset, duplicate ids, unknown/self dependencies,
+  and `order()`'s cycles), `order(tasks)` (stable Kahn), `job_prompt(...)` (per-task prompt,
+  that is 4b's), `Queue` (4b's persistent queue). Already covered by `tests/test_rest.py`.
+- Jail rules for this job: any git the board runs on a project repo goes through
+  `agentjobs_upgrades/safegit.SafeGit` (`-c core.hooksPath=/dev/null`, config not trusted,
+  `GIT_CONFIG_NOSYSTEM=1`) wrapped in the project's own jail with
+  `upgrades.make_wrap(root, folder, prefix)` → `jail/run-local.sh sandbox-run <root> <folder>
+  <name> --` (only `<root>` mounted at `/work/<folder>`, no network). `upgrades.HOST_MODE`
+  (`JOBBOARD_JAIL=host`) runs it straight on the host — how the tests work. Plain file writes
+  into `WORK/<folder>` are the existing house pattern (`checks.write_checks`).
+- Plan state must live outside the sandbox (the planner can write anything inside
+  `WORK/<folder>`): new `PLANS = state/plans/<folder>.json` (env `JOBBOARD_PLANS`), same
+  safety rule as `JOBS`.
+- Fake agent for tests: hidden mode `fake` (`JOBBOARD_FAKE=1`), job text = a scenario
+  (`{"rounds": [[step…]]}`; `write`/`say`/`tick`/`cmd`/`exit` steps). U01/U05 tests run one
+  fake job per test in a child process with `JOBBOARD_JAIL=host` + `JOBBOARD_FAKE=1`
+  (`tests/test_u01.py::Board.run_job`); page tests serve `jobboard.H` in-process on their own
+  port with `jobboard.PORT` set (`tests/test_u05_bestofn.py::Pages`).
+- Test command (`AGENT_CHECKS.json`): `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore
+  -m unittest discover -s tests`. Baseline before my changes: **425 tests, OK** (job 06's
+  leftover best-of-N work was left uncommitted in this shared copy; committed as-is first).
+
+## Steps
+
+- [ ] Commit job 06's leftover work as-is (its own commit) so this job's diffs stay clean.
+- [ ] `prompts/planner.md` (repo root): the planner prompt with `{{NAME}} {{KIND}} {{FOLDER}}
+      {{OUTLINE}} {{ERRORS}}` placeholders — "do not write app code", write ROADMAP.md +
+      tasks.json, ~45-minute tasks, task 1 = skeleton + test setup + AGENT_CHECKS.json,
+      testable acceptance criteria.
+- [ ] `docs/tasks-schema.json`: the task schema, exactly `plan.SCHEMA` (a test keeps it in sync).
+- [ ] `web/planning.py` (new glue, `# U04a`): project records under `PLANS/`, project folder
+      creation (jail git init on branch `agent/<name>` + a first commit), the planner prompt,
+      `start_plan` (a normal job, `plan_job` marker, checks off), reading + validating the
+      folder's `tasks.json`/`ROADMAP.md`, the one automatic re-send of the errors,
+      save/approve, and the page HTML (new project, project, plan review).
+- [ ] `jobboard.py` hooks: `PLANS`, header links, `check_record` validation for
+      `plan_job`/`plan_retry`, `planning.plan_finished(...)` after `run_planned`, the plan card
+      on a planning job's page, GET `/projects` `/project/new` `/project/<folder>`
+      `/plan/<folder>`, POST `/project/new` `/project/edit/<folder>` `/plan/edit/<folder>`.
+- [ ] `web/tests/test_u04a_plan.py`: schema (good/bad/cycles) + the docs file stays in sync,
+      prompt content, project folder creation (git init, branch, first commit), records +
+      approval state, the plan form parse (index-named fields, move/drop/add, blank values),
+      a canned planner output through the fake agent (valid plan, and an invalid plan sent
+      back to the planner exactly once), and the pages/routes served in-process.
+- [ ] Full suite passes with the gate's command; smoke-serve the board on a free port
+      (never 8090) and click the new pages with curl.
+- [ ] AGENT_REPORT.md section for this job.
+
+---
+
+## Plan left by the previous job (Upgrade 5, best-of-N) — kept verbatim so nothing is lost
+
+## Job 06 — Upgrade 5: best-of-N for hard steps
+
+### Findings
 
 - Server + pages: `web/jobboard.py` (1941 lines). `main()` starts `worker()` +
   `http.server.ThreadingHTTPServer` on `127.0.0.1:PORT` (`jobboard.PORT`, env `JOBBOARD_PORT`);
@@ -52,7 +130,7 @@
   `fetch <bundle>`, and the working trees are built inside the jail so no agent-planted filter
   ever runs on the host).
 
-## Steps
+### Steps
 
 - [ ] Commit job 05's leftover ntfy work as-is (its own commit) so this job's commits stay clean.
 - [ ] `web/attempts.py` (new glue): settings keys (`attempts` 2-4 default 3, `stop_early` on,
@@ -81,9 +159,9 @@
 
 ---
 
-## Plan left by the previous job (Upgrade 9b, phone alerts) — kept verbatim so nothing is lost
+### Plan left by the previous job (Upgrade 9b, phone alerts) — kept verbatim so nothing is lost
 
-### Findings
+#### Findings
 
 - Server + pages: `web/jobboard.py` (1889 lines). `main()` starts the `worker()` thread and
   `http.server.ThreadingHTTPServer` on `127.0.0.1:PORT` (`jobboard.PORT`, env `JOBBOARD_PORT`).
@@ -119,7 +197,7 @@
   In-process page tests serve `jobboard.H` on their own free port and set `jobboard.PORT`
   (`tests/test_u07b_changes.py::Pages`, `tests/test_jobweb_bench.py::BenchPagesInProcess`).
 
-### Steps
+#### Steps
 
 - [ ] New `web/notifycfg.py` (glue): settings load/save (0600, env `NTFY_SERVER`/`NTFY_TOPIC`
       seed the defaults, topic pre-filled with `notify.random_topic()`), form ↔ settings with
