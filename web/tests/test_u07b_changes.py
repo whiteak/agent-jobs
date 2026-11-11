@@ -373,6 +373,19 @@ class Collect(unittest.TestCase):
         self.assertEqual((big["added"], big["shown"]), (15000, True))
         self.assertGreater(s["totals"]["added"], 15000)
 
+    def test_an_untracked_file_too_big_to_measure_is_listed_without_a_made_up_count(self):
+        tmp = Path(tempfile.mkdtemp(prefix="jb7b-huge-"))
+        repo, base = make_repo(tmp)
+        (repo / "huge.txt").write_text("x" * (diffview.UNTRACKED_READ + 10))
+        m, g = meta_of("u07b-huge", "proj", base), SafeGit(repo)
+        f = next(x for x in diffview.summary(m, g, "all")["files"] if x["path"] == "huge.txt")
+        self.assertTrue(f["shown"])
+        self.assertEqual((f["added"], f["removed"]), (0, 0))     # not measured, not "+1"
+        self.assertEqual(f["why"], "too big to count")
+        d = diffview.file_diff(m, g, "all", "huge.txt")
+        self.assertTrue(d["shown"] and d["truncated"])           # the diff is cut, not endless
+        self.assertLessEqual(sum(len(h["lines"]) for h in d["hunks"]), diffview.DIFF_MAX_LINES)
+
     def test_a_folder_that_is_not_a_git_repo_says_so(self):
         plain = Path(tempfile.mkdtemp(prefix="jb7b-plain-"))
         (plain / "x.txt").write_text("hi\n")

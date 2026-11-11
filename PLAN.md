@@ -38,23 +38,24 @@
 
 ## Steps
 
-- [ ] Fix the 7a leftovers so the suite starts green (no test deleted/weakened):
+- [x] Fix the 7a leftovers so the suite starts green (no test deleted/weakened):
   `Pages` sets `jobboard.PORT`, `upgrades.EventLog.__call__`, correct the fixture-order assert.
-- [ ] New `web/changes.py`: sandboxed git collection — refs (all / commit / checkpoint),
+- [x] New `web/diffview.py` (named diffview, not changes: `changes` is already a local in
+  `jobboard.freeze_checks`) - sandboxed git collection: refs (all / commit / checkpoint),
   file list with +/- counts (numstat + name-status + untracked listing in one call, safe git
   flags), per-file diff (untracked via `git diff --no-index`), binary/generated marked and
   not shown (reuse `reviewbundle._skip` + `diffparse.is_generated`), small TTL cache.
-- [ ] Parser tests for `diffparse` (added/deleted/renamed, binary markers, "no newline at end
+- [x] Parser tests for `diffparse` (added/deleted/renamed, binary markers, "no newline at end
   of file") and side-by-side pairing.
-- [ ] Check badges: `dashboard.check_badges()` (one per check, `build ✓`, `tests 41/42 ✗`)
-  linking to a new `/api/check/...` output endpoint (path resolved from meta, must stay
+- [x] Check badges: new `web/badges.py` (one per check, `build ✓`, `tests 41/42 ✗`) linking to
+  a new `/api/check/<jid>?src=&n=` output endpoint (path resolved from meta, must stay
   inside `JOBS/<id>`); badges on the job page and in the jobs list.
-- [ ] Endpoints + card in `jobboard.py`: `/api/changes/<jid>`, `/api/changes/<jid>/file`,
-  `/api/check/<jid>/<source>/<n>`; Changes card with file list, unified/side-by-side toggle,
-  collapsed unchanged parts, "Next change", ref picker, 10 s refresh + refresh on stream
-  events, lazy (chunked) rendering.
-- [ ] `web/tests/test_u07b_changes.py`: collection against a real temp git repo (host jail),
+- [x] Endpoints + card in `jobboard.py`: `/api/changes/<jid>`, `/api/changes/<jid>/file`,
+  `/api/check/<jid>?src=&n=`; Changes card (`web/diffcard.py`) with file list, unified /
+  side-by-side toggle, collapsed unchanged parts, "Next change", ref picker, 10 s refresh +
+  refresh on stream events, lazy (chunked) rendering.
+- [x] `web/tests/test_u07b_changes.py`: collection against a real temp git repo (host jail),
   endpoint tests on its own port, badge tests, page/script tests (node --check).
-- [ ] Full suite passes; smoke-serve the board on a free port (never 8090) and click through
-  the endpoints with curl.
-- [ ] AGENT_REPORT.md section for this job.
+- [x] Full suite passes (381 tests, OK); smoke-served the board on port 8123 (never 8090)
+  with a temp HOME/JOBBOARD_JOBS/JOBBOARD_WORK and curled the new endpoints.
+- [x] AGENT_REPORT.md section for this job.

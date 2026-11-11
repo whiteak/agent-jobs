@@ -240,11 +240,11 @@ function paintFiles(files){
     var a=document.createElement('td'); a.className='p';
     a.textContent=(f.status==='added'?'+ ':f.status==='deleted'?'- ':f.status==='renamed'?'\u21b4 '
                    :f.status==='untracked'?'? ':'') + f.path;
-    a.title=f.shown?'Show this file':(f.why+' - listed but not shown');
+    a.title=f.shown?('Show this file'+(f.why?(' ('+f.why+')'):'')):(f.why+' - listed but not shown');
     tr.appendChild(a);
     var p=document.createElement('td'); p.className='n pa'; p.textContent=f.added||''; tr.appendChild(p);
     var d=document.createElement('td'); d.className='n pd'; d.textContent=f.removed||''; tr.appendChild(d);
-    var w=document.createElement('td'); w.className='n'; w.textContent=f.shown?'':f.why; tr.appendChild(w);
+    var w=document.createElement('td'); w.className='n'; w.textContent=f.why||''; tr.appendChild(w);
     if(f.shown){ tr.onclick=function(){pick(f.path);}; }
     frag.appendChild(tr);
   });

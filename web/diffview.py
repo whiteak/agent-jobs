@@ -319,8 +319,11 @@ def _untracked(text):
             except ValueError:
                 return -1
         lines, size, flag = num(p[1]), num(p[2]), num(p[3])
+        # lines == -1: not measured (the file is bigger than UNTRACKED_READ) - no made-up count
+        counted = lines >= 0
         out.append({"path": path, "old": path, "status": "untracked",
-                    "added": lines if lines > 0 else (1 if size > 0 else 0), "removed": 0,
+                    "added": (lines if lines > 0 else (1 if size > 0 else 0)) if counted else 0,
+                    "removed": 0, "counted": counted,
                     "binary": flag == 1, "lines": lines, "size": size})
     return out, more
 
@@ -367,6 +370,8 @@ def _list(m, git, ref, pf):
                               "added": a, "removed": d, "binary": bn})
     for e in files:
         e["shown"], e["why"] = _flags(e)
+        if e["shown"] and not e.get("counted", True):
+            e["why"] = "too big to count"
     files.sort(key=lambda e: e["path"])
     return {"files": files[:LIST_MAX], "more": untracked_more + max(0, len(files) - LIST_MAX),
             "totals": {"files": len(files),
