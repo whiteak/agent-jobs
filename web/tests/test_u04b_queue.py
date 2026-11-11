@@ -833,7 +833,7 @@ class Pages(unittest.TestCase):
 # ------------------------------------------------------------------ a plan through the fake agent
 
 DRIVER = textwrap.dedent("""
-    import json, os, sys, threading, time
+    import json, os, subprocess, sys, threading, time
     import jobboard, planning, taskqueue
     from pathlib import Path
     spec = json.loads(sys.argv[1])
@@ -845,9 +845,15 @@ DRIVER = textwrap.dedent("""
     rec.update(tasks=spec["tasks"], approved_at=1000.0, mode="fake",
                best_of_n=bool(spec.get("best_of_n")))
     planning.save(jobboard.PLANS, rec)
+    root = Path(jobboard.WORK) / folder
+    (root / "ROADMAP.md").write_text(spec["roadmap"], encoding="utf-8")
     if spec.get("checks_file"):
-        (Path(jobboard.WORK) / folder / "AGENT_CHECKS.json").write_text(
-            json.dumps({"checks": spec["checks_file"]}), encoding="utf-8")
+        (root / "AGENT_CHECKS.json").write_text(json.dumps({"checks": spec["checks_file"]}),
+                                                encoding="utf-8")
+    g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=plan", "-c",
+         "user.email=plan@local"]
+    subprocess.run(g + ["add", "-A"], cwd=str(root), check=True)
+    subprocess.run(g + ["commit", "-qm", "the approved plan"], cwd=str(root), check=False)
     q = taskqueue.create(jobboard.QUEUES, rec, on_fail=spec.get("on_fail", "stop"))
     if spec.get("cutoff_past"):
         q.state["stop_starting_at"] = time.time() - 1
@@ -913,6 +919,7 @@ class Runs(unittest.TestCase):
 
     def boot(self, spec, timeout=300):
         spec.setdefault("folder", "notes-app")
+        spec.setdefault("roadmap", ROADMAP)
         r = subprocess.run([sys.executable, "-c", DRIVER, json.dumps(spec)], cwd=str(ROOT),
                            env=self.env, capture_output=True, text=True, timeout=timeout)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -960,12 +967,14 @@ class Runs(unittest.TestCase):
         self.assertIn("You can find a note again by searching.", second)   # from ROADMAP.md
 
     def test_a_task_s_checks_run_and_a_failing_check_fails_the_task(self):
-        self.boot({"tasks": [T("t1", checks=["test -f never-written.txt"])],
+        self.boot({"tasks": [T("t1", checks=["test -f never-written.txt"]), T("t2", ["t1"])],
                    "scenarios": {"t1": DONE("one")}})
         m = self.task_runs("t1")[0]
         self.assertEqual([c["cmd"] for c in m["checks"]], ["test -f never-written.txt"])
         self.assertEqual(m["status"], "failed")
-        self.assertEqual((self.queue["status"], self.queue["tasks"][0]["state"]), ("stopped", "failed"))
+        self.assertEqual([t["state"] for t in self.queue["tasks"]], ["failed", "queued"])
+        self.assertEqual(self.queue["status"], "stopped")          # and nothing else started
+        self.assertEqual(self.order(), ["t1"])
 
     def test_a_failure_stops_the_queue_and_later_tasks_never_start(self):
         self.boot({"tasks": [T("t1"), T("t2", ["t1"]), T("t3")],
@@ -993,14 +1002,19 @@ class Runs(unittest.TestCase):
                    "checks_file": [{"name": "the note is there", "cmd": "test -f two.py",
                                     "timeout_s": 60}],
                    "scenarios": {"t1": {"attempts": [[{"say": "I could not work it out"}],
-                                                      DONE("two")]}}})
+                                                      DONE("two"), DONE("two")]}}})
         m = self.task_runs("t1")[0]
         self.assertEqual(m["attempts"], 3)
-        self.assertEqual([a["k"] for a in m["attempt_log"]], [1, 2])   # it stopped once one passed
-        self.assertEqual([a["status"] for a in m["attempt_log"]], ["unverified", "passed"])
+        log = m["attempt_log"]
+        self.assertEqual([a["k"] for a in log], [1, 2, 3])
+        self.assertEqual([a["status"] for a in log], ["failed", "passed", "passed"])
+        self.assertEqual(m["attempts_final"]["winner"], 2)              # the first clean one won
         self.assertEqual(m["status"], "done")
         self.assertEqual(self.queue["tasks"][0]["state"], "done")
-        self.assertTrue((self.work / "notes-app" / "two.py").is_file())  # the winner's work is there
+        app = self.work / "notes-app"
+        self.assertTrue((app / "two.py").is_file())                     # the winner's work is there
+        self.assertEqual(git(app, "rev-parse", "--abbrev-ref", "HEAD").strip(), "agent/" + m["id"])
+        self.assertEqual(self.queue["tasks"][0]["end"], log[1]["commit"])   # and that is recorded
 
     def test_no_new_task_starts_after_the_time_even_though_the_queue_is_running(self):
         self.boot({"tasks": [T("t1"), T("t2", ["t1"])], "cutoff_past": True,
@@ -1027,11 +1041,13 @@ class Restart(unittest.TestCase):
                         JOBBOARD_SETTINGS=str(self.t / "settings.json"), JOBBOARD_JAIL="host",
                         JOBBOARD_FAKE="1", PYTHONDONTWRITEBYTECODE="1")
 
-    def boot(self, spec, timeout=300):
-        spec = dict(spec, folder="notes-app")
+    def boot(self, spec, timeout=300, want_result=True):
+        spec = dict(spec, folder="notes-app", roadmap=spec.get("roadmap", ROADMAP))
         r = subprocess.run([sys.executable, "-c", DRIVER, json.dumps(spec)], cwd=str(ROOT),
                            env=self.env, capture_output=True, text=True, timeout=timeout)
         line = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULT=")]
+        if not want_result:                       # this board was killed mid-task: no report
+            return {}
         self.assertTrue(line, r.stdout + r.stderr)
         return json.loads(line[-1][7:])
 
@@ -1039,19 +1055,19 @@ class Restart(unittest.TestCase):
         slow = [{"sleep": 4}] + DONE("one")[:2] + [{"exit": 0}]
         spec = {"tasks": [T("t1"), T("t2", ["t1"])],
                 "scenarios": {"t1": slow, "t2": DONE("two")}, "crash_after": 1.2}
-        self.boot(spec)                                    # this board dies while task t1 runs
-        time.sleep(4.5)                                    # let the orphaned fake agent finish
+        self.boot(spec, want_result=False)                   # this board dies while task t1 runs
+        time.sleep(4.5)                                      # let its orphaned agent finish writing
         on_disk = json.loads((self.queues / "notes-app.json").read_text())
         self.assertEqual(on_disk["tasks"][0]["state"], "running")   # exactly as a crash leaves it
-        out = self.boot(dict(spec, startup=True, crash_after=0))
+        out = self.boot(dict(spec, startup=True, crash_after=0))    # the board comes back up
         self.assertEqual([t["state"] for t in out["queue"]["tasks"]], ["done", "done"])
         runs = [m for m in out["jobs"].values() if m.get("task_id") == "t1"]
         self.assertEqual(len(runs), 2)                     # the interrupted one and its re-run
-        again = sorted(runs, key=lambda m: m["created"])[1]
+        first, again = sorted(runs, key=lambda m: m["created"])
+        self.assertEqual(first["status"], "interrupted")   # the record says what happened to it
         self.assertEqual(again["task_try"], 2)
         self.assertTrue(again.get("resume"))               # it carries on that job's conversation
-        self.assertEqual(again["status"], "interrupted")   # the first one says what happened to it
-        tl = (self.jobs / sorted(runs, key=lambda m: m["created"])[0]["id"] / "timeline.jsonl")
+        tl = self.jobs / first["id"] / "timeline.jsonl"
         self.assertTrue(any("Interrupted by a restart" in ln for ln in tl.read_text().splitlines()))
 
 
