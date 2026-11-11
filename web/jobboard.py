@@ -18,6 +18,8 @@ import benchstats
 import jailcfg   # JAIL: no-internet sandbox for local modes, self-test, Push button
 import jobstatus
 import reviewbundle
+import upgrades   # U01: verify gate, git checkpoints, runaway watchdog
+from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
 HOME = Path.home()
@@ -44,6 +46,10 @@ FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 JOB_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")       # what new_job generates
 SESSION_RE = re.compile(r"[A-Za-z0-9-]{8,80}")           # agent session ids (resume)
 JOB_TEXT_MAX = 200000                                    # same cap as the web form read
+# U01: fix rounds + watchdog thresholds (written with the defaults on first start)
+SETTINGS_FILE = Path(os.environ.get("JOBBOARD_SETTINGS") or (SANDBOX / "state" / "agentjobs-settings.json"))
+if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
+    MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # Bench auto-runs. Run data lives OUTSIDE the sandbox-visible folders; the worker
 # reads the run settings ONLY from BENCH_RUNS/<id>/spec.json (never from meta.json).
 # Job records also live outside the sandbox now, but they are plain files, so the
@@ -65,6 +71,8 @@ TOKEN = TOKEN_FILE.read_text().strip()
 lock = threading.Lock()
 queue_cv = threading.Condition(lock)
 running = {}  # job id -> Popen
+monitors = {}  # U01: job id -> upgrades.Monitor of the agent process now running
+meta_lock = threading.RLock()  # U01: worker, Stop and buttons all update meta.json
 
 
 # ---------------------------------------------------------------- jobs
@@ -81,6 +89,17 @@ def save_meta(m, jid=None):
     real directory name when saving a record it did not create."""
     p = job_dir(jid if jid is not None else m["id"]) / "meta.json"
     tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(m, indent=1)); tmp.replace(p)
+
+def update_meta(jid, **kw):
+    """U01: load, change some fields, save - under meta_lock, so a Stop press in
+    between is never overwritten. Returns the new meta (None if gone)."""
+    with meta_lock:
+        m = load_meta(jid)
+        if m is None:
+            return None
+        m.update(kw)
+        save_meta(m, jid)
+        return m
 
 def all_job_dirs():
     """(directory name, meta) for every record, newest first. The worker queues
@@ -126,6 +145,19 @@ def check_record(name, m):
     if parent is not None and (not isinstance(parent, str) or not JOB_ID_RE.fullmatch(parent)
                                or not load_meta(parent)):
         return "parent"
+    if not upgrades.checks_ok(m.get("checks")):          # U01
+        return "checks"
+    fr = m.get("fix_rounds")
+    if fr is not None and (not isinstance(fr, int) or isinstance(fr, bool)
+                           or not 0 <= fr <= upgrades.FIX_ROUNDS_MAX):
+        return "fix_rounds"
+    if not isinstance(m.get("verify_off", False), bool):
+        return "verify_off"
+    if m.get("mode") == upgrades.FAKE_MODE:
+        try:
+            json.loads(job)
+        except ValueError:
+            return "job"
     return None
 
 def new_job(mode, folder, job, offline, resume=None, parent=None, extra=None):
@@ -208,24 +240,14 @@ def process_job(name):
             try: notify_finished(m, False)
             except Exception: pass
             return False
-    cmd = [str(AGENT), m["mode"], "--stream", "--name", "agentjob-" + m["id"], "--in", m["folder"]]
-    if m["offline"]: cmd.insert(2, "--offline")
-    if m.get("resume"): cmd += ["--resume", m["resume"]]
-    cmd.append(m["job"])
     m.update(status="running", started=time.time()); save_meta(m, name)
     record_git_start(m)
-    with open(job_dir(name) / "events.jsonl", "wb") as out:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, cwd=str(HOME))
-        running[m["id"]] = p
-        rc, finished_ok = wait_with_watchdog(m["id"], p)
-    running.pop(m["id"], None)
+    upgrades.freeze_checks(m, WORK / m["folder"])   # U01: what the gate checks is fixed BEFORE the agent runs
+    save_meta(m, name)
+    run_agent_job(m, name)                         # U01: agent + watchdog, then the verify gate
     m = load_meta(name)
-    if m["status"] == "stopping": m["status"] = "stopped"
-    elif finished_ok is not None: m["status"] = "done" if finished_ok else "failed"
-    else: m["status"] = "done" if rc == 0 else "failed"
-    m.update(finished=time.time(), exit=rc, session=session_of(m["id"]) or m.get("resume")); save_meta(m, name)
     try:
-        notify_finished(m, m["status"] == "done")
+        notify_finished(m, m["status"] == "done" and (m.get("verify") or {}).get("status") != "failed")
     except Exception:
         pass
     try:  # review bundle saved with the job, so Copy/Download never wait
@@ -233,6 +255,232 @@ def process_job(name):
     except Exception:
         pass
     return True
+
+
+# ---------------------------------------------------------------- U01: agent runs, watchdog, verify gate
+
+class GateAbort(Exception):
+    """A fix round or check was ended by Stop, a safety stop or a watchdog stop."""
+    def __init__(self, how, act=None):
+        super().__init__(how)
+        self.how, self.act = how, act
+
+
+class JobCtx:
+    def __init__(self, m, name, cfg):
+        self.m, self.name, self.cfg = m, name, cfg
+        self.root = WORK / m["folder"]
+        self.ev = upgrades.EventLog(job_dir(name) / "events.jsonl")
+        proj = str(self.root) if upgrades.HOST_MODE else f"/work/{m['folder']}"
+        self.wd = wdm.Watchdog(upgrades.watchdog_settings(cfg), proj)
+        self.ping = None if (upgrades.HOST_MODE or m["mode"] == upgrades.FAKE_MODE) else wdm.model_server_ok
+        self.actions = []      # watchdog actions (meta["watchdog"])
+        self.last_error = ""
+        self.mgr = None        # CheckpointManager (git folders only)
+        self.runs = 0
+
+    def on_plan(self, text, first):
+        """PLAN.md changed (polled every second while an agent runs) -> checkpoint."""
+        if self.mgr is None:
+            return
+        try:   # ticks that were already there before this job started are not this job's steps
+            if first and (self.root / "PLAN.md").stat().st_mtime < float(self.m.get("started") or 0):
+                self.mgr._seen_ticks = max(self.mgr._seen_ticks, len(upgrades.cpm.ticked_steps(text)))
+                return
+        except OSError:
+            return
+        self.mgr.on_plan_change(text)
+
+
+def agent_argv(m, prompt, resume, rnd):
+    """(argv, cwd) for one agent process. Real modes go through ~/agent-sandbox/agent."""
+    if m["mode"] == upgrades.FAKE_MODE:
+        argv, cwd = upgrades.fake_cmd(m, WORK / m["folder"], m["folder"], m["job"], rnd, resume)
+        return argv, cwd or str(HOME)
+    cmd = [str(AGENT), m["mode"], "--stream", "--name", "agentjob-" + m["id"], "--in", m["folder"]]
+    if m["offline"]: cmd.insert(2, "--offline")
+    if resume: cmd += ["--resume", resume]
+    cmd.append(prompt)
+    return cmd, str(HOME)
+
+def stop_agent_process(jid, p=None):
+    """The existing Stop path (podman stop + a supervised job's offline children),
+    plus the process group for the fake agent in host test mode."""
+    if upgrades.HOST_MODE:
+        p = p or running.get(jid)
+        if p is not None and p.poll() is None:
+            try: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except OSError: pass
+        return
+    subprocess.run(["podman", "stop", "-t", "10", "agentjob-" + jid], capture_output=True, timeout=60)
+    jailcfg.stop_children(jid)   # JAIL: offline local agents a supervised job started
+
+def launch_agent(ctx, prompt, resume, rnd, fresh_log=False):
+    """Run ONE agent process with the watchdog. Returns (rc, finished_ok, action)."""
+    m, name, jid = ctx.m, ctx.name, ctx.m["id"]
+    evp = job_dir(name) / "events.jsonl"
+    if fresh_log:
+        evp.write_bytes(b"")
+    ctx.ev.release()                     # board lines written before the agent starts
+    if rnd or ctx.runs:                  # keep every fix / restart prompt with the job
+        pd = job_dir(name) / "prompts"
+        pd.mkdir(exist_ok=True)
+        (pd / f"run-{ctx.runs + 1}-round-{rnd}.txt").write_text(prompt, encoding="utf-8")
+    ctx.runs += 1
+    cmd, cwd = agent_argv(m, prompt, resume, rnd)
+    offset = evp.stat().st_size if evp.exists() else 0
+    mon = None
+    ctx.ev.hold()                        # nothing else writes events.jsonl while the agent does
+    try:
+        with open(evp, "ab") as out:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 cwd=cwd, start_new_session=True)
+            running[jid] = p
+            cfg = ctx.cfg
+            mon = upgrades.Monitor(
+                evp, offset, ctx.wd, local=m["mode"] != "supervised",
+                stop=lambda: stop_agent_process(jid, p),
+                kill=lambda proc: upgrades.kill_now(proc, "agentjob-" + jid),
+                pause=lambda on: upgrades.pause_container("agentjob-" + jid, on, p.pid),
+                ping=ctx.ping, emit=ctx.ev.emit, plan_path=ctx.root / "PLAN.md", on_plan=ctx.on_plan,
+                grace=cfg["after_result_grace_s"], tick_s=cfg["watchdog_tick_s"], ping_s=cfg["model_ping_s"])
+            monitors[jid] = mon
+            rc, finished_ok = wait_with_watchdog(jid, p)
+    finally:
+        running.pop(jid, None)
+        monitors.pop(jid, None)
+        ctx.ev.release()
+    ctx.actions.extend(mon.actions)
+    ctx.last_error = mon.feeder.last_error or ctx.last_error
+    if mon.actions:
+        update_meta(name, watchdog=ctx.actions[-100:])
+    return rc, finished_ok, mon.action
+
+def run_agent_loop(ctx, prompt, resume, rnd, fresh_log=False):
+    """Agent run plus watchdog restarts. Returns (rc, finished_ok, how, action);
+    how = None | user_stop | safety_stop | stop."""
+    restarts = 0
+    while True:
+        rc, fok, act = launch_agent(ctx, prompt, resume, rnd, fresh_log)
+        fresh_log = False
+        if (load_meta(ctx.name) or {}).get("status") == "stopping":
+            return rc, fok, "user_stop", act
+        if act is not None and act.kind == "restart" and restarts < 6:
+            restarts += 1
+            ctx.ev.emit("restart", f"Restarting the agent in the same session ({act.reason})", None, "warn2")
+            resume = session_of(ctx.m["id"]) or resume
+            prompt = act.message
+            continue
+        if act is not None and act.kind == "restart_fresh" and restarts < 6:
+            restarts += 1
+            ctx.ev.emit("restart", f"Starting a fresh session with a handover ({act.reason})", None, "warn2")
+            resume = None
+            prompt = upgrades.handover(ctx.m, ctx.root, ctx.last_error)
+            continue
+        return rc, fok, (act.kind if act is not None else None), act
+
+def run_gate(ctx):
+    """Upgrade 1: the verify-and-retry gate (checks in the sandbox, fix rounds in this
+    same worker thread with --resume of the latest session). Returns the outcome."""
+    m, name, jid = ctx.m, ctx.name, ctx.m["id"]
+    maxr = m["fix_rounds"] if isinstance(m.get("fix_rounds"), int) else int(ctx.cfg["fix_rounds"])
+    wrap = upgrades.make_wrap(ctx.root, m["folder"], f"agentcheck-{jid}")
+    state = {"round": 0}
+
+    def stopped():
+        return (load_meta(name) or {}).get("status") == "stopping"
+
+    def run_checks():
+        if stopped():
+            raise GateAbort("user_stop")
+        r = state["round"]
+        update_meta(name, phase="Running checks" + (f" after fix round {r}" if r else ""))
+        ctx.ev.emit("checks_start", "Running checks in the sandbox" + (f" after fix round {r}" if r else ""))
+        ctx.ev.release()
+        summary = ck.run_all(ctx.root, job_dir(name) / "checks" / f"round-{r}", wrap, checks=upgrades.job_checks(m))
+        if stopped():
+            raise GateAbort("user_stop")
+        return summary
+
+    def run_agent(prompt, rnd):
+        state["round"] = rnd
+        update_meta(name, phase=f"Fix round {rnd} of {maxr}")
+        rc, fok, how, act = run_agent_loop(ctx, prompt, session_of(jid) or m.get("resume"), rnd)
+        if how in ("user_stop", "safety_stop", "stop"):
+            raise GateAbort(how, act)
+
+    gate = vf.VerifyGate(ctx.root, run_agent, run_checks, max_rounds=maxr, verify=not m.get("verify_off"),
+                         emit=upgrades.gate_emit(ctx.ev), checkpoints=ctx.mgr)
+    out = gate.run(m["job"])
+    ctx.ev.release()
+    return out
+
+def run_agent_job(m, name):
+    """The agent run (with watchdog), then - if it ended normally - the verify gate.
+    Leaves the final status, verify outcome, checkpoints and watchdog actions in meta."""
+    cfg = upgrades.load_settings(SETTINGS_FILE, write_defaults=False)
+    ctx = JobCtx(m, name, cfg)
+    note = None
+    if not upgrades.git_repo(ctx.root):
+        note = "Checkpoints off: the project folder is not a git repository"
+    else:
+        try:
+            ctx.mgr = upgrades.make_checkpoints(m, ctx.root, job_dir(name) / "checks", ctx.ev)
+        except Exception as ex:
+            note = f"Checkpoints off: {str(ex)[:200]}"
+    if note:
+        update_meta(name, checkpoints_note=note)
+    rc, fok, how, act = run_agent_loop(ctx, m["job"], m.get("resume"), 0, fresh_log=True)
+    cur = load_meta(name) or m
+    extra = {}
+    if how == "user_stop" or cur.get("status") == "stopping":
+        status = "stopped"
+    elif how == "safety_stop":
+        status, extra["fail_note"] = "safety_stop", act.reason
+    elif how == "stop":
+        status, extra["fail_note"] = "failed", act.reason
+    elif fok is not None:
+        status = "done" if fok else "failed"
+    else:
+        status = "done" if rc == 0 else "failed"
+    verify = None
+    if status == "done":
+        try:
+            verify = run_gate(ctx)
+            if verify["status"] == "failed":
+                status, extra["fail_note"] = "failed", verify["banner"]["text"]
+        except GateAbort as ga:
+            verify = {"status": "aborted", "reason": (ga.act.reason if ga.act is not None else "Stopped by you")}
+            if ga.how == "user_stop":
+                status = "stopped"
+            elif ga.how == "safety_stop":
+                status, extra["fail_note"] = "safety_stop", ga.act.reason
+            else:
+                status, extra["fail_note"] = "failed", ga.act.reason if ga.act is not None else "Stopped"
+        except Exception as ex:
+            verify = {"status": "error", "banner": {"colour": "yellow",
+                                                     "text": f"Done – checks could not run ({str(ex)[:200]})"}}
+            ctx.ev.emit("checks", verify["banner"]["text"], None, "warn")
+    if ctx.mgr is not None:
+        try:
+            ctx.mgr.finish()
+        except Exception:
+            pass
+    ctx.ev.release()
+    with meta_lock:
+        cur = load_meta(name) or m
+        if cur.get("status") == "stopping":
+            status = "stopped"
+        cur.update(status=status, finished=time.time(), exit=rc,
+                   session=session_of(m["id"]) or cur.get("resume"), phase=None, **extra)
+        if verify is not None:
+            cur["verify"] = verify
+        if ctx.mgr is not None:
+            cur["checkpoints"] = ctx.mgr.to_record()
+        if ctx.actions:
+            cur["watchdog"] = ctx.actions[-100:]
+        save_meta(cur, name)
+    return cur
 
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 
@@ -266,6 +514,9 @@ def notify_finished(meta, ok):
     Never raises: a missing notify-send or sound player, or a display-less
     session, must not take down the worker thread."""
     title = "Agent job finished" if ok else "Agent job failed"
+    if (meta or {}).get("status") == "safety_stop":   # U01
+        title = "Agent job: SAFETY STOP"
+        text = " ".join(str(meta.get("fail_note") or "")[:100].split()) or text
     text = " ".join(str((meta or {}).get("job") or (meta or {}).get("id") or "job").split())[:100]
     if (meta or {}).get("kind") == "bench":
         title = "Bench run finished" if ok else "Bench run failed"
@@ -300,11 +551,19 @@ def build_review_md(m):
     failure must never break the worker thread."""
     if not m or m.get("kind") == "bench":
         return
-    md = reviewbundle.build_bundle(
-        m, job_dir(m["id"]) / "events.jsonl",
-        lambda s: in_sandbox(m["folder"], s, timeout=120), load_meta)
+    md = bundle_md(m)
     if not READONLY:
         (job_dir(m["id"]) / "review.md").write_text(md, encoding="utf-8")
+
+def bundle_md(m):
+    """reviewbundle + U01's verify rounds, cheating-guard issues, checkpoints, watchdog."""
+    md = reviewbundle.build_bundle(m, job_dir(m["id"]) / "events.jsonl",
+                                   lambda s: in_sandbox(m["folder"], s, timeout=120), load_meta)
+    sec = upgrades.bundle_section(m)
+    if sec:
+        body, sep, foot = md.rpartition("\n(bundle: ")
+        md = (body + "\n\n" + sec + sep + foot) if sep else (md + "\n\n" + sec)
+    return md
 
 def saved_review_md(m):
     """The auto-built review.md, but only when it is NEWER than the job's finish
@@ -323,7 +582,8 @@ def status_for(m):
     """Live status of a job (state, what it is doing now, step checklist)."""
     if m.get("kind") == "bench":
         return bench_status(m)
-    return jobstatus.job_status(m, job_dir(m["id"]) / "events.jsonl", WORK / (m.get("folder") or ""), time.time())
+    s = jobstatus.job_status(m, job_dir(m["id"]) / "events.jsonl", WORK / (m.get("folder") or ""), time.time())
+    return upgrades.overlay_status(s, m)   # U01: checks banner, safety stop, gate phase
 
 def session_of(jid):
     """The agent's session id from its event stream, so a follow-up can continue the same conversation."""
@@ -336,38 +596,31 @@ def session_of(jid):
     except OSError: pass
     return sid if sid and SESSION_RE.fullmatch(sid) else None
 
-GRACE_AFTER_RESULT = 120  # seconds an agent may linger after its final answer before it is stopped
+GRACE_AFTER_RESULT = 120  # default; the live value is after_result_grace_s in SETTINGS_FILE (U01)
 
 def wait_with_watchdog(jid, p):
-    """Wait for the agent. Once it has printed its final result, give it GRACE_AFTER_RESULT seconds to exit,
-    then stop its container: unattended Claude Code can otherwise wait forever on a leftover background task.
-    Returns (exit code, True/False from the final result if the watchdog stopped it, else None)."""
-    result_at, result_ok = None, None
-    ev = job_dir(jid) / "events.jsonl"
-    while p.poll() is None:
-        time.sleep(10)
-        if result_at is None:
-            try:
-                tail = ev.read_bytes()[-20000:].decode("utf-8", "replace")
-            except OSError:
-                continue
-            for line in tail.splitlines():
-                if line.startswith('{"type":"result"'):
-                    try: result_ok = not json.loads(line).get("is_error")
-                    except ValueError: result_ok = True
-                    result_at = time.time()
-        elif time.time() - result_at > GRACE_AFTER_RESULT:
-            subprocess.run(["podman", "stop", "-t", "10", "agentjob-" + jid], capture_output=True, timeout=60)
-            return p.wait(), result_ok
-    return p.returncode, None
+    """Wait for the agent. U01: the job's Monitor (upgrades.py) does the watching - the
+    runaway watchdog, PLAN.md checkpoints and the after-result stop, which now parses each
+    line as JSON and checks type == "result" whatever the key order (Claude Code puts
+    "type" near the end, so the old startswith test never fired for Claude modes).
+    Returns (exit code, True/False from the final result if it was stopped after
+    lingering past its final answer, else None)."""
+    mon = monitors.get(jid)
+    if mon is None:
+        return p.wait(), None
+    rc = mon.run(p)
+    return rc, mon.after_result
 
 def stop_job(jid):
-    m = load_meta(jid)
-    if not m: return
-    if m["status"] == "queued":
-        m.update(status="cancelled", finished=time.time()); save_meta(m); return
-    if m["status"] == "running":
+    with meta_lock:   # U01: the worker updates meta.json during a job too
+        m = load_meta(jid)
+        if not m: return
+        if m["status"] == "queued":
+            m.update(status="cancelled", finished=time.time()); save_meta(m); return
+        if m["status"] != "running":
+            return
         m["status"] = "stopping"; save_meta(m)
+    if True:
         if m.get("kind") == "bench":
             # Stop = terminate the runner (it saves every finished sample already);
             # give it 15 s to exit on its own, then kill.
@@ -381,8 +634,8 @@ def stop_job(jid):
                 except Exception:
                     pass
         else:
-            subprocess.run(["podman", "stop", "-t", "10", "agentjob-" + jid], capture_output=True, timeout=60)
-            jailcfg.stop_children(jid)   # JAIL: offline local agents a supervised job started
+            stop_agent_process(jid)              # podman stop + JAIL: stop_children (supervised)
+            upgrades.stop_job_containers(jid)    # U01: a check / checkpoint run in progress
 
 
 # ---------------------------------------------------------------- bench auto-runs
@@ -811,6 +1064,8 @@ def events(jid, since=0):
                     lines = body.splitlines()
                     short = "\n".join(lines[:12]) + (f"\n... ({len(lines) - 12} more lines)" if len(lines) > 12 else "")
                     items.append({"k": "result", "err": bool(c.get("is_error")), "t": short[:2000]})
+        elif t == "agentjobs":   # U01: the board's own lines (checks, fix rounds, watchdog)
+            items.append({"k": "gate", "t": str(e.get("text") or ""), "tone": str(e.get("tone") or "")})
         elif t == "result":
             items.append({"k": "final", "t": str(e.get("result") or ""), "err": bool(e.get("is_error")),
                           "secs": round((e.get("duration_ms") or 0) / 1000), "turns": e.get("num_turns")})
@@ -991,7 +1246,13 @@ def status_pill(s):
         sub = f'<div class="hint clamp">{esc(s["result_summary"][:90])}</div>'
     elif s["state"] == "FAILED" and s.get("fail_reason"):
         sub = f'<div class="hint bad clamp">{esc(s["fail_reason"][:90])}</div>'
-    return f'<span class="pill s-{s["state"]}">{STATE_GLYPH[s["state"]]} {esc(s["label"])}</span>{extra}{sub}'
+    tone = f' t-{s["tone"]}' if s.get("tone") else ""   # U01: checks colour
+    return f'<span class="pill s-{s["state"]}{tone}">{STATE_GLYPH[s["state"]]} {esc(s["label"])}</span>{extra}{sub}'
+
+def folder_busy(folder):
+    """U01: a job is queued/running in this folder (no rollback or re-check then)."""
+    return any(m.get("folder") == folder and m.get("status") in ("running", "stopping")
+               for m in all_jobs()[:200])
 
 def job_rows():
     rows = ""
@@ -1005,7 +1266,8 @@ def job_rows():
     return rows or '<tr><td colspan=6 class=mut>No jobs yet.</td></tr>'
 
 def home_page():
-    opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in MODES.items())
+    opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in MODES.items()
+                   if k != upgrades.FAKE_MODE)   # U01: the fake mode stays hidden
     fopts = "".join(f'<option value="{esc(f)}">{esc(f)}</option>' for f in folders())
     rows = job_rows()
     body = header() + f"""
@@ -1016,9 +1278,10 @@ def home_page():
 <label>Job</label><textarea name="job" required placeholder="Describe the job the way you would to Claude. Example: Clone https://github.com/... into this folder, add a dark mode toggle to the settings screen, and build a debug APK."></textarea>
 {jailcfg.OFFLINE_FIELD}
 {jailcfg.FETCH_FORM_FIELD}
-<p class="hint">Jobs run one at a time. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
+{upgrades.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False)["fix_rounds"])}
+<p class="hint">Jobs run one at a time. When the agent finishes, the board runs the project's checks in the sandbox and sends failures back for fix rounds. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
 <button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
-<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
+{upgrades.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
 <script>
 (function(){{
 // Refresh only the job list, never the form, so typing is never lost.
@@ -1038,10 +1301,10 @@ function pill(s){{const ex=s.pill_extra||(s.steps_total?s.steps_done+'/'+s.steps
  if((s.state==='WORKING'||s.state==='STUCK')&&s.current_action)sub='<div class="hint act clamp">'+eh(s.current_action)+'</div>';
  else if(s.state==='FINISHED'&&s.result_summary)sub='<div class="hint clamp">'+eh(String(s.result_summary).slice(0,90))+'</div>';
  else if(s.state==='FAILED'&&s.fail_reason)sub='<div class="hint bad clamp">'+eh(String(s.fail_reason).slice(0,90))+'</div>';
- return '<span class="pill s-'+s.state+'">'+GL[s.state]+' '+eh(s.label)+'</span>'+x+sub}}
+ return '<span class="pill s-'+s.state+(s.tone?' t-'+s.tone:'')+'">'+GL[s.state]+' '+eh(s.label)+'</span>'+x+sub}}
 let cur={{}};
 function setPills(map){{for(const jid in map){{const el=document.getElementById('p-'+jid);if(el){{el.innerHTML=pill(map[jid]);el.dataset.st=map[jid].state;
- const b=el.firstElementChild;if(b)b.className='pill s-'+map[jid].state}}}}cur=map}}
+ const b=el.firstElementChild;if(b)b.className='pill s-'+map[jid].state+(map[jid].tone?' t-'+map[jid].tone:'')}}}}cur=map}}
 async function stats(){{try{{const r=await fetch('/api/statuses');if(r.ok){{const d=await r.json();setPills(d.statuses);
  let live=null;for(const jid in d.statuses){{const s=d.statuses[jid];if(!live&&(s.state==='WORKING'||s.state==='STUCK'))live=s}}
  if(live){{const p=live.pill_extra?' '+live.pill_extra:(live.steps_total?' '+live.steps_done+'/'+live.steps_total:'');document.title=TIT[live.state]+p+' '+(live.state==='STUCK'?'Stuck?':TW[live.state])+' \\u2013 '+live.short}}
@@ -1091,23 +1354,27 @@ def job_page(jid):
         meta_bits.append(f'follow-up to <a href="/job/{m["parent"]}">earlier job</a>')
     meta_line = " &middot; ".join(meta_bits)
     bundle_html = ""
-    if m["status"] in ("done", "failed", "stopped", "interrupted"):
+    if m["status"] in ("done", "failed", "stopped", "interrupted", "safety_stop"):
         bundle_html = f"""<div class="card"><h2>Review bundle</h2>
 <div class="brow" id="bundlebox"><button id="copybundle">Copy for Claude</button>
 <a class="btn" href="/api/bundle/{esc(jid)}?download=1">Download .md</a></div>
 <p class="hint">One file with the prompt, the agent's summary, build/test results and the changed lines - paste it into Claude to review.</p></div>
 """
+    can_act = not active and not READONLY and not folder_busy(m["folder"]) and m.get("kind") != "bench"
+    u01_cards = (upgrades.checks_card_html(m, jid, can_act and m["status"] != "cancelled")
+                 + upgrades.checkpoints_card_html(m, jid, can_act) + upgrades.watchdog_card_html(m) + upgrades.CSS)
     body = header() + f"""
-<div class="card banner {s['state']}" id="banner">
-<div class="bhead"><span class="btitle s-{s['state']}" id="st">{glyph} {esc(s['label'])}</span><span style="flex:1"></span><span id="stopform">{stop}</span></div>
+<div class="card banner {s['state']}{' t-' + s['tone'] if s.get('tone') else ''}" id="banner">
+<div class="bhead"><span class="btitle s-{s['state']}{' t-' + s['tone'] if s.get('tone') else ''}" id="st">{glyph} {esc(s['label'])}</span><span style="flex:1"></span><span id="stopform">{stop}</span></div>
 <div class="bact" id="bact"{' style="display:none"' if not s['current_action'] else ''}>{esc(s['current_action'] or '')}</div>
 <div class="bwarn" id="bstuck"{' hidden' if s['state'] != 'STUCK' else ''}>{esc(stuck_text(s))}</div>
+{upgrades.verify_line_html(s)}
 <div class="bsum{' bad' if s['state'] == 'FAILED' else ''}" id="bsum">{esc(summary)}</div>
 <div class="bstats mut" id="bstats">{stats_text(s)}</div>
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{u01_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}<div class="card"><h2>Activity</h2><details id="det"><summary class="hint">Show details</summary><div class="feed" id="feed"><span class="mut">Waiting for the agent...</span></div></details></div>
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 <div class="card"><h2>Changes</h2><pre id="git" class="mut">Loading...</pre></div>
@@ -1119,7 +1386,7 @@ const jid={json.dumps(jid)},jobShort={json.dumps(" ".join((m['job'] or 'job').sp
 const feed=document.getElementById('feed'),det=document.getElementById('det'),banner=document.getElementById('banner');
 function el(t,c,h){{const d=document.createElement(t);if(c)d.className=c;if(h!==undefined)d.textContent=h;return d}}
 function eh(s){{const d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML}}
-function add(it){{if(first){{feed.textContent='';first=false}}let d=el('div','it '+it.k);
+function add(it){{if(first){{feed.textContent='';first=false}}let d=el('div','it '+it.k+(it.tone?' '+it.tone:''));
  if(it.k==='think'){{if(feed.lastChild&&feed.lastChild.classList.contains('think'))return;d.textContent='thinking...'}}
  else if(it.k==='tool'){{const b=el('b',null,it.name+' ');d.appendChild(b);d.appendChild(el('code',null,it.t))}}
  else if(it.k==='result'){{const p=el('pre',it.err?'bad':'mut',it.t);d.appendChild(p)}}
@@ -1145,8 +1412,9 @@ function stepsH(j){{if(!j.steps_total)return j.fallback?'<p class="mut">'+eh(j.f
  for(const t of j.steps)h+='<li class="'+t.state+'">'+(sym[t.state]||'\\u25CB')+' '+eh(t.text)+'</li>';
  return h+'</ul>'}}
 function beep(ok){{try{{const C=window.AudioContext||window.webkitAudioContext,c=new C(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.type='sine';o.frequency.value=ok?880:240;g.gain.value=.15;o.start();const t=c.currentTime;g.gain.exponentialRampToValueAtTime(.001,t+.4);o.stop(t+.45);setTimeout(()=>c.close(),700)}}catch(e){{}}}}
-function apply(j){{banner.className='card banner '+j.state;
- const stp=document.getElementById('st');stp.className='btitle s-'+j.state;stp.innerHTML=GL[j.state]+' '+eh(j.label);
+function apply(j){{const tn=j.tone?' t-'+j.tone:'';banner.className='card banner '+j.state+tn;
+ const stp=document.getElementById('st');stp.className='btitle s-'+j.state+tn;stp.innerHTML=GL[j.state]+' '+eh(j.label);
+ const bv=document.getElementById('bverify');if(bv){{if(j.verify){{bv.hidden=false;bv.className='vline t-'+j.verify.colour;bv.textContent=j.verify.text}}else bv.hidden=true}}
  const stats=[];if(j.elapsed!=null)stats.push('Elapsed '+fmtDur(j.elapsed));
  if(j.last_activity_ago!=null)stats.push('last activity '+fmtAgo(j.last_activity_ago));
  stats.push(j.actions+(j.actions===1?' action':' actions'));stats.push(j.turns+(j.turns===1?' turn':' turns'));
@@ -1274,8 +1542,7 @@ class H(http.server.BaseHTTPRequestHandler):
             md = saved_review_md(m)   # the worker builds this when the job ends
             if md is None:
                 try:
-                    md = reviewbundle.build_bundle(m, job_dir(m["id"]) / "events.jsonl",
-                                                   lambda s: in_sandbox(m["folder"], s, timeout=120), load_meta)
+                    md = bundle_md(m)
                 except Exception as ex:
                     return self.send(f"(bundle failed: {ex})", "text/plain; charset=utf-8", code=500)
             hdrs = []
@@ -1311,8 +1578,18 @@ class H(http.server.BaseHTTPRequestHandler):
             folder = get("newfolder") or get("folder")
             if mode not in MODES or not job or not FOLDER_RE.match(folder or "") or folder == "eval":
                 return self.send(render(header() + '<div class="card bad">Pick a mode, a valid folder name (letters, numbers, dot, dash, underscore) and describe the job. <a href="/">Back</a></div>'), code=400)
-            m = new_job(mode, folder, job, bool(get("offline")) and mode != "supervised",
-                        extra={"fetch_first": True} if get("fetch_first") else None)   # JAIL
+            extra = {"fetch_first": True} if get("fetch_first") else {}   # JAIL
+            u01 = u01_form_extra(form, mode, job)                         # U01: checks, don't verify, fix rounds
+            if u01 is None:
+                return self.send(render(header() + '<div class="card bad">The checks, fix rounds (0-10) or the fake '
+                                        'scenario could not be read. <a href="/">Back</a></div>'), code=400)
+            extra.update(u01)
+            m = new_job(mode, folder, job, bool(get("offline")) and mode != "supervised", extra=extra or None)
+            if m.get("checks") and m.get("checks_source") == "the new-job form":
+                try:   # the agent can see what it will be checked with
+                    ck.write_checks(WORK / folder, upgrades.job_checks(m))
+                except OSError:
+                    pass
             return self.redirect(f"/job/{m['id']}")
         if len(parts) == 2 and parts[0] == "followup" and load_meta(parts[1]):
             prev = load_meta(parts[1]); job = get("job")
@@ -1320,7 +1597,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self.redirect(f"/job/{parts[1]}")
             if check_record(parts[1], prev):   # never build a follow-up on a tampered record
                 return self.redirect(f"/job/{parts[1]}")
-            m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"], parent=prev["id"])
+            carry = {k: prev[k] for k in ("checks", "checks_source", "verify_off", "fix_rounds") if k in prev}   # U01
+            m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"],
+                        parent=prev["id"], extra=carry or None)
             return self.redirect(f"/job/{m['id']}")
         if parts == ["fetch"]:   # JAIL: Download packages (form button or job page)
             folder = get("newfolder") or get("folder")
@@ -1331,10 +1610,13 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.redirect(f"/fetch/{rid}")
         if len(parts) == 2 and parts[0] == "push" and load_meta(parts[1]):   # JAIL: Push branch button
             pm = load_meta(parts[1])
-            if (pm.get("kind") != "bench" and pm["status"] in ("done", "failed", "stopped", "interrupted")
+            if (pm.get("kind") != "bench" and pm["status"] in ("done", "failed", "stopped", "interrupted", "safety_stop")
                     and not check_record(parts[1], pm)):
                 jailcfg.push_branch(pm, WORK / pm["folder"], get("branch"))
                 save_meta(pm, parts[1])
+            return self.redirect(f"/job/{parts[1]}")
+        if len(parts) == 2 and parts[0] in ("recheck", "rollback", "ckpt-cleanup") and load_meta(parts[1]):   # U01
+            u01_button(parts[0], parts[1], get)
             return self.redirect(f"/job/{parts[1]}")
         if len(parts) == 2 and parts[0] == "stop" and load_meta(parts[1]):
             was_bench = load_meta(parts[1]).get("kind") == "bench"
@@ -1362,6 +1644,83 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+# ---------------------------------------------------------------- U01: form fields and buttons
+
+def u01_form_extra(form, mode, job):
+    """New-job form -> record fields (checks, verify_off, fix_rounds). None = bad input."""
+    get = lambda k: (form.get(k, [""])[0]).strip()
+    extra = {}
+    checks = upgrades.form_checks(form.get("checks", [""])[0])
+    if checks:
+        if not upgrades.checks_ok(checks):
+            return None
+        extra.update(checks=checks, checks_source="the new-job form")
+    if get("noverify"):
+        extra["verify_off"] = True
+    if get("fixrounds"):
+        try:
+            fr = int(get("fixrounds"))
+        except ValueError:
+            return None
+        if not 0 <= fr <= upgrades.FIX_ROUNDS_MAX:
+            return None
+        extra["fix_rounds"] = fr
+    if mode == upgrades.FAKE_MODE:
+        try:
+            json.loads(job)
+        except ValueError:
+            return None
+    return extra
+
+def u01_button(kind, jid, get):
+    """Run checks again / Roll back to here / Clean up - only for a finished job whose
+    folder has nothing running, on a record that passes the worker's safety check."""
+    m = load_meta(jid)
+    if (not m or m.get("kind") == "bench" or m["status"] in ("queued", "running", "stopping")
+            or check_record(jid, m) or folder_busy(m["folder"])):
+        return
+    root = WORK / m["folder"]
+    ev = upgrades.EventLog(job_dir(jid) / "events.jsonl")
+    if kind == "recheck":
+        if (m.get("recheck") or {}).get("running"):
+            return
+        update_meta(jid, recheck={"running": True, "time": time.time()})
+
+        def go():
+            try:
+                wrap = upgrades.make_wrap(root, m["folder"], f"agentcheck-{jid}")
+                summ = ck.run_all(root, job_dir(jid) / "checks" / f"again-{int(time.time())}", wrap,
+                                  checks=upgrades.job_checks(m))
+                colour, text = ck.banner_text(summ)
+                ev.emit("checks", f"Checks run again: {text}", None, upgrades.TONE.get(colour, ""))
+                update_meta(jid, recheck={"running": False, "time": time.time(), "summary": summ})
+            except Exception as ex:
+                update_meta(jid, recheck={"running": False, "time": time.time(),
+                                          "summary": {"status": "unverified", "results": []}, "error": str(ex)[:300]})
+        threading.Thread(target=go, daemon=True).start()
+        return
+    if not upgrades.git_repo(root) or not m.get("checkpoints"):
+        return
+    try:
+        mgr = upgrades.make_checkpoints(m, root, job_dir(jid) / "checks", ev)
+        if kind == "rollback":
+            n = int(get("n"))
+            want = next((c for c in m["checkpoints"].get("checkpoints", []) if c.get("n") == n), None)
+            have = next((c for c in mgr.checkpoints if c.n == n), None)
+            # the record outside the sandbox must agree with the one in .git (agent-writable)
+            if not want or not have or have.commit != want.get("commit") or not SHA_RE.fullmatch(have.commit):
+                return
+            mgr.rollback_to(n)
+            update_meta(jid, checkpoints=mgr.to_record())
+        else:
+            removed = upgrades.cpm.cleanup_old(mgr.git, days=14)
+            mgr.git.ok("worktree", "prune")
+            ev.emit("checkpoint", f"Clean up: removed {len(removed)} old checkpoint refs / discarded branches")
+            update_meta(jid, ckpt_cleanup={"time": time.time(), "removed": removed[:50]})
+    except Exception as ex:
+        ev.emit("checkpoint_error", f"{kind} failed: {str(ex)[:300]}", None, "bad")
+
+
 def _has_records(path):
     """True if a jobs folder holds any job records (.trash doesn't count)."""
     try:
@@ -1386,6 +1745,8 @@ def main():
         print("Sent one success notification (errors are ignored; check the desktop and sound).", flush=True)
         return
     old_jobs_notice()
+    if not READONLY:   # U01: create the settings file with the defaults, so it is easy to find
+        upgrades.load_settings(SETTINGS_FILE, write_defaults=True)
     if READONLY:
         print("Read-only mode: no worker thread, jobs are never changed.", flush=True)
     else:

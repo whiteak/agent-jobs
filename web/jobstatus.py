@@ -350,7 +350,7 @@ def job_status(meta, events_path, project_dir, now=None):
         state = "STUCK" if (idle_ref is not None and now - idle_ref > STUCK_SECONDS) else "WORKING"
     elif status == "done":
         state = "FINISHED"
-    elif status in ("failed", "interrupted"):
+    elif status in ("failed", "interrupted", "safety_stop"):   # safety_stop: U01 watchdog
         state = "FAILED"
     elif status in ("stopped", "cancelled"):
         state = "STOPPED"
