@@ -593,7 +593,10 @@ def status_for(m):
     if m.get("kind") == "bench":
         return bench_status(m)
     s = jobstatus.job_status(m, job_dir(m["id"]) / "events.jsonl", WORK / (m.get("folder") or ""), time.time())
-    return upgrades.overlay_status(s, m)   # U01: checks banner, safety stop, gate phase
+    s = upgrades.overlay_status(s, m)   # U01: checks banner, safety stop, gate phase
+    s["badge"], s["badge_colour"] = dashboard.badge(m, s)   # U07: jobs-list badge + checks result
+    s["checks"] = dashboard.checks_cell(m)
+    return s
 
 def session_of(jid):
     """The agent's session id from its event stream, so a follow-up can continue the same conversation."""
@@ -1272,7 +1275,7 @@ def status_pill(s):
     elif s["state"] == "FAILED" and s.get("fail_reason"):
         sub = f'<div class="hint bad clamp">{esc(s["fail_reason"][:90])}</div>'
     tone = f' t-{s["tone"]}' if s.get("tone") else ""   # U01: checks colour
-    return f'<span class="pill s-{s["state"]}{tone}">{STATE_GLYPH[s["state"]]} {esc(s["label"])}</span>{extra}{sub}'
+    return f'<span class="pill s-{s["state"]}{tone}">{STATE_GLYPH[s["state"]]} {esc(s.get("badge") or s["label"])}</span>{extra}{sub}'   # U07: badge text
 
 def folder_busy(folder):
     """U01: a job is queued/running in this folder (no rollback or re-check then)."""
@@ -1327,7 +1330,7 @@ function pill(s){{const ex=s.pill_extra||(s.steps_total?s.steps_done+'/'+s.steps
  if((s.state==='WORKING'||s.state==='STUCK')&&s.current_action)sub='<div class="hint act clamp">'+eh(s.current_action)+'</div>';
  else if(s.state==='FINISHED'&&s.result_summary)sub='<div class="hint clamp">'+eh(String(s.result_summary).slice(0,90))+'</div>';
  else if(s.state==='FAILED'&&s.fail_reason)sub='<div class="hint bad clamp">'+eh(String(s.fail_reason).slice(0,90))+'</div>';
- return '<span class="pill s-'+s.state+(s.tone?' t-'+s.tone:'')+'">'+GL[s.state]+' '+eh(s.label)+'</span>'+x+sub}}
+ return '<span class="pill s-'+s.state+(s.tone?' t-'+s.tone:'')+'">'+GL[s.state]+' '+eh(s.badge||s.label)+'</span>'+x+sub}}
 let cur={{}};
 function setPills(map){{for(const jid in map){{const el=document.getElementById('p-'+jid);if(el){{el.innerHTML=pill(map[jid]);el.dataset.st=map[jid].state;
  const b=el.firstElementChild;if(b)b.className='pill s-'+map[jid].state+(map[jid].tone?' t-'+map[jid].tone:'')}}}}cur=map}}
@@ -1417,14 +1420,14 @@ function atBottom(){{return feed.scrollTop+feed.clientHeight>=feed.scrollHeight-
 let stick=true;feed.addEventListener('scroll',()=>{{stick=atBottom();follow.textContent=stick?'Following':'Paused - scroll to the bottom to follow'}});
 function match(d){{const q=(logq.value||'').trim().toLowerCase();d.hidden=!!q&&!d.textContent.toLowerCase().includes(q)}}
 logq.addEventListener('input',()=>{{for(const d of feed.children)match(d)}});
-const ICON={{cmd:'$ ',edit:'\u270E ',read:'',other:''}};
+const ICON={{cmd:'$ ',edit:'\\u270E ',read:'',other:''}};
 function el(t,c,h){{const d=document.createElement(t);if(c)d.className=c;if(h!==undefined)d.textContent=h;return d}}
 function eh(s){{const d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML}}
 function add(it){{if(first){{feed.textContent='';first=false}}let d=el('div','it '+it.k+(it.cat?' '+it.cat:'')+(it.tone?' '+it.tone:''));
  if(it.k==='think'){{if(feed.lastChild&&feed.lastChild.classList.contains('think'))return;d.textContent='thinking...'}}
  else if(it.k==='tool'){{const b=el('b',null,(ICON[it.cat]||'')+it.name+' ');d.appendChild(b);d.appendChild(el('code',null,it.t))}}
- else if(it.k==='result'){{const lines=String(it.t).split('\n');const p=el('pre',it.err?'bad':'mut',lines.slice(0,10).join('\n'));d.appendChild(p);
-  if(lines.length>10){{const b=el('button','more','Show more ('+(lines.length-10)+' more lines)');b.onclick=()=>{{const open=b.dataset.o==='1';p.textContent=open?lines.slice(0,10).join('\n'):it.t;b.dataset.o=open?'0':'1';b.textContent=open?'Show more ('+(lines.length-10)+' more lines)':'Show less'}};d.appendChild(b)}}}}
+ else if(it.k==='result'){{const lines=String(it.t).split('\\n');const p=el('pre',it.err?'bad':'mut',lines.slice(0,10).join('\\n'));d.appendChild(p);
+  if(lines.length>10){{const b=el('button','more','Show more ('+(lines.length-10)+' more lines)');b.onclick=()=>{{const open=b.dataset.o==='1';p.textContent=open?lines.slice(0,10).join('\\n'):it.t;b.dataset.o=open?'0':'1';b.textContent=open?'Show more ('+(lines.length-10)+' more lines)':'Show less'}};d.appendChild(b)}}}}
  else if(it.k==='final'){{d.className='it final'+(it.err?' err':'');d.appendChild(el('b',null,(it.err?'Finished with an error':'Finished')+(it.secs?' in '+Math.round(it.secs/60)+' min':'')));d.appendChild(el('pre',null,it.t))}}
  else d.appendChild(el(it.k==='log'?'pre':'div',it.k==='log'?'mut':null,it.t));
  match(d);feed.appendChild(d)}}
@@ -1432,7 +1435,7 @@ function addItems(items){{const s=stick;items.forEach(add);if(items.length&&s)fe
 function addTl(ev){{if(!tl||ev.id<=tlLast)return;tlLast=ev.id;const e=tl.querySelector('.tlempty');if(e)e.remove();
  const icons={json.dumps(dashboard.evm.ICONS)};const li=document.createElement('li');
  const c=ev.type==='checks'?({{green:'ok',red:'bad',yellow:'warn',orange:'warn2'}}[(ev.data||{{}}).colour]||''):({{safety_stop:'bad',failed:'bad',rollback:'warn2',needs_review:'warn2',watchdog:'warn2',restart:'warn2'}}[ev.type]||'');
- li.className=c;li.innerHTML='<span class="tli">'+(icons[ev.type]||'\u2022')+'</span><span class="tlt">'+new Date(ev.time*1000).toTimeString().slice(0,8)+'</span><span>'+eh(ev.text)+'</span>';tl.appendChild(li)}}
+ li.className=c;li.innerHTML='<span class="tli">'+(icons[ev.type]||'\\u2022')+'</span><span class="tlt">'+new Date(ev.time*1000).toTimeString().slice(0,8)+'</span><span>'+eh(ev.text)+'</span>';tl.appendChild(li)}}
 // Polling = the fallback when the live stream (Server-Sent Events) is not available
 let polling=false;
 async function poll(){{try{{const r=await fetch('/api/events/'+jid+'?since='+off);const j=await r.json();
