@@ -10,6 +10,7 @@
 - Tests must never call the model server (127.0.0.1:8080) or start a real agent; mock them (use the fake agent once upgrade 1a adds it).
 - Commit locally after each working step with a clear message. Do not push.
 - To try the web page, run your copy on port 8091 (add a --port option if there isn't one) with its own state folder. Never use port 8090.
+- Voice (merged after upgrade 3): keep every "# VOICE" block in jobboard.py, the data-voice and data-voice-read attributes, the static/voice.js script tag and the 5 voice routes working.
 - UI text: short, plain, friendly English. No jargon on buttons.
 - Finish with AGENT_REPORT.md: what changed (files), how to test it by hand click by click, test counts before and after, and anything unfinished or assumed.
 
