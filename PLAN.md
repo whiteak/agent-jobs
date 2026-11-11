@@ -1,3 +1,90 @@
+# Job 04 (re-run) — Upgrade 9a: phone-friendly layout and safe phone access
+
+## Findings
+
+- Nothing of 9a exists yet: the branch ends at U08 job 03 (`2619db1`), `git log` has no
+  `U09a` commit, and `grep -rn "U09a" web/` only hits `agentjobs_upgrades/auth.py`'s own
+  docstring. `notifycfg.py` is U09b (ntfy alerts) and already has a settings page (`/notify`,
+  `header()` links it as "Phone"), so 9a is layout + access + login + manifest, from zero.
+- Pages: one HTML shell, `jobboard.PAGE` (1324), filled by `render(body)` (`@@BODY@@`).
+  The viewport meta is already there; the base CSS lives inside PAGE and every module appends
+  its own `<style>` in the body (`upgrades.CSS`, `badges.CSS`, `diffcard.CSS`,
+  `dashboard.CSS`, `taskqueue.CSS`, `planning.CSS`, `jailcfg.BADGE_CSS`) — so a phone block
+  appended in the head loses to a later module rule of the same specificity. Overrides that
+  touch another module's classes go in that module's own CSS.
+  Only fixed widths over 360 px in the whole tree: `.jobtxt{max-width:420px}` and
+  `.wrap{max-width:980px}` (a desktop cap); everything else is ≤340 px
+  (`.clamp` 340, `.act` 300, `td.st`/`.row>div`/`select.chref` 220, `img.shot` 230/46vw).
+  There is one `@media (max-width:640px)` block already.
+- The jobs list is `job_rows()` → `<tr>`s in a 7-column table whose `<tbody id=jobrows>` the
+  3 s poller replaces wholesale from `/api/rows`. Same markup on both paths, so "jobs as
+  cards" has to be CSS (label each cell with `data-l` and use `::before`), not a second HTML
+  variant — a width-sniffing server render would break the poller anyway.
+- The server (`# JAIL` untouched): `HOST, PORT = "127.0.0.1", JOBBOARD_PORT or 8090`;
+  `main()` binds `(HOST, PORT)`; `H.guard()` demands `Host` ∈ {`127.0.0.1:PORT`,
+  `localhost:PORT`}, the `jb=` token cookie (`?t=` hands it out once) and, for POSTs,
+  `Origin` ∈ the same two. `PORT` is read per request (tests patch it), `HOST` only at bind
+  time. Phone access therefore needs three things: a bind address, a host/origin allowlist
+  that includes it, and a login for anything that is not 127.0.0.1.
+- The login logic is given and tested (`agentjobs_upgrades/auth.py`, `tests/test_rest.py`):
+  `hash_password`/`verify_password` (PBKDF2-HMAC-SHA256, 310 000 iters, random 16-byte salt),
+  `is_local`, `Lockout(5 tries → 300 s)`, `Sessions` (ids stored hashed in one JSON file,
+  0600, 30 days, `revoke_all`), `cookie_header` (`HttpOnly; SameSite=Strict; Max-Age=30d`) and
+  `needs_login(remote, sid, sessions)`. Not reimplemented here — `phoneaccess.py` is the glue.
+- "settings still need the secret from upgrade 8": `decisions.allowed(method, cookie, tok)`
+  (the `aj` HttpOnly session cookie + the `ajtok` HMAC made from
+  `~/.local/state/agentjobs/secret`, which no jail mounts). Only `GET /job/<id>` hands that
+  session out today (`decisions.session_for`), so the two settings pages have to do the same
+  before their POSTs can be gated on it. No test covers `POST /notify` today; the decide
+  tests (`test_u08_decide.py::Pages`) keep working because `/job` and `/decide` are untouched.
+- Timeline: `dashboard.timeline_card` renders the newest **300** rows and a U07 test pins both
+  that count (`len(re.findall(r"<li ", h)) == 300`) and the card's exact empty HTML. So
+  "latest 10 + Show all" must be CSS (`:nth-last-child`) + one button, not fewer rows server-side.
+- Diff viewer: `diffcard.JS` is already unified by default (`sbs=false`, "Side by side" is
+  opt-in) — on a phone the switch just has to be unreachable and a side-by-side table opened
+  on a wide screen must fall back to unified after a resize.
+- No browser here (job 09/10 findings: no Playwright, no Chromium, nothing installable), so
+  360×800 / 412×915 is checked statically (CSS assertions on the rendered pages); the real
+  device look stays Jason's, and the report says so.
+- Sandbox has only `lo` (`ip -4 addr` → nothing, `/sys/class/net` → `lo`), so a test cannot
+  connect through a second interface; the remote-address seam is `H.remote()` and tests patch it.
+- Test command (`AGENT_CHECKS.json`, the verify gate): `cd web && PYTHONDONTWRITEBYTECODE=1
+  python3 -W ignore -m unittest discover -s tests`. Baseline before my changes: **741 tests, OK**.
+
+## Steps
+
+- [ ] PLAN.md (this file) committed before the code.
+- [ ] `web/phoneaccess.py` (new glue, `# U09a`): `state/access-settings.json` (0600) holding
+      `phone_access` (off), the listen address (default the `{{PHONE_ACCESS}}` placeholder to
+      fill in after Jason picks LAN or Tailscale) and only a salted PBKDF2 hash of the
+      password; `bind_host` (applies on the next restart), the address to open on the phone,
+      login/logout with `auth.Lockout` + `auth.Sessions`, the Access settings page and its form
+      validation, and the host/origin names the board answers when phone access is on.
+- [ ] `web/phonelayout.py` (new, `# U09a`): the ≤700 px stylesheet (one column, 44 px tap
+      targets, sticky top bar, jobs as cards, no container wider than 360 px), the web app
+      manifest, and the 192/512 icons drawn with stdlib `zlib`/`struct` (no image library here).
+- [ ] `jobboard.py` hooks (`# U09a`): `ACCESS_FILE`, `H.remote()`, the guard's host/origin
+      allowlist + login gate (`/login` GET+POST, 403 for a POST from an anonymous remote,
+      lock-out after 5 wrong tries), `/access` (read on the page, changes need the U08 secret
+      token like the decide buttons), `header()` sticky status bar + nav, `job_rows()` labelled
+      cells, the manifest/icon routes, and `main()` binding the chosen address and printing the
+      phone link.
+- [ ] Timeline "Show all" in `dashboard.timeline_card` + the unified-only diff viewer in
+      `diffcard` + the live top-bar status in the two page scripts.
+- [ ] Tests `web/tests/test_u09a_phone.py`: phone access off by default (bind stays
+      127.0.0.1, `{{PHONE_ACCESS}}` counts as unset), password hash (no plaintext on disk),
+      login + 30-day HttpOnly/Strict cookie, localhost needs no login, a remote request
+      without a session gets the login page and its POSTs get 403 without touching a job,
+      lock-out after 5 wrong tries then recovery, a changed password signs phones out,
+      the manifest + icons + viewport meta, and the CSS: one column, 44 px targets, sticky
+      bar, cards, no fixed width over 360 px in the main containers, timeline "Show all",
+      diff unified.
+- [ ] Full suite green with the gate's command; PLAN ticked; AGENT_REPORT.md section for this
+      job (click-by-click phone test at 360×800 / 412×915 and what must be checked on a real
+      phone).
+
+---
+
 # Job 03 (re-run) — Upgrade 8: approve / merge buttons
 
 ## Findings
