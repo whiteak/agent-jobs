@@ -598,6 +598,11 @@ class EndToEndBoard(unittest.TestCase):
         agent.write_text('#!/bin/sh\nsleep 12\n'
                          'echo \'{"type":"result","is_error":false,"result":"done"}\'\n')
         agent.chmod(0o755)
+        # JAIL: local jobs run the sandbox self-test first; a passing stand-in
+        (home / "agent-sandbox" / "jail").mkdir()
+        st = home / "agent-sandbox" / "jail" / "podman-selftest.sh"
+        st.write_text("#!/bin/sh\necho 'OK    stand-in self-test'\n")
+        st.chmod(0o755)
         for sub in ("jobs", "work", "runs"):
             (cls.tmp / sub).mkdir()
         cfg = cls.tmp / "basalt_config.json"

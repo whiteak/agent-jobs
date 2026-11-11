@@ -60,7 +60,7 @@ SECRET_PATH_RE = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/home/[^/\s'\"]+|/root)/("
     r"\.ssh|\.gnupg|\.aws|\.netrc|\.git-credentials|\.password-store|\.docker|\.kube"
     r"|\.local/share/keyrings|\.mozilla|\.config/(google-chrome|chromium|BraveSoftware|"
-    r"Code|gh|git|rclone|qwen)|\.qwen|\.claude|\.cline|snap/(firefox|chromium)|"
+    r"Code|gh|git|rclone|qwen)|\.qwen|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
     r"basalt_config|agent-sandbox/(web|state/secrets))"
     r"|/etc/(shadow|sudoers)|/proc/\d+/environ")
 URL_RE = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]+", re.I)
@@ -178,6 +178,14 @@ class Watchdog:
         why = safety_reason(cmd, self.s)
         if why:
             self._pending.append(Action("safety_stop", f"Safety stop: {why}", data={"command": cmd}))
+
+    def on_activity(self) -> None:
+        """Any other sign of work (a tool call, a command still running)."""
+        self._progress()
+
+    def has_urgent(self) -> bool:
+        """True when a safety stop is waiting: the runner should tick() right away."""
+        return any(a.kind == "safety_stop" for a in self._pending)
 
     def on_command_result(self, cmd: str, output: str) -> None:
         self._cmds.append(_h(cmd + "\0" + output))
@@ -301,7 +309,8 @@ def _alive_in_group(pgid: int) -> list[int]:
         if not d.isdigit():
             continue
         try:
-            stat = open(f"/proc/{d}/stat").read()
+            with open(f"/proc/{d}/stat") as fh:
+                stat = fh.read()
         except OSError:
             continue
         fields = stat.rsplit(")", 1)[1].split()

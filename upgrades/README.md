@@ -25,7 +25,8 @@ Written by Claude on 11 Nov 2026 before seeing the live Agent Jobs code, and sti
 
 Run tests: `python3 -m unittest discover -s tests -t .` (78 tests).
 
-Still needs the live code (wiring): job launcher hooks (call VerifyGate after the agent exits; feed
+Upgrades 1-3 are WIRED into the live board (jobboard/web/upgrades.py, 11 Nov 2026; tests: jobboard/web/tests/test_u01.py).
+Still needs the live code (wiring) for 4-10: job launcher hooks (call VerifyGate after the agent exits; feed
 watchdog from each mode's log; CheckpointManager.on_plan_change from the PLAN.md watcher), routes and
 pages in jobboard.py (dashboard, diff tab, buttons, login, settings, new project/plan review,
 attempts tab, reports tab, phone CSS), Playwright/adb screenshot capture (6a/6b).
