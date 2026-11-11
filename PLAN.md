@@ -1,3 +1,98 @@
+# Job 11 — Upgrade 6b: vision check, part 2 (Android)
+
+## Findings
+
+- What 6a already gives me (`web/visioncheck.py`, `# U06`): `run_check(project, check,
+  out_dir, *, wrap, model_url, emit, capture_fn, call, votes, budget)` does everything
+  except taking the picture — it saves the PNGs into `JOBS/<id>/checks/round-N/`, sizes
+  them to ≤1280 px, writes `check-<name>.log`, asks the model `votes` times through the
+  tested engine `agentjobs_upgrades/vision.py`, and returns the dict `checks.run_all`
+  wants (`name/cmd/type/mode/ok/exit_code/verdict/issues/screenshots/passed/failed/
+  skipped/output_file/seconds`). A `capture_fn(project, spec)` returning
+  `{"shots": [(name, png)], "url", "steps", "log", "error"}` is the whole contract, so an
+  Android capture drops straight in — requirement 3 ("the same model check as 6a") comes
+  free. The model is only asked when a PNG came back.
+- `visioncheck.check_ok()` rejects `target != "web"` on purpose and the 6a test asserts
+  that, so Android entries get their own validator (`androidcheck.check_ok`) and
+  `visioncheck.check_ok` is left alone.
+- Runners are registered in two places only: `jobboard.run_gate()` (jobboard.py:462) and
+  the "Run checks again" thread in `jobboard.u01_button()` (jobboard.py:2153), both as
+  `extra_runners=visioncheck.runners(...)`. `checks.run_all` skips a non-command check
+  with no runner silently; `summarize()` only fails a job over results whose
+  `mode != "advisory"` — which is how "no device" can be reported without failing a job.
+- Check types/records: `checks.Check` already has `type` + `extra` and its comment names
+  `"command" | "vision" | "android-smoke"`. `upgrades.checks_ok()`,
+  `upgrades.freeze_checks()` and `job_checks()` know `command` and `vision` only.
+  `detect_checks()` returns two checks for a `gradlew` project and
+  `test_checks.py::test_gradle` pins exactly those two, so the default `android-smoke`
+  must only appear when the folder really is an Android app (a manifest) — that keeps the
+  existing test true.
+- Where results are shown: `upgrades._res_rows`/`_vision_row` (Checks card),
+  `upgrades._check_hint` (the frozen-checks line), `upgrades.bundle_section`/`_vision_md`
+  (review bundle), `badges.badges` (one badge per check), `/api/shot/<jid>` →
+  `visioncheck.shot_file` (serves any PNG listed under `JOBS/<id>/`, so Android
+  screenshots need no new route). `verify.build_fix_prompt` already feeds `issues` to the
+  agent, which is where the crash lines belong.
+- Environment (checked, not assumed): `adb` **is** installed and on PATH
+  (`/opt/android-sdk/platform-tools/adb`, `ANDROID_HOME=/opt/android-sdk`);
+  `adb devices` → **no devices attached**; there is **no emulator package**
+  (`/opt/android-sdk/emulator` missing, `avdmanager` exists but no system image and no
+  network to fetch one), and `~/agent-sandbox/state/android-sdk` does not exist in this
+  container. So the Android path is exercised here against a **fake adb script on PATH**,
+  and a real run must skip with a clear message instead of failing the job.
+- Jail (`# JAIL`): `jail/podman-local.sh` starts every job container with `--network none`
+  and no USB, so **adb cannot run inside the jail at all** — a container has no way to
+  reach a device. Decision: adb runs on the host, argv-only (never a shell, never
+  `shell=True`), the APK path is resolved and must stay inside the project folder, the
+  device commands are fixed words, and nothing is written inside the project folder
+  (screenshots come back as bytes, like the 6a driver's envelope). The project's own code
+  still only ever runs on the device, never on the host. Documented in the module and the
+  report.
+- Test command (`AGENT_CHECKS.json`, the verify gate): `cd web &&
+  PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`.
+  Baseline before my changes: **592 tests, OK** (≈186 s).
+
+## Steps
+
+- [x] PLAN.md (this file) committed before the code.
+- [ ] `web/agentjobs_upgrades/android.py` (new, tested engine): adb lookup, `devices`
+      parsing, APK find under `app/build/outputs/apk/debug`, `install -r`, package
+      detection (`pm list packages -3` diff, `applicationId` fallback),
+      `cmd package resolve-activity --brief`, `am start -W`, crash detection (`pidof` +
+      `logcat` blocks), `exec-out screencap -p`, the stable-screen wait (two shots 1 s
+      apart identical, max 20 s), device steps (`input tap/swipe/text/keyevent`, a
+      screenshot after each) and the `capture()`/`smoke()` sequences that answer in the 6a
+      capture shape. Every device command goes through one `Adb.call(argv)` — argv only,
+      no shell — with `run`/`sleep`/`now` injectable so the tests are fast.
+- [ ] Fake adb on PATH for the tests: a small python script (scenario + argv log through
+      env vars) covering devices, install ok/fail, package lists, resolve-activity,
+      `am start`, `pidof`, logcat crash blocks, screencap (moving/steady frames) and the
+      `input` steps.
+- [ ] `web/androidcheck.py` (new, `# U06b` glue): entry validation + frozen record for
+      `target: "android"` vision checks and `type: "android-smoke"`; device choice (check
+      `device` → settings `android_device` → first connected, with an unfilled
+      `{{ANDROID_DEVICE}}` treated as auto); clear errors (`No device`, `APK not built`,
+      `App crashed on start` with the logcat lines); `run_check` = the 6a model check with
+      an Android `capture_fn`; `run_smoke` = install + start + 10 s without a crash (no
+      model); `runners()` = `android-smoke` plus a `vision` that sends
+      `target: "android"` here and everything else to 6a.
+- [ ] Two small additions in `visioncheck.run_check`: a capture that reports a real
+      device-side failure (`fatal`) is a **fail**, not "not sure"; a skipped check gets a
+      word and colour of its own.
+- [ ] Wiring: `upgrades.checks_ok`/`freeze_checks` accept both Android shapes;
+      `checks.detect_checks` adds a required `app runs` android-smoke check for a real
+      Android app; settings get `android_device`; jobboard registers the Android runners
+      in the gate and in "Run checks again"; the Checks card, the frozen-check hint, the
+      badge text and the review bundle show the device, the package and the crash lines.
+- [ ] Tests `web/tests/test_u06b_android.py`: the engine against the fake adb (exact argv
+      sequences: install, launch, crash, stable wait, steps), the three clear errors,
+      no-device = skipped and never fatal, the model check on an Android screenshot, the
+      smoke check pass/crash, `run_all` + banner + fix prompt, records
+      (validate/freeze/detect), pages (card row, badge, bundle).
+- [ ] Full suite green; PLAN ticked; AGENT_REPORT.md section for job 11.
+
+---
+
 # Job 10 — Upgrade 6a: vision check, part 1 (web pages + the checking engine)
 
 ## Findings
