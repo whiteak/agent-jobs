@@ -51,6 +51,7 @@ FINISHED = ("done", "failed", "stopped", "interrupted", "safety_stop")
 UNDO_DAYS = 14
 SID_RE = re.compile(r"[A-Za-z0-9_-]{16,80}")
 SESSION_RE = re.compile(r"[A-Za-z0-9-]{8,80}")     # agent session ids, as jobboard checks them
+FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")   # jobboard.FOLDER_RE (no import: circular)
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 BR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 TITLE_MAX = 70
@@ -105,6 +106,26 @@ def allowed(method, cookie_hdr, form_tok):
     """True only for a POST carrying the session cookie and that session's own token."""
     sid = sid_from_cookie(cookie_hdr)
     return actions.check_request(secret(), method, sid or None, (form_tok or "").strip() or None)
+
+
+def cannot_decide(m, busy=False):
+    """Why this record may not be decided right now ('' = it may).
+
+    This is not jobboard.check_record: that one asks "could the worker start this job", and a
+    finished job's record is free to fail it for reasons that have nothing to do with a decision
+    (a fake-mode job whose text is no longer a scenario, a parent record since deleted). Here it
+    is only about whether a decision makes sense and which folder it may touch - the folder name
+    matters because it decides where git runs."""
+    folder = m.get("folder")
+    if not isinstance(folder, str) or not FOLDER_RE.fullmatch(folder) or folder == "eval":
+        return "That record's folder is not a folder this board can work in, so nothing was changed."
+    if m.get("kind") == "bench":
+        return "A bench run is not a job, so there is nothing to approve or reject."
+    if m.get("status") not in FINISHED:
+        return "The job has to finish before you can decide."
+    if busy:
+        return "Another job is still working in that folder - decide once it has stopped."
+    return ""
 
 
 # ------------------------------------------------------------------ which branches
@@ -496,10 +517,14 @@ def _form(jid, tok, act, extra="", button="Merge into main", cls=""):
             f'<button{cls}>{button}</button></form>')
 
 
-def card_html(m, jid, can_act, tok="", root=None):
+def card_html(m, jid, can_act, tok="", root=None, note=""):
     """The decide card: Merge into main / Ask for changes / Reject, plus what was decided
-    already (and Undo). Without `can_act` nothing is offered, only what happened."""
+    already (and Undo). Without `can_act` nothing is offered, only what happened. `note` is
+    the board's word for a press it would not take (a job that is still running, say)."""
     if m.get("kind") == "bench" or m.get("status") not in FINISHED:
+        if note:      # a press from a page that has gone stale still gets its word
+            return (f'<div class="card" id="decidecard"><h2>Approve or reject</h2>'
+                    f'<p class="warn2">{esc(note[:200])}</p></div>')
         return ""
     st = state(m)
     status, words = gate(m)
@@ -508,6 +533,8 @@ def card_html(m, jid, can_act, tok="", root=None):
         target, branch = branch_hint(m, root)   # a job already merged or rejected has nothing to merge
     target = target or target_word(m)
     head = ""
+    if note:
+        head += f'<p class="warn2">{esc(note[:200])}</p>'
     if st["merge"]:
         e = st["merge"]
         head += (f'<p class="ok">Merged <code>{esc(e["branch"])}</code> into '
@@ -547,9 +574,9 @@ def card_html(m, jid, can_act, tok="", root=None):
         head += f'<p class="warn2">{esc(st["refused"].get("reason") or "")}</p>'
 
     buttons = ""
-    if can_act:
+    if can_act and not st["reject"]:   # a rejected job offers Undo only; Undo brings the buttons back
         merge_btn = ""
-        if st["merge"] or st["reject"]:
+        if st["merge"]:
             merge_btn = ""
         elif not branch:
             merge_btn = (f'<button disabled title="Nothing to merge">Merge into {esc(target)}</button>'

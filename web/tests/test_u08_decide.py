@@ -496,6 +496,17 @@ class Reject(Base):
         self.assertNotIn("Merge into", html)
         self.assertNotIn('value="merge"', html)
 
+    def test_a_rejected_job_offers_undo_only(self):
+        self.act("reject")
+        html = decisions.card_html(self.meta, self.jid, True, "tok", self.root)
+        for gone in ('value="reject"', 'value="ask"', "Ask for changes"):
+            self.assertNotIn(gone, html)
+        self.assertIn('value="undo-reject"', html)
+        self.act("undo-reject")                       # and Undo brings the decisions back
+        html = decisions.card_html(self.meta, self.jid, True, "tok", self.root)
+        self.assertIn('<button class="ghost">Reject</button>', html)
+        self.assertIn('value="ask"', html)
+
 
 class UndoMerge(Base):
     def test_undo_puts_the_target_back_where_it_was(self):
@@ -628,6 +639,32 @@ class JailCannotReadIt(unittest.TestCase):
     def test_a_normal_project_command_is_still_fine(self):
         self.assertIsNone(watchdog.safety_reason("cat .local/state/notes.md"))
         self.assertIsNone(watchdog.safety_reason("python3 -m unittest discover -s tests"))
+
+
+# ------------------------------------------------------------------ what a press is checked against
+
+class Guard(unittest.TestCase):
+    def test_a_finished_job_in_a_real_folder_can_be_decided(self):
+        self.assertEqual(decisions.cannot_decide(meta_of()), "")
+
+    def test_a_job_that_has_not_finished_cannot(self):
+        for st in ("queued", "running", "stopping"):
+            self.assertIn("has to finish", decisions.cannot_decide(meta_of(status=st)), st)
+
+    def test_a_bench_run_is_not_a_job(self):
+        self.assertIn("bench run", decisions.cannot_decide(meta_of(kind="bench")))
+
+    def test_a_folder_name_that_is_not_a_folder_never_reaches_git(self):
+        for bad in ("../elsewhere", "a/b", "eval", "", None, 7):
+            self.assertIn("folder", decisions.cannot_decide(meta_of(folder=bad)), repr(bad))
+
+    def test_a_folder_another_job_is_still_working_in_waits(self):
+        self.assertIn("still working", decisions.cannot_decide(meta_of(), busy=True))
+
+    def test_the_worker_s_launch_check_is_not_the_test_for_a_decision(self):
+        """jobboard.check_record refuses a record whose parent job is gone. That says nothing
+        about approving the work the job left behind, and used to swallow the press silently."""
+        self.assertEqual(decisions.cannot_decide(meta_of(parent="20260101-000000-ffff")), "")
 
 
 # ------------------------------------------------------------------ the card
@@ -907,6 +944,27 @@ class Pages(unittest.TestCase):
         self.assertEqual((jobs[0]["parent"], jobs[0]["folder"], jobs[0]["resume"]),
                          (self.JID, "u08proj", "sess-12345678"))
         self.assertIn("Make the button blue.", jobs[0]["job"])
+
+    def test_a_record_the_worker_would_not_start_can_still_be_decided(self):
+        """The bug the 8091 run caught: the decision route used jobboard.check_record - the
+        worker's "could I launch this job" check - so a finished job whose record fails it for
+        an unrelated reason (its parent job has since been deleted) swallowed the press: no
+        merge, no word, nothing in the record."""
+        jobboard.update_meta(self.JID, parent="20260101-000000-ffff")
+        self.assertEqual(jobboard.check_record(self.JID, self.record()), "parent")
+        sid, tok, _page = self.session()
+        self.press("merge", sid=sid, tok=tok)
+        self.assertEqual(self.head("main"), self.head("agent/" + self.JID))
+        self.assertEqual(self.record()["decision"], "merged")
+
+    def test_a_press_the_board_will_not_take_says_so_on_the_page(self):
+        sid, tok, _page = self.session()
+        jobboard.update_meta(self.JID, status="running")
+        code, page, _h = self.press("merge", sid=sid, tok=tok)
+        self.assertEqual(code, 200)
+        self.assertIn("The job has to finish before you can decide.", page)
+        self.assertIsNone(self.record().get("decision_log"))
+        self.assertEqual(self.head("main"), self.base)
 
     def test_a_job_that_is_still_running_cannot_be_decided(self):
         sid, tok, _page = self.session()          # a valid session from the finished page

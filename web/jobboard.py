@@ -1527,7 +1527,7 @@ f.addEventListener('submit',()=>{{try{{localStorage.removeItem('jobdraft')}}catc
 </script>"""
     return render(body)
 
-def job_page(jid, decide_tok=""):
+def job_page(jid, decide_tok="", decide_note=""):
     m = load_meta(jid)
     if not m: return None
     report_p = safe_path(m["folder"], "AGENT_REPORT.md")
@@ -1590,7 +1590,7 @@ def job_page(jid, decide_tok=""):
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{decisions.card_html(m, jid, can_act, decide_tok, WORK / m["folder"])}{decisions.CSS}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{decisions.card_html(m, jid, can_act, decide_tok, WORK / m["folder"], decide_note)}{decisions.CSS}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 {diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
@@ -1797,9 +1797,11 @@ class H(http.server.BaseHTTPRequestHandler):
                                  get(decisions.TOKEN_FIELD)):
             return self.send_error(403, "That button only works from the job page in your browser")
         m = load_meta(jid)
-        if (not m or m.get("kind") == "bench" or m.get("status") not in decisions.FINISHED
-                or check_record(jid, m) or folder_busy(m["folder"])):
+        if not m:
             return self.redirect(f"/job/{jid}")
+        why = decisions.cannot_decide(m, busy=folder_busy(m.get("folder") or ""))
+        if why:       # a press the board will not take, said on the card instead of vanishing
+            return self.redirect(f"/job/{jid}?note=" + urllib.parse.quote(why))
         try:
             decisions.action(jid, get("act"), get, decision_ctx())
         except Exception as ex:   # a repo that is not what the record said must not break the page
@@ -1948,7 +1950,8 @@ class H(http.server.BaseHTTPRequestHandler):
             jm = load_meta(parts[1])
             if jm.get("kind") == "bench": return self.redirect(f"/bench/run/{jm['id']}")
             sid, hdrs = decisions.session_for(self.headers)   # U08: the browser's decision session
-            return self.send(job_page(parts[1], decisions.token_for(sid)), headers=hdrs)
+            return self.send(job_page(parts[1], decisions.token_for(sid),
+                                       q.get("note", [""])[0][:200]), headers=hdrs)
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "events" and load_meta(parts[2]):
             return self.sse_job(parts[2], q)     # U07: live stream for the job page
         if len(parts) == 3 and parts[:2] == ["api", "raw"] and load_meta(parts[2]):   # U07: Show raw log
