@@ -212,6 +212,11 @@ class EventLog:
         self.holding = False
         self.history = []
 
+    def __call__(self, kind, text, data=None, tone=""):
+        """ev("checks", "...") is the same as ev.emit(...) - what the 7a tests and
+        gate callbacks expect."""
+        return self.emit(kind, text, data, tone)
+
     def emit(self, kind, text, data=None, tone=""):
         rec = {"type": "agentjobs", "kind": kind, "text": str(text)[:4000], "time": time.time()}
         if tone:

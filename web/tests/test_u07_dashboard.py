@@ -136,9 +136,10 @@ class LogParser(unittest.TestCase):
         items, nxt = jobboard.events("20261107-180819-71a7")
         self.assertEqual(nxt, (SAMPLES / "20261107-180819-71a7" / "events.jsonl").stat().st_size)
         tools = [i for i in items if i["k"] == "tool"]
+        # the order the sample log really has: glob, write hello.sh, chmod, git probe, write AGENT_REPORT.md
         self.assertEqual([(t["name"], t["cat"]) for t in tools],
-                         [("glob", "read"), ("write_file", "edit"), ("write_file", "edit"),
-                          ("run_shell_command", "cmd"), ("run_shell_command", "cmd")][:len(tools)])
+                         [("glob", "read"), ("write_file", "edit"), ("run_shell_command", "cmd"),
+                          ("run_shell_command", "cmd"), ("write_file", "edit")])
         self.assertEqual(sorted(t["cat"] for t in tools), ["cmd", "cmd", "edit", "edit", "read"])
         self.assertEqual(len([i for i in items if i["k"] == "text"]), 3)
         self.assertEqual(len([i for i in items if i["k"] == "result"]), 5)
@@ -243,6 +244,8 @@ class Pages(unittest.TestCase):
         dashboard.tl_add(jobboard.JOBS / cls.jid, "queued", "Queued")
         dashboard.tl_add(jobboard.JOBS / cls.jid, "finished", "Finished")
         s = socket.socket(); s.bind(("127.0.0.1", 0)); cls.port = s.getsockname()[1]; s.close()
+        cls.saved_port = jobboard.PORT
+        jobboard.PORT = cls.port            # guard() reads this at request time (as in test_jobweb_bench)
         cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", cls.port), jobboard.H)
         cls.thr = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.thr.start()
@@ -250,6 +253,7 @@ class Pages(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown(); cls.srv.server_close(); cls.thr.join(timeout=5)
+        jobboard.PORT = cls.saved_port
 
     def get(self, path, cookie=True, headers=None):
         import urllib.request, urllib.error
