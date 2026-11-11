@@ -3,13 +3,17 @@ r"""Upgrade 6a: vision checks - screenshot the app, ask the model whether it loo
 
 * Sizing    - PNG width read, the max-1280 px downscale (exact pixels), an undecodable PNG
               passed through with a note instead of a crash.
+* Limits    - the sandbox's answer is not trusted: how much of its stdout/stderr is read,
+              how big one screenshot may be, and that an absurd or lying PNG header stops
+              the decode before it can decompress anything big.
 * Verdicts  - the model server is a fake in-process http server with canned answers:
               both pass / both fail / garbage (after the retry) / a disagreeing pair / a
               server that refuses - and what the check result and its log say.
 * Capture   - the jail command is built and (for the Python driver) actually run: this
               sandbox has no Playwright, so it proves the driver answers cleanly and the
-              engine calls that "not sure" instead of failing the job. The envelope is
-              also fed by hand (two shots, garbage, no answer).
+              engine calls that "skipped" - advisory, never a failed job - instead of
+              blaming the app. The envelope is also fed by hand (two shots, garbage, no
+              answer).
 * Records   - AGENT_CHECKS.json -> frozen job record -> checks.Check keeps type + extras.
 * Pages     - the Checks card (verdict, issues, screenshot thumbnails), the review-bundle
               lines, the badge for an unsure check, and /api/shot through the real
@@ -159,6 +163,76 @@ class Sizing(unittest.TestCase):
         self.assertEqual(visioncheck._png_decode(out)[2], 1)
 
 
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+
+
+def png_header(w, h, ch=6, idat=b"", inter=0):
+    """A PNG with a chosen header and whatever IDAT bytes are asked for."""
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ch, 0, 0, inter))
+            + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
+
+
+# ------------------------------------------------------------------ what may be read back
+
+class Limits(unittest.TestCase):
+    """# U06a review: the screenshot comes out of the sandbox, so it is not trusted. Every
+    read has a limit, and going over it is a note, never a crash or a huge allocation."""
+
+    def test_the_sandbox_output_is_read_with_a_limit(self):
+        saved = visioncheck.MAX_OUT
+        try:
+            visioncheck.MAX_OUT = 1000
+            code, out, err = visioncheck.default_run(
+                [sys.executable, "-c", "import sys;"
+                                       "sys.stdout.write('a' * 300000);sys.stderr.write('b' * 300000)"],
+                "/tmp", 60)
+        finally:
+            visioncheck.MAX_OUT = saved
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out), 1000)
+        self.assertLessEqual(len(err), 1200)              # the cap plus the note
+        self.assertIn(b"the rest was dropped", err)
+
+    def test_a_normal_run_of_the_driver_is_read_as_before(self):
+        code, out, err = visioncheck.default_run([sys.executable, "-c", "print('hello')"], "/tmp", 30)
+        self.assertEqual((code, out.strip(), err), (0, b"hello", b""))
+
+    def test_an_absurd_picture_size_is_refused(self):
+        """60000x60000 is not a screenshot; the header alone says stop."""
+        bomb = png_header(60000, 60000, idat=zlib.compress(b"\x00" * 100))
+        self.assertEqual(visioncheck.png_size(bomb), (60000, 60000))
+        self.assertIsNone(visioncheck._png_decode(bomb))
+        out, note = visioncheck.fit_width(bomb)
+        self.assertIs(out, bomb)                          # passed through, not resized
+        self.assertIn("could not be resized", note)
+
+    def test_a_png_that_lies_about_its_size_stops_at_the_limit(self):
+        """Small file, honest-looking 100x100 header, IDAT that really expands to far more
+        than the header implies: the capped inflate gives up instead of decompressing it."""
+        saved = visioncheck.MAX_RAW
+        try:
+            visioncheck.MAX_RAW = 1000000
+            bomb = png_header(100, 100, idat=zlib.compress(b"\x00" * (40 * 1024 * 1024)))
+            self.assertLess(len(bomb), 200000)
+            self.assertIsNone(visioncheck._png_decode(bomb))
+            self.assertIsNone(visioncheck._inflate(zlib.compress(b"A" * 5000000), 100000))
+            self.assertEqual(visioncheck._inflate(zlib.compress(b"A" * 500), 100000), b"A" * 500)
+        finally:
+            visioncheck.MAX_RAW = saved
+
+    def test_undecodable_or_truncated_pixel_data_is_still_just_a_note(self):
+        broken = png_header(300, 200, idat=b"this is not deflate data")
+        self.assertIsNone(visioncheck._png_decode(broken))
+        truncated = png_header(300, 200, idat=zlib.compress(b"\x00" * 50))
+        self.assertIsNone(visioncheck._png_decode(truncated))
+
+    def test_the_limits_are_the_ones_the_review_asked_for(self):
+        self.assertEqual(visioncheck.MAX_OUT, 10 * 1024 * 1024)
+        self.assertEqual(visioncheck.MAX_PNG, 10 * 1024 * 1024)
+        self.assertTrue(visioncheck.MAX_PIXELS >= 1280 * 4096)     # the biggest viewport asked for
+
+
 # ------------------------------------------------------------------ the model's verdict
 
 class Verdicts(unittest.TestCase):
@@ -306,12 +380,82 @@ class Capture(unittest.TestCase):
         self.assertIn("no Playwright and no Chromium", cap["error"])
         self.assertIn("not a problem with the code", cap["error"])
 
-    def test_no_browser_check_is_not_sure_and_says_why(self):
+    def test_no_browser_check_is_a_skip_and_says_why(self):
+        """# U06a review: no Playwright / no Chromium in the sandbox image is not a verdict
+        about the app ("not sure" was wrong, and a required check used to fail the job)."""
         t = Path(tempfile.mkdtemp(prefix="u06a-"))
         res = visioncheck.run_check(t, vcheck(), t / "out",
                                     capture_fn=lambda pr, sp: {"shots": [], "error": visioncheck.NO_BROWSER})
-        self.assertEqual(res["verdict"], "inconclusive")
-        self.assertIn("playwright install chromium", res["issues"][0])
+        self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
+        self.assertEqual(res["issues"][0], visioncheck.NO_BROWSER_MSG)
+        self.assertIn("playwright install chromium", res["issues"][1])
+        self.assertIn("playwright install chromium", Path(res["output_file"]).read_text())
+
+    def test_a_required_vision_check_is_never_failed_by_a_missing_browser(self):
+        t = Path(tempfile.mkdtemp(prefix="u06a-"))
+        summ = ck.run_all(t, t / "out", checks=[vcheck(name="the screen", mode="required")],
+                          extra_runners=visioncheck.runners(
+                              capture_fn=lambda pr, sp: {"shots": [], "no_browser": True,
+                                                         "error": "Playwright for Python is not "
+                                                                 "installed in the sandbox image"}))
+        self.assertEqual(summ["status"], "unverified")            # never "failed"
+        self.assertEqual(summ["results"][0]["verdict"], "skipped")
+        self.assertEqual(ck.banner_text(summ)[0], "yellow")
+
+    def test_a_real_run_with_no_browser_in_the_image_skips(self):
+        """Nothing Playwright-shaped is installed in this sandbox, so this is the honest
+        end to end: the board's own runner, the real command, the honest answer."""
+        t = Path(tempfile.mkdtemp(prefix="u06a-"))
+        res = visioncheck.run_check(t, vcheck(name="the screen", mode="required"), t / "out")
+        self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
+        self.assertEqual(res["issues"][0],
+                         "Playwright isn't installed in the sandbox image; vision check skipped")
+        self.assertEqual(res["word"], "no browser")
+        self.assertEqual(badges.badges({"verify": {"rounds": [{"round": 0, "summary": {
+            "status": "unverified", "results": [res]}}]}}, "j1")[0]["text"], "the screen (no browser)")
+
+    def test_capture_marks_a_missing_browser_as_such(self):
+        cap = visioncheck.capture(Path(tempfile.mkdtemp(prefix="u06a-")), {})
+        self.assertTrue(cap["no_browser"])
+        obj = {"shots": [], "url": "", "error": "Playwright for Node is not installed in the "
+                                                "sandbox image", "no_browser": True}
+        cap = visioncheck.capture("/p", {}, kind="node",
+                                  run=lambda a, c, t: (0, b"VISIONSHOT_JSON " + base64.b64encode(
+                                      json.dumps(obj).encode()), b""))
+        self.assertTrue(cap["no_browser"])
+        self.assertIn("not installed", cap["error"])
+        # a page that would not open is still just "not sure"
+        self.assertFalse(visioncheck.capture("/p", {}, kind="node", run=lambda a, c, t: (
+            0, b"VISIONSHOT_JSON " + base64.b64encode(json.dumps(
+                {"shots": [], "error": "the page did not open"}).encode()), b""))["no_browser"])
+
+    def test_a_shot_bigger_than_the_limit_is_left_out_by_capture(self):
+        saved = visioncheck.MAX_PNG
+        try:
+            visioncheck.MAX_PNG = 500
+            obj = {"shots": [{"name": "big", "b64": base64.b64encode(b"z" * 5000).decode()},
+                             {"name": "ok", "b64": base64.b64encode(b"png!").decode()}], "url": "u"}
+            cap = visioncheck.capture("/p", {}, kind="node", run=lambda a, c, t: (
+                0, b"VISIONSHOT_JSON " + base64.b64encode(json.dumps(obj).encode()), b""))
+        finally:
+            visioncheck.MAX_PNG = saved
+        self.assertEqual([s[0] for s in cap["shots"]], ["ok"])
+        self.assertIn("screenshot big", " ".join(cap["notes"]))
+        self.assertIn("left out", " ".join(cap["notes"]))
+
+    def test_a_shot_bigger_than_the_limit_is_left_out_by_the_check(self):
+        saved, small = visioncheck.MAX_PNG, small_png()
+        try:
+            visioncheck.MAX_PNG = len(small) + 100
+            t = Path(tempfile.mkdtemp(prefix="u06a-"))
+            res = visioncheck.run_check(t, vcheck(), t / "out",
+                                        capture_fn=capture_shots(("big", b"z" * (len(small) + 5000)),
+                                                                 ("final", small)),
+                                        call=lambda body: '{"pass": true}')
+        finally:
+            visioncheck.MAX_PNG = saved
+        self.assertEqual([Path(p).name for p in res["screenshots"]], ["vision-looks_right-2-final.png"])
+        self.assertIn("more than", Path(res["output_file"]).read_text())
 
     def test_spec_and_steps_are_bounded(self):
         spec = visioncheck.spec_for(vcheck(size=[5000, 9000], open="x" * 400,
@@ -327,7 +471,11 @@ class Capture(unittest.TestCase):
     def test_drivers_are_valid(self):
         compile((WEB / "visionshot.py").read_text(), "visionshot.py", "exec")
         src = (WEB / "visionshot.mjs").read_text()
-        self.assertIn("from \"playwright\"", src)
+        # U06a review: the import is dynamic so a sandbox image without Playwright answers
+        # with "no browser" instead of dying before it can say anything.
+        self.assertIn('await import("playwright")', src)
+        self.assertIn("no_browser", src)
+        self.assertIn("no_browser", (WEB / "visionshot.py").read_text())
         if shutil.which("node"):
             t = Path(tempfile.mkdtemp(prefix="u06a-")) / "driver.mjs"
             t.write_text(src)

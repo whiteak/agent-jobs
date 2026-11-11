@@ -34,6 +34,7 @@ import os
 import re
 import struct
 import subprocess
+import threading
 import time
 import urllib.request
 import zlib
@@ -46,6 +47,12 @@ import badges
 WEB = Path(__file__).resolve().parent
 MAX_WIDTH = 1280                    # the model gets at most this many pixels across
 DEFAULT_SIZE = (1280, 800)
+# U06a review: what comes back out of the sandbox is not trusted. Every read is bounded, so
+# a driver that goes wrong (or a project that makes one) cannot eat the board's memory.
+MAX_OUT = 10 * 1024 * 1024          # stdout/stderr read from the sandbox run, per stream
+MAX_PNG = 10 * 1024 * 1024          # one screenshot, as it comes back
+MAX_PIXELS = 8_000_000              # width x height of a screenshot we are willing to decode
+MAX_RAW = 48 * 1024 * 1024          # its pixels once the PNG filters are undone
 MODEL_URL = os.environ.get("JOBBOARD_MODEL_URL") or "http://127.0.0.1:8080/v1/chat/completions"
 STEP_KEYS = ("click", "type", "fill", "key", "wait", "wait_for", "shot")
 STEP_ARGS = ("text",)                         # {"type": "#name", "text": "hello"}
@@ -59,6 +66,20 @@ NO_BROWSER = ("Screenshots need a browser: this machine has no Playwright and no
               "Ask Jason to add one to the sandbox image "
               "(python3 -m playwright install chromium). This is not a problem with the code - "
               "do not try to install anything.")
+# U06a review: no browser in the sandbox image is a skip, not a verdict about the app, and it
+# is never allowed to fail a job - the message says what is missing and what happens next.
+NO_BROWSER_MSG = "Playwright isn't installed in the sandbox image; vision check skipped"
+NO_BROWSER_MARKS = ("no playwright", "no chromium", "playwright is not installed",
+                    "playwright isn't installed", "playwright for python is not installed",
+                    "playwright for node is not installed", "playwright install chromium",
+                    "browser is not", "executable doesn't exist")
+
+
+def no_browser_missing(why) -> bool:
+    """Does this capture error mean "there is no Playwright/Chromium in the sandbox image"
+    rather than "this page would not open"? Only the first one is a skip."""
+    text = str(why or "").lower()
+    return any(mark in text for mark in NO_BROWSER_MARKS)
 
 
 def tail(text, n=800):
@@ -92,6 +113,25 @@ def _chunks(png: bytes):
 _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}          # PNG colour type -> bytes per pixel
 
 
+def _inflate(idat: bytes, limit: int):
+    """The pixel stream of a PNG, at most `limit` bytes of it. zlib.decompress with no
+    limit is how a 10 KB file turns into gigabytes, so this decompresses in steps and
+    gives up as soon as it is past the limit (# U06a review)."""
+    try:
+        d = zlib.decompressobj()
+        out, todo = bytearray(), idat
+        while todo:
+            out += d.decompress(todo, max(1, limit + 1 - len(out)))
+            if len(out) > limit:
+                return None
+            todo = d.unconsumed_tail
+            if d.eof:
+                break
+        return bytes(out)
+    except zlib.error:
+        return None
+
+
 def _png_decode(png: bytes):
     """(w, h, bytes_per_pixel, rows) with the PNG filters undone, or None. Only plain
     8-bit non-interlaced PNGs - which is exactly what Playwright writes."""
@@ -101,6 +141,8 @@ def _png_decode(png: bytes):
             ihdr = data
         elif typ == b"IDAT":
             idat += data
+            if len(idat) > MAX_PNG:            # more than one screenshot's worth already
+                return None
         elif typ == b"IEND":
             break
     if not ihdr or not idat:
@@ -112,10 +154,13 @@ def _png_decode(png: bytes):
     if depth != 8 or ctype not in _CHANNELS or inter != 0 or w <= 0 or h <= 0:
         return None
     ch = _CHANNELS[ctype]
+    if w * h > MAX_PIXELS:                     # an absurd size claimed by the header
+        return None
     stride = w * ch
-    try:
-        raw = zlib.decompress(idat)
-    except zlib.error:
+    if h * (stride + 1) > MAX_RAW:             # ... or one that would take too many bytes
+        return None
+    raw = _inflate(idat, MAX_RAW)
+    if raw is None:
         return None
     rows, prev, i = [], bytearray(stride), 0
     for _ in range(h):
@@ -336,15 +381,54 @@ def capture_command(kind: str, spec: dict) -> str:
     return "VISION_SPEC_B64=%s %s <<'%s'\n%s\n%s\n" % (b64, interp, DRIVER_EOF, driver_source(kind), DRIVER_EOF)
 
 
+def _read_cap(fh, limit: int):
+    """At most `limit` bytes of a stream kept in memory - the rest is read and thrown away
+    so the program can still finish - plus whether there was more than the limit."""
+    keep, total, over = bytearray(), 0, False
+    while True:
+        part = fh.read(1 << 16)
+        if not part:
+            break
+        if total < limit:
+            keep += part[:limit - total]
+        else:
+            over = True
+        total += len(part)
+    return bytes(keep), over
+
+
 def default_run(argv, cwd, timeout):
-    """(exit code, stdout, stderr)."""
+    """(exit code, stdout, stderr). U06a review: what the sandbox prints is not trusted, so
+    neither stream is read past MAX_OUT; the note says the rest was dropped."""
     try:
-        p = subprocess.run(argv, cwd=str(cwd), capture_output=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as ex:
-        return 124, ex.stdout or b"", b"[stopped: the screenshot took too long]\n" + (ex.stderr or b"")
+        p = subprocess.Popen(list(argv), cwd=str(cwd), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
     except OSError as ex:
         return 127, b"", str(ex).encode()
+    got = {}
+
+    def drain(key, fh):
+        got[key] = _read_cap(fh, MAX_OUT)
+
+    readers = [threading.Thread(target=drain, args=(k, fh), daemon=True)
+               for k, fh in (("out", p.stdout), ("err", p.stderr))]
+    for t in readers:
+        t.start()
+    note = b""
+    try:
+        rc = p.wait(timeout=max(1, timeout))
+    except subprocess.TimeoutExpired:
+        p.kill()
+        rc = 124
+        note = b"[stopped: the screenshot took too long]\n"
+    for t in readers:
+        t.join(30)
+    out, over_out = got.get("out", (b"", False))
+    err, over_err = got.get("err", (b"", False))
+    if over_out or over_err:
+        note += (b"\n[the sandbox sent more than %d MB: the rest was dropped]\n"
+                 % (MAX_OUT // (1024 * 1024)))
+    return rc, out, note + err
 
 
 def parse_envelope(stdout: bytes):
@@ -364,27 +448,37 @@ def parse_envelope(stdout: bytes):
 def capture(project, spec: dict, wrap: Callable = None, kind: str = "",
             run: Callable = default_run, timeout: int = 600) -> dict:
     """Screenshots of the project, taken through `wrap` (the jail). Returns
-    {shots: [(name, png)], url, steps, log, error} - never raises."""
+    {shots: [(name, png)], url, steps, log, error, notes} - never raises."""
     kind, why = backend(kind)
     if not kind:
-        return {"shots": [], "url": "", "steps": [], "log": "", "error": why}
+        return {"shots": [], "url": "", "steps": [], "log": "", "error": why,
+                "no_browser": True, "notes": []}
     argv = wrap(project, capture_command(kind, spec)) if wrap else ["bash", "-lc", capture_command(kind, spec)]
     rc, out, err = run(argv, project, timeout)
     err = (err or b"").decode("utf-8", "replace")
     env = parse_envelope(out)
     if env is None:
-        return {"shots": [], "url": "", "steps": [], "log": tail(err),
+        return {"shots": [], "url": "", "steps": [], "log": tail(err), "notes": [],
                 "error": "the screenshot program did not answer (exit %s)" % rc}
-    shots = []
+    shots, notes = [], []
     for s in env.get("shots") or []:
         if not isinstance(s, dict):
             continue
         try:
-            shots.append((str(s.get("name") or "shot")[:40], base64.b64decode(s.get("b64") or "")))
+            png = base64.b64decode(s.get("b64") or "")
         except (ValueError, TypeError):
             continue
+        if len(png) > MAX_PNG:            # one screenshot is not allowed to be huge
+            notes.append("screenshot %s is %.1f MB - more than %d MB, left out"
+                         % (str(s.get("name") or "shot")[:40], len(png) / 1048576.0,
+                            MAX_PNG // (1024 * 1024)))
+            continue
+        shots.append((str(s.get("name") or "shot")[:40], png))
+    why = str(env.get("error")) if env.get("error") else None
     return {"shots": shots, "url": str(env.get("url") or ""), "steps": env.get("steps") or [],
-            "log": tail(err), "error": str(env.get("error")) if env.get("error") else None}
+            "log": tail(err), "notes": notes,
+            "no_browser": bool(env.get("no_browser")) or (why is not None and no_browser_missing(why)),
+            "error": why}
 
 
 # ---------------------------------------------------------------- the check
@@ -430,16 +524,19 @@ def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str 
     shots, final_png = [], None
     asked = {}
 
-    def finish(verdict, cap=None):
+    def finish(verdict, cap=None, word: str = ""):
         res = vision.to_check_result(check.name, verdict, mode, screenshots=[p for _, p in shots])
         res.update({"cmd": ("vision: %s" % (extra.get("open") or ""))[:200],
                     "seconds": round(time.time() - t0, 1), "output_file": str(log_file),
                     "timed_out": False, "url": (cap or {}).get("url") or ""})
+        if word:
+            res["word"] = word                  # what the card/badge says for a skipped check
         if asked.get("n"):
             res["asked"] = asked["n"]
         log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if emit:
-            emit("checks", 'Screen check "%s": %s' % (check.name, WORD.get(verdict["verdict"], verdict["verdict"])),
+            emit("checks", 'Screen check "%s": %s' % (check.name,
+                                                      word or WORD.get(verdict["verdict"], verdict["verdict"])),
                  {"colour": COLOUR.get(verdict["verdict"], "yellow")})
         return res
 
@@ -458,7 +555,21 @@ def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str 
         lines += ["", "capture log:", cap["log"]]
     if cap.get("error"):
         lines.append("capture error: " + str(cap["error"]))
+    for note in cap.get("notes") or []:
+        lines.append("note: " + str(note))
+    if cap.get("no_browser") or no_browser_missing(cap.get("error")):
+        # U06a review: no Playwright / no Chromium in the sandbox image is nothing the agent
+        # can fix and nothing about the app, so it is a skip - advisory, never a failed job.
+        mode = "advisory"
+        why = str(cap.get("error") or "")
+        issues = [NO_BROWSER_MSG] + ([why] if why and why != NO_BROWSER_MSG else [])
+        lines += ["", "verdict: skipped", "issues:"] + ["- " + i for i in issues]
+        return finish({"verdict": "skipped", "issues": issues}, cap, word="no browser")
     for i, (sname, png) in enumerate(cap.get("shots") or []):
+        if len(png or b"") > MAX_PNG:                       # U06a: bounded, whatever sent it
+            lines.append("note: screenshot %d (%s) is more than %d MB - left out"
+                         % (i + 1, sname, MAX_PNG // (1024 * 1024)))
+            continue
         if png_size(png) is None:
             lines.append("note: screenshot %d (%s) is not a PNG - left out" % (i + 1, sname))
             continue

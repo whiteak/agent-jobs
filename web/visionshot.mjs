@@ -2,7 +2,6 @@
 // instead of Python Playwright. Same spec and same answer as visionshot.py: the board
 // pipes it in with a here-doc, passes the check spec in VISION_SPEC_B64 and reads the
 // PNGs back as one base64 JSON line on stdout, so nothing is written in the project.
-import { chromium } from "playwright";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -41,6 +40,20 @@ async function doStep(page, step, tout) {
 }
 
 const out = { shots: [], steps: [], url: "", error: null };
+
+// Playwright is in the image only if Jason put it there. Say that plainly - if the import
+// simply failed the board would only see "the screenshot program did not answer".
+let chromium = null;
+try {
+  ({ chromium } = await import("playwright"));
+} catch (ex) {
+  out.error = "Playwright for Node is not installed in the sandbox image " +
+              "(npm install playwright && npx playwright install chromium)";
+  out.no_browser = true;
+  emit(out);
+  process.exit(0);
+}
+
 let srv = null;
 try {
   const spec = JSON.parse(Buffer.from(process.env.VISION_SPEC_B64 || "", "base64").toString("utf8"));

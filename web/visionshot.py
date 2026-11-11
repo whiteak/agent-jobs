@@ -92,6 +92,7 @@ def main():
     except ImportError:
         out["error"] = ("Playwright for Python is not installed in the sandbox image "
                         "(pip install playwright + playwright install chromium)")
+        out["no_browser"] = True
         emit(out)
         return 0
 
