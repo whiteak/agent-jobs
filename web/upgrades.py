@@ -709,8 +709,9 @@ def _vision_row(i, r, jid, src):
         detail += " &middot; " + esc(r["url"])[:80]
     if r.get("device"):                                       # U06b: a check on a phone
         detail += " &middot; on " + esc(str(r["device"]))[:40]
+    word = str(r.get("word") or "") or visioncheck.WORD.get(v, v)   # a skip says what was missing
     rows = (f'<tr><td class="{cls}">{mark} {esc(r.get("name"))}</td><td class="hint">{detail}</td>'
-            f'<td class="{cls}">{esc(androidcheck.short_result(r) if r.get("crash") else visioncheck.WORD.get(v, v))}</td>'
+            f'<td class="{cls}">{esc(androidcheck.short_result(r) if r.get("crash") else word)}</td>'
             f'<td>{esc(r.get("seconds"))} s</td></tr>')
     shots = [str(s) for s in (r.get("screenshots") or []) if str(s)]
     if shots:

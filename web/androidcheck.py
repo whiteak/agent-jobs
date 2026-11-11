@@ -3,23 +3,30 @@
 
 Two kinds of check, both written in the project's AGENT_CHECKS.json:
 
-  {"name": "app runs", "type": "android-smoke", "mode": "required"}
+  {"name": "app runs", "type": "android-smoke", "mode": "required", "install": true,
+   "device": "emulator-5554"}
 
   * installs app/build/outputs/apk/debug/*.apk (or the "apk" path from the check), starts
     the launcher activity and requires the app to still be running after 10 s. No model.
-    This is what an Android project gets by default when it has no AGENT_CHECKS.json.
+    An Android project gets an "app runs" check by default when it has no AGENT_CHECKS.json,
+    but without "install" it is skipped (see "putting anything on a phone is opt-in" below).
 
   {"name": "looks right", "type": "vision", "target": "android",
    "spec": "a list of notes and a + button bottom right",
    "steps": [{"tap": [360, 1900]}, {"text": "buy milk"}, {"key": "KEYCODE_ENTER"}],
-   "device": "emulator-5554", "mode": "advisory"}
+   "device": "emulator-5554", "install": true, "mode": "advisory"}
 
   * installs and starts the app, waits until the screen stops changing (two screenshots 1 s
     apart that match, at most 20 s), takes `adb exec-out screencap -p`, runs the optional
     steps with a screenshot after each, then asks the model the same two questions as 6a.
 
-`device` is optional: the first connected device is used, or the serial in the board's
-settings ("android_device"). A `{{ANDROID_DEVICE}}` nobody filled in counts as unset.
+`device` is the serial to work on: the check's own, else the serial in the board's settings
+("android_device"). A `{{ANDROID_DEVICE}}` nobody filled in counts as unset.
+
+Putting anything on a phone is opt-in (# U06b review): an APK is only installed when the
+check says `"install": true` AND names a device serial. A check that does not is reported
+as "skipped" with a message saying exactly how to turn it on, so an Android project with no
+AGENT_CHECKS.json cannot put an app on a connected phone by itself.
 
 No device (or no adb) is never the app's fault: the check is reported as "skipped" and
 forced to advisory, so it cannot fail a job. Everything else - no APK, an install that
@@ -47,12 +54,20 @@ DEVICE_MAX = 80
 STEP_MAX = 40
 STEP_KEYS = ("tap", "swipe", "text", "key", "keyevent", "wait")
 ENTRY_KEYS = {"name", "cmd", "timeout_s", "type", "target", "apk", "pkg", "device", "steps",
-              "spec", "mode", "votes", "hold_s"}
+              "spec", "mode", "votes", "hold_s", "install"}
 ENTRY_MAX = 12000
 CRASH_ISSUES = 8                        # crash lines shown as problems in the card/bundle/prompt
 WORD = {"pass": "the app ran", "fail": "the app did not run", "skipped": "no device"}
 COLOUR = {"pass": "green", "fail": "red", "skipped": "yellow"}
 NO_RUNNER = "No Android check runner is set up for this job."
+NO_INSTALL = ('Nothing was put on a device: an Android check only installs when it says '
+              '"install": true and names a device ("device": "emulator-5554" in the check, '
+              'or the android_device setting). This is not a problem with the code.')
+NO_SERIAL = ('The check says "install": true but names no device, so nothing was put on a '
+             'phone: put "device": "emulator-5554" in the check or choose the phone in the '
+             "board's settings (android_device). This is not a problem with the code.")
+NOT_ON = "android: install not asked for"          # the record's "cmd" for a not-opt-in check
+OPT_IN_WHY = "installing on a phone is opt-in"     # the timeline line for the same thing
 
 
 # ---------------------------------------------------------------- the check entry
@@ -91,6 +106,8 @@ def check_ok(entry) -> bool:
         return False
     if entry.get("mode", "required" if kind == "android-smoke" else "advisory") not in ("advisory", "required"):
         return False
+    if not isinstance(entry.get("install", False), bool):
+        return False                    # U06b: installing on a phone is opt-in, "true" as text is not yes
     hold = entry.get("hold_s", 10)
     if not (isinstance(hold, int) and not isinstance(hold, bool) and 1 <= hold <= 120):
         return False
@@ -127,7 +144,8 @@ def frozen(check) -> Optional[dict]:
     """An Android checks.Check -> the dict frozen into the job record, or None."""
     extra = check.extra or {}
     entry = {"name": str(check.name)[:80], "type": check.type, "timeout_s": int(check.timeout_s)}
-    for k in ("target", "apk", "pkg", "device", "steps", "spec", "mode", "votes", "hold_s"):
+    for k in ("target", "apk", "pkg", "device", "steps", "spec", "mode", "votes", "hold_s",
+              "install"):
         if k in extra:
             entry[k] = extra[k]
     if check.type == "vision":
@@ -161,6 +179,8 @@ def short_result(r) -> str:
                              ("No device", "no device"), ("No adb", "no adb"),
                              ("This machine has no adb", "no adb"),
                              ("Device ", "no device"),
+                             ("Nothing was put on a device", "install not asked for"),
+                             ("The check says \"install\"", "no device named"),
                              ("Ran out of time", "ran out of time")):
             if text.startswith(start):
                 return words
@@ -178,21 +198,35 @@ def device_want(check, cfg) -> str:
     return want[:DEVICE_MAX]
 
 
+def install_opt_in(check, cfg) -> tuple:
+    """(ok, why not). # U06b review: putting an APK on a phone is Jason's choice, never the
+    project's - it happens only when the check says "install": true AND names a device
+    serial (its own "device" or the android_device setting). The "app runs" check a project
+    gets when it has no AGENT_CHECKS.json does neither, so it installs nothing."""
+    if not bool((check.extra or {}).get("install")):
+        return False, NO_INSTALL
+    if not device_want(check, cfg):
+        return False, NO_SERIAL
+    return True, ""
+
+
 # ---------------------------------------------------------------- the result bits
 
 def _log_file(out_dir, check) -> Path:
     return Path(out_dir) / ("check-%s.log" % re.sub(r"[^A-Za-z0-9_.-]+", "_", check.name))
 
 
-def _skipped(check, out_dir, emit, why, t0, kind: str = "android") -> dict:
-    """No adb / no device: say so plainly, and never fail the job over it."""
+def _skipped(check, out_dir, emit, why, t0, kind: str = "android",
+             cmd: str = "android: no device", what: str = "no device to check on") -> dict:
+    """No adb / no device / not asked to install: say so plainly, and never fail the job."""
     log = _log_file(out_dir, check)
     log.write_text("%s check: %s\n\n%s\n" % (kind, check.name, why), encoding="utf-8")
     res = vision.to_check_result(check.name, {"verdict": "skipped", "issues": [why]}, "advisory")
-    res.update({"cmd": "android: no device", "seconds": round(time.time() - t0, 1),
-                "output_file": str(log), "timed_out": False, "url": "", "verdict": "skipped"})
+    res.update({"cmd": cmd, "seconds": round(time.time() - t0, 1),
+                "output_file": str(log), "timed_out": False, "url": "", "verdict": "skipped",
+                "word": short_result(res)})          # the card/badge says why, not just "no device"
     if emit:
-        emit("checks", "%s check \"%s\": no device to check on" % (kind.title(), check.name),
+        emit("checks", "%s check \"%s\": %s" % (kind.title(), check.name, what),
              {"colour": "yellow"})
     return res
 
@@ -223,6 +257,10 @@ def run_check(project, check, out_dir, *, emit: Callable = None, cfg: dict = Non
     deadline = t0 + budget
     adb_path = android.find_adb(str((cfg or {}).get("android_adb") or "")) if adb_path is None else adb_path
     holder = {}
+
+    go, why = install_opt_in(check, cfg)
+    if not go:
+        return _skipped(check, out_dir, emit, why, t0, cmd=NOT_ON, what=OPT_IN_WHY)
 
     dev, why = android.pick_device(android.Adb("", adb_path, deadline=deadline), device_want(check, cfg))
     if not dev:
@@ -264,6 +302,10 @@ def run_smoke(project, check, out_dir, *, emit: Callable = None, cfg: dict = Non
     deadline = t0 + budget
     log = _log_file(out_dir, check)
     adb_path = android.find_adb(str((cfg or {}).get("android_adb") or "")) if adb_path is None else adb_path
+
+    go, why = install_opt_in(check, cfg)
+    if not go:
+        return _skipped(check, out_dir, emit, why, t0, kind="device", cmd=NOT_ON, what=OPT_IN_WHY)
 
     dev, why = android.pick_device(android.Adb("", adb_path, deadline=deadline), device_want(check, cfg))
     if not dev:

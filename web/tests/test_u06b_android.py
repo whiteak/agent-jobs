@@ -13,9 +13,14 @@ emulator, no model server (that part is an in-process fake, as in 6a).
               and with logcat when the device has no pidof, install/start failures, the APK
               search (inside the project folder only), which package the APK installed, the
               device steps and their validation, and the device choice.
+* Safety    - `adb shell` runs its words through the PHONE's shell, so a text step (or any
+              other value) that holds a metacharacter is refused and never sent; a package
+              name the device reports is only used when it really is one.
 * Checks    - android-smoke (pass / crash / no device), the Android screen check (model
               verdict, a crash is a fail rather than "not sure"), the no-device case never
-              failing a job, the time budget, and the runner dispatch.
+              failing a job, the install opt-in (nothing at all is sent to a device unless
+              the check says "install": true and names a serial), the time budget, and the
+              runner dispatch.
 * Records   - what a valid entry looks like, the frozen job record, and the default checks
               an Android project gets.
 * Pages     - the Checks card row, the badge, the review bundle, the fix prompt.
@@ -319,10 +324,13 @@ class Engine(DeviceCase):
 
 class Smoke(DeviceCase):
     CHECK = ck.Check("app runs", "", type="android-smoke", extra={"mode": "required"})
+    # U06b: putting an app on a phone is opt-in, so the checks here that do install say so
+    OPT_IN = ck.Check("app runs", "", type="android-smoke",
+                      extra={"mode": "required", "install": True, "device": "emulator-5554"})
 
     def run_one(self, check=None, **sc):
         self.scenario(**sc)
-        return androidcheck.run_smoke(self.project(), check or self.CHECK, self.tmp / "out",
+        return androidcheck.run_smoke(self.project(), check or self.OPT_IN, self.tmp / "out",
                                       cfg={}, adb_path=str(FAKE_ADB))
 
     def test_the_app_starts_and_stays_up(self):
@@ -350,14 +358,68 @@ class Smoke(DeviceCase):
     def test_no_device_is_skipped_and_never_fails_the_job(self):
         res = self.run_one(devices=[])
         self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
-        self.assertEqual(res["issues"], [ad.NO_DEVICE])
+        self.assertIn("emulator-5554 is not connected", res["issues"][0])
         self.assertEqual(ck.summarize([res], "file")["status"], "unverified")
         self.assertEqual(ck.banner_text(ck.summarize([res], "file"))[0], "yellow")
-        self.assertIn(ad.NO_DEVICE, Path(res["output_file"]).read_text())
+        self.assertIn("is not connected", Path(res["output_file"]).read_text())
+
+    def test_nothing_is_installed_unless_the_check_asks_for_it(self):
+        """# U06b review: an Android check puts an APK on a phone only when it says
+        "install": true AND names a device. The "app runs" check a project gets by default
+        does neither, so it is skipped with the way to turn it on - and the plugged-in phone
+        is never touched."""
+        res = self.run_one(self.CHECK, devices=["emulator-5554"])
+        self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
+        self.assertEqual(res["issues"], [androidcheck.NO_INSTALL])
+        self.assertEqual(self.calls(), [])            # not even `adb devices` was asked
+        self.assertEqual(androidcheck.short_result(res), "install not asked for")
+        self.assertEqual(ck.summarize([res], "file")["status"], "unverified")
+        log = Path(res["output_file"]).read_text()
+        self.assertIn('"install": true', log)
+        self.assertIn("android_device", log)
+
+    def test_install_true_without_a_named_device_installs_nothing_either(self):
+        self.scenario(devices=["emulator-5554"])
+        res = androidcheck.run_smoke(self.project(),
+                                     ck.Check("app runs", "", type="android-smoke",
+                                              extra={"mode": "required", "install": True}),
+                                     self.tmp / "out", cfg={}, adb_path=str(FAKE_ADB))
+        self.assertEqual((res["verdict"], res["mode"]), ("skipped", "advisory"))
+        self.assertEqual(res["issues"], [androidcheck.NO_SERIAL])
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(androidcheck.short_result(res), "no device named")
+
+    def test_the_default_app_runs_check_never_installs_by_itself(self):
+        """A project with no AGENT_CHECKS.json, the checks the board detects for it, the
+        board's own runner, and a phone plugged in and named in the settings."""
+        proj = self.tmp / "androidproj"
+        proj.mkdir(parents=True, exist_ok=True)
+        (proj / "gradlew").write_text("#!/bin/sh")
+        (proj / "app/src/main/AndroidManifest.xml").parent.mkdir(parents=True)
+        (proj / "app/src/main/AndroidManifest.xml").write_text("<manifest/>")
+        smoke = [c for c in ck.detect_checks(proj) if c.type == "android-smoke"]
+        self.assertEqual(len(smoke), 1)
+        self.assertFalse(smoke[0].extra.get("install"))
+        self.scenario(devices=["emulator-5554"], installed=["com.example.app"])
+        runners = androidcheck.runners(cfg={"android_device": "emulator-5554"}, adb_path=str(FAKE_ADB))
+        res = runners["android-smoke"](proj, smoke[0], self.tmp / "out")
+        self.assertEqual((res["verdict"], res["mode"]), ("skipped", "advisory"))
+        self.assertEqual(res["issues"], [androidcheck.NO_INSTALL])
+        self.assertEqual(self.calls(), [])
+
+    def test_an_opted_in_check_named_only_in_the_settings_is_allowed(self):
+        self.scenario(devices=["phone-9"], installed=["com.example.app"])
+        res = androidcheck.run_smoke(self.project(),
+                                     ck.Check("app runs", "", type="android-smoke",
+                                              extra={"mode": "required", "install": True}),
+                                     self.tmp / "out", cfg={"android_device": "phone-9"},
+                                     adb_path=str(FAKE_ADB))
+        self.assertEqual((res["verdict"], res["device"]), ("pass", "phone-9"))
+        self.assertIn("install -r", self.device_saw())
 
     def test_no_adb_at_all_is_also_just_a_message(self):
         self.scenario()
-        res = androidcheck.run_smoke(self.project(), self.CHECK, self.tmp / "out", cfg={}, adb_path="")
+        res = androidcheck.run_smoke(self.project(), self.OPT_IN, self.tmp / "out", cfg={}, adb_path="")
         self.assertEqual(res["verdict"], "skipped")
         self.assertIn("no adb", res["issues"][0].lower())
         self.assertEqual(androidcheck.short_result(res), "no adb")
@@ -366,7 +428,8 @@ class Smoke(DeviceCase):
         self.scenario(devices=["emulator-5554", "phone-7"], installed=["com.example.app"])
         res = androidcheck.run_smoke(self.project(),
                                      ck.Check("app runs", "", type="android-smoke",
-                                              extra={"mode": "required", "device": "phone-7"}),
+                                              extra={"mode": "required", "device": "phone-7",
+                                                     "install": True}),
                                      self.tmp / "out", cfg={"android_device": "phone-7"},
                                      adb_path=str(FAKE_ADB))
         self.assertEqual((res["verdict"], res["device"]), ("pass", "phone-7"))
@@ -375,7 +438,8 @@ class Smoke(DeviceCase):
         self.scenario(devices=["d"], installed=["com.example.app"])
         res = androidcheck.run_smoke(self.project(),
                                      ck.Check("app runs", "", type="android-smoke",
-                                              extra={"mode": "required", "hold_s": 1}),
+                                              extra={"mode": "required", "hold_s": 1,
+                                                     "device": "d", "install": True}),
                                      self.tmp / "out", cfg={}, adb_path=str(FAKE_ADB))
         self.assertEqual(res["verdict"], "pass")
         self.assertIn("shell pidof com.example.app", self.device_saw())
@@ -436,8 +500,10 @@ class ScreenCheck(DeviceCase):
         self.scenario(**sc)
         fake = FakeModel(answers)
         try:
-            res = androidcheck.run_check(self.project(apk=apk), check or vcheck(), self.tmp / "out",
-                                         cfg={}, adb_path=str(FAKE_ADB), model_url=fake.url)
+            res = androidcheck.run_check(self.project(apk=apk),
+                                         check or vcheck(install=True, device="emulator-5554"),
+                                         self.tmp / "out", cfg={}, adb_path=str(FAKE_ADB),
+                                         model_url=fake.url)
         finally:
             fake.stop()
         return res, fake
@@ -473,21 +539,35 @@ class ScreenCheck(DeviceCase):
 
     def test_no_device_is_skipped_and_advisory_even_when_required(self):
         self.scenario(devices=[])
-        res = androidcheck.run_check(self.project(), vcheck(mode="required"), self.tmp / "out",
-                                     cfg={}, adb_path=str(FAKE_ADB))
+        res = androidcheck.run_check(self.project(),
+                                     vcheck(mode="required", install=True, device="emulator-5554"),
+                                     self.tmp / "out", cfg={}, adb_path=str(FAKE_ADB))
         self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
-        self.assertEqual(res["issues"], [ad.NO_DEVICE])
+        self.assertIn("emulator-5554 is not connected", res["issues"][0])
         self.assertEqual(visioncheck.WORD[res["verdict"]], "no device")
+
+    def test_the_screen_check_installs_nothing_unless_the_check_asks(self):
+        """# U06b review: the same rule for a screen check on a phone - no "install": true
+        and no named device means the device is never touched at all."""
+        self.scenario(devices=["emulator-5554"], installed=["com.example.app"])
+        res = androidcheck.run_check(self.project(), vcheck(), self.tmp / "out", cfg={},
+                                     adb_path=str(FAKE_ADB), call=lambda body: '{"pass": true}')
+        self.assertEqual((res["verdict"], res["mode"], res["ok"]), ("skipped", "advisory", False))
+        self.assertEqual(res["issues"], [androidcheck.NO_INSTALL])
+        self.assertEqual(self.calls(), [])
+        self.assertIn('"install": true', Path(res["output_file"]).read_text())
 
     def test_the_steps_and_the_time_budget_reach_the_device(self):
         self.scenario(devices=["d"], installed=["com.example.app"], frames=["a", "a", "b", "b"])
-        res = androidcheck.run_check(self.project(), vcheck(steps=[{"tap": [5, 6]}]),
+        res = androidcheck.run_check(self.project(), vcheck(steps=[{"tap": [5, 6]}], install=True,
+                                                           device="d"),
                                      self.tmp / "out", cfg={}, adb_path=str(FAKE_ADB),
                                      call=lambda body: '{"pass": true}', budget=60)
         self.assertIn("shell input tap 5 6", self.device_saw())
         self.assertEqual(res["verdict"], "pass")
         # an Android check that runs out of time says so instead of hanging the gate
-        res = androidcheck.run_check(self.project(), vcheck(), self.tmp / "out2", cfg={},
+        res = androidcheck.run_check(self.project(), vcheck(install=True, device="d"),
+                                     self.tmp / "out2", cfg={},
                                      adb_path=str(FAKE_ADB), call=lambda body: '{"pass": true}',
                                      budget=0)
         self.assertEqual(res["verdict"], "inconclusive")
@@ -502,9 +582,10 @@ class ScreenCheck(DeviceCase):
         out = self.tmp / "out"
         r_web = runners["vision"](self.project(), ck.Check("page", "", type="vision",
                                                            extra={"target": "web"}), out)
-        r_and = runners["vision"](self.project(), vcheck(), out)
+        r_and = runners["vision"](self.project(), vcheck(install=True, device="d"), out)
         r_smoke = runners["android-smoke"](self.project(),
-                                           ck.Check("app runs", "", type="android-smoke"), out)
+                                           ck.Check("app runs", "", type="android-smoke",
+                                                    extra={"install": True, "device": "d"}), out)
         self.assertEqual(seen, ["page"])
         self.assertEqual(r_web["type"], "vision")
         self.assertEqual(r_and["verdict"], "pass")
@@ -527,6 +608,7 @@ class Record(unittest.TestCase):
 
     def test_the_documented_shape_is_accepted(self):
         self.assertTrue(androidcheck.check_ok(dict(self.SMOKE)))
+        self.assertTrue(androidcheck.check_ok({**self.SMOKE, "install": True}))
         self.assertTrue(androidcheck.check_ok(dict(self.SCREEN)))
         self.assertTrue(androidcheck.check_ok({"name": "n", "type": "vision", "target": "android",
                                                "spec": "x"}))
@@ -534,6 +616,7 @@ class Record(unittest.TestCase):
     def test_junk_is_refused(self):
         for bad in ({**self.SMOKE, "mode": "must"}, {**self.SMOKE, "hold_s": 0},
                     {**self.SMOKE, "hold_s": 9999}, {**self.SMOKE, "colour": "red"},
+                    {**self.SMOKE, "install": "yes"},
                     {**self.SCREEN, "spec": ""}, {**self.SCREEN, "target": "web"},
                     {"name": "n", "type": "vision", "spec": "x"},
                     {**self.SCREEN, "apk": "/etc/passwd"}, {**self.SCREEN, "apk": "../x.apk"},
@@ -553,7 +636,7 @@ class Record(unittest.TestCase):
         t = Path(tempfile.mkdtemp(prefix="u06b-"))
         (t / "AGENT_CHECKS.json").write_text(json.dumps({"checks": [
             {"name": "tests", "cmd": "make test"},
-            dict(self.SMOKE), dict(self.SCREEN, name="the screen")]}))
+            dict(self.SMOKE, install=True), dict(self.SCREEN, name="the screen")]}))
         m = {}
         upgrades.freeze_checks(m, t)
         self.assertEqual([c.get("type", "command") for c in m["checks"]],
@@ -564,6 +647,8 @@ class Record(unittest.TestCase):
         self.assertEqual(got["the screen"].extra["steps"], self.SCREEN["steps"])
         self.assertEqual(got["app runs"].type, "android-smoke")
         self.assertEqual(got["app runs"].extra["mode"], "required")
+        # U06b: "install" is part of the frozen record, so the opt-in cannot be lost
+        self.assertEqual(got["app runs"].extra["install"], True)
 
     def test_a_broken_android_entry_is_dropped(self):
         t = Path(tempfile.mkdtemp(prefix="u06b-"))
@@ -590,6 +675,7 @@ class Record(unittest.TestCase):
         self.assertEqual([c.type for c in checks], ["command", "command", "android-smoke"])
         self.assertEqual(checks[2].name, "app runs")
         self.assertEqual(checks[2].extra["mode"], "required")
+        self.assertNotIn("install", checks[2].extra)     # U06b: it never installs by itself
         self.assertEqual(ck.load_checks(t)[1], "detected")            # no AGENT_CHECKS.json here
         # the gate reads those detected checks, so they have to be acceptable ones
         frozen = [{"name": c.name, "cmd": c.cmd, "type": c.type, "timeout_s": c.timeout_s,
@@ -610,7 +696,8 @@ class Record(unittest.TestCase):
 class GateAndPages(DeviceCase):
     def test_a_crashing_app_fails_the_job_and_reaches_the_agent(self):
         self.scenario(devices=["d"], crash=True)
-        checks = [ck.Check("app runs", "", type="android-smoke", extra={"mode": "required"})]
+        checks = [ck.Check("app runs", "", type="android-smoke",
+                           extra={"mode": "required", "install": True, "device": "d"})]
         runners = androidcheck.runners(cfg={}, adb_path=str(FAKE_ADB))
         summ = ck.run_all(self.project(), self.tmp / "out", checks=checks, extra_runners=runners)
         self.assertEqual(summ["status"], "failed")
@@ -622,8 +709,9 @@ class GateAndPages(DeviceCase):
 
     def test_the_board_runs_both_kinds_of_android_check(self):
         self.scenario(devices=["d"], installed=["com.example.app"], frames=["a", "a"])
-        checks = [ck.Check("app runs", "", type="android-smoke", extra={"mode": "required"}),
-                  vcheck(mode="required")]
+        checks = [ck.Check("app runs", "", type="android-smoke",
+                           extra={"mode": "required", "install": True, "device": "d"}),
+                  vcheck(mode="required", install=True, device="d")]
         runners = androidcheck.runners(cfg={}, adb_path=str(FAKE_ADB),
                                        call=lambda body: '{"pass": true}')
         summ = ck.run_all(self.project(), self.tmp / "out", checks=checks, extra_runners=runners)
