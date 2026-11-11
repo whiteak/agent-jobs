@@ -1,0 +1,12 @@
+{
+ "id": "20261107-180819-71a7",
+ "mode": "local-qwen",
+ "folder": "webtest",
+ "job": "Write hello.sh that prints Hello from the job board, make it executable, run it, and write AGENT_REPORT.md with the output.",
+ "offline": false,
+ "status": "done",
+ "created": 1794038899.1771963,
+ "started": 1794038899.177631,
+ "finished": 1794038915.3938658,
+ "exit": 0
+}

@@ -99,7 +99,8 @@ class ProcessJobRefusals(unittest.TestCase):
              mock.patch.object(jobboard, "record_git_start", lambda m: None), \
              mock.patch.object(jobboard, "wait_with_watchdog", lambda jid, p: (0, None)), \
              mock.patch.object(jobboard, "notify_finished", lambda m, ok: None), \
-             mock.patch.object(jobboard, "build_review_md", lambda m: None):
+             mock.patch.object(jobboard, "build_review_md", lambda m: None), \
+             mock.patch.object(jobboard.jailcfg, "selftest", lambda force=False: (True, "OK  (mocked)")):
             ran = jobboard.process_job(dirname)
         return ran, popen
 

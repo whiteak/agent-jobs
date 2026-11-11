@@ -535,7 +535,12 @@ class Notify(unittest.TestCase):
 
     def test_success_notification_and_sound(self):
         self.mocks({"paplay"})  # paplay-only box
-        jobboard.notify_finished({"id": "x", "job": "Build the app and run tests"}, True)
+        # a desktop shell already has these set; the test is about the fallback values
+        from unittest import mock
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            jobboard.notify_finished({"id": "x", "job": "Build the app and run tests"}, True)
         self.assertEqual(self.run.call_count, 2)
         ns, pa = self.run.call_args_list[0][0][0], self.run.call_args_list[1][0][0]
         self.assertEqual(ns[:2], ["notify-send", "Agent job finished"])

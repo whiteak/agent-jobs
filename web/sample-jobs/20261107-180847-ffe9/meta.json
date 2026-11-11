@@ -1,0 +1,12 @@
+{
+ "id": "20261107-180847-ffe9",
+ "mode": "local-claude",
+ "folder": "webtest",
+ "job": "Write a Python script that computes the first 2000 primes in five different ways, with tests for each, and explain each in detail.",
+ "offline": false,
+ "status": "stopped",
+ "created": 1794038927.4412549,
+ "started": 1794038927.4415534,
+ "finished": 1794038952.5301967,
+ "exit": 143
+}
