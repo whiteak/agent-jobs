@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mode 2b: Qwen Code driving the LOCAL Basalt model.
+export BASALT_API_KEY=basalt QWEN_CODE_SUPPRESS_YOLO_WARNING=1
+exec qwen -m "Qwen3.8-Flash-Next GSQ-RCO IQ3_S" --yolo "$@"

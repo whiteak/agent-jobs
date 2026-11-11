@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+# JAIL: local-claude / local-qwen SHIM inside the SUPERVISED container.
+# The supervisor has internet and the Claude login, so it must never run a local agent
+# itself. This shim keeps the same command line (local-claude -p "..." etc.) but only
+# sends {mode, prompt, a few output flags} to the host broker (/run/agent-broker/broker.sock).
+# The host runs the agent in a separate offline sandbox on this project folder and
+# streams its output back here. No other commands can be requested.
+import json, os, socket, struct, sys
+
+MODE = os.path.basename(sys.argv[0])
+SOCK = "/run/agent-broker/broker.sock"
+USAGE = (f"usage: {MODE} -p \"PROMPT\" [--output-format text|json|stream-json] [--verbose] "
+         "[--resume ID | --continue]\n(runs the local agent offline in a separate sandbox on this project)\n")
+
+def die(msg, code=2):
+    sys.stderr.write(f"{MODE}: {msg}\n"); sys.exit(code)
+
+def main():
+    a = sys.argv[1:]; req = {"mode": MODE, "cwd": os.getcwd(), "verbose": False}
+    if MODE == "sandbox-run":   # sandbox-run "./gradlew --offline test": offline sandbox, no model
+        if not a or a[0] in ("-h", "--help"):
+            sys.stdout.write('usage: sandbox-run "COMMAND"  (runs offline in the local agents\' sandbox, this project only)\n'); return 0 if a else 2
+        return talk({"mode": MODE, "cwd": os.getcwd(), "command": " ".join(a)})
+    prompt = None; i = 0
+    while i < len(a):
+        x = a[i]
+        def val():
+            if i + 1 >= len(a): die(f"{x} needs a value")
+            return a[i + 1]
+        if x in ("-p", "--print"):
+            if i + 1 < len(a) and not a[i + 1].startswith("-"): prompt = a[i + 1]; i += 1
+        elif x in ("--output-format", "-o"): req["output_format"] = val(); i += 1
+        elif x.startswith("--output-format="): req["output_format"] = x.split("=", 1)[1]
+        elif x == "--verbose": req["verbose"] = True
+        elif x in ("--resume", "-r"): req["resume"] = val(); i += 1
+        elif x in ("--continue", "-c"): req["continue"] = True
+        elif x in ("--dangerously-skip-permissions", "--yolo", "-y"): pass   # always on in the sandbox
+        elif x in ("-h", "--help"): sys.stdout.write(USAGE); return 0
+        elif x.startswith("-"): die(f"option {x} is not supported here.\n" + USAGE)
+        elif prompt is None: prompt = x
+        else: die("only one prompt please (quote it)")
+        i += 1
+    if prompt is None and not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    if not prompt: die("no prompt given (interactive mode is not available here).\n" + USAGE)
+    req["prompt"] = prompt
+    return talk(req)
+
+def talk(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try: s.connect(SOCK)
+    except OSError as ex: die(f"cannot reach the host broker ({ex})", 3)
+    s.sendall(json.dumps(req).encode() + b"\n")
+    out = sys.stdout.buffer; code = 1; buf = b""
+    while True:
+        while len(buf) < 5:
+            b = s.recv(65536)
+            if not b: die("broker closed the connection", 3)
+            buf += b
+        kind, n = buf[:1], struct.unpack(">I", buf[1:5])[0]
+        while len(buf) < 5 + n:
+            b = s.recv(65536)
+            if not b: die("broker closed the connection", 3)
+            buf += b
+        data, buf = buf[5:5 + n], buf[5 + n:]
+        if kind == b"O": out.write(data); out.flush()
+        elif kind == b"E": sys.stderr.buffer.write(data); sys.stderr.flush()
+        elif kind == b"X": code = int(data or b"1"); break
+    return code
+
+if __name__ == "__main__":
+    sys.exit(main())

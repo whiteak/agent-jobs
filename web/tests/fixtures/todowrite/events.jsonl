@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"s-fixed-1","tools":["TodoWrite","Bash"]}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"Set up the project","status":"in_progress"},{"content":"Write the code","status":"pending"},{"content":"Run the tests","status":"pending"}]}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Starting with the setup."}]},{"type":"extra":1}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls -la"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"filelist"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"TodoWrite","input":{"todos":[{"content":"Set up the project","status":"completed"},{"content":"Write the code","status":"in_progress"},{"content":"Run the tests","status":"pending"}]}}]}}

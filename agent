@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# agent - run the coding agent inside the rootless Podman sandbox.
+#
+#   agent supervised   ["job"]   Mode 1: cloud Claude plans/reviews, local model codes
+#   agent local-claude ["job"]   Mode 2a: Claude Code on the local Basalt model, no cloud
+#   agent local-qwen   ["job"]   Mode 2b: Qwen Code on the local Basalt model, no cloud
+#   agent shell                  a shell inside the sandbox (whole ~/agent-work, internet, normal home)
+#   agent build                  (re)build the sandbox image
+#   agent github-login           save the GitHub token used by the job board's Push button
+#   Local modes ALWAYS run offline (no internet, no credentials, own project only; see jail/).
+#   Options after the mode: --offline (supervised/shell: reach nothing but Basalt), --in DIR (start in ~/agent-work/DIR),
+#   --stream (live JSON events, used by the web page), --name NAME (container name, so it can be stopped),
+#   --resume ID (continue an earlier session, for follow-up questions)
+#
+# Without a job it opens the agent interactively. With a job it runs unattended and logs to
+# ~/agent-work/.agent-logs/. Local modes see only their project (as /work/FOLDER), a home without
+# credentials and Basalt on localhost:8080 - no internet. Supervised also has internet. No sudo.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+IMAGE=localhost/local-agent:latest
+WORK="$HOME/agent-work"; STATE="$HERE/state"
+mode="${1:-}"; shift || true
+net="pasta:-T,8080"
+wdir=/work; folder=""; stream=0; cname=(); resume=()
+while [ $# -gt 0 ]; do case "$1" in
+  --offline) net="pasta:--splice-only,-T,8080"; shift ;;
+  --in) folder="${2:?--in needs a folder}"; wdir="/work/$folder"; shift 2 ;;
+  --stream) stream=1; shift ;;
+  --name) cname=(--name "${2:?--name needs a value}"); shift 2 ;;
+  --resume) resume=(--resume "${2:?--resume needs a session id}"); shift 2 ;;
+  *) break ;;
+esac; done
+
+case "$mode" in
+  build) exec podman build -t "$IMAGE" "$HERE" ;;
+  github-login)
+    # Save a GitHub token inside the sandbox only, connect git to it, then show what it can reach.
+    # JAIL: the token now lives in state/push-creds/gh (only the job board's push container
+    # mounts it); agent containers never see it.
+    mkdir -p "$STATE/push-creds/gh"; chmod 700 "$STATE/push-creds"
+    read -rsp "Paste your GitHub token (nothing will show), then press Enter: " tok; echo
+    tok=$(printf '%s' "$tok" | tr -d '[:space:][:cntrl:]')
+    [ -n "$tok" ] || { echo "No token entered. Paste with Ctrl+Shift+V or right-click > Paste (Ctrl+V does not paste here)."; exit 1; }
+    case "$tok" in
+      github_pat_*|ghp_*) echo "Got a ${#tok}-character token starting with ${tok%%_*}_ ... checking it with GitHub." ;;
+      *) echo "That doesn't look like a GitHub token (got ${#tok} characters; they start with github_pat_ or ghp_)."
+         echo "Copy the token again on GitHub and paste with Ctrl+Shift+V or right-click > Paste."; exit 1 ;;
+    esac
+    printf '%s\n' "$tok" | podman run --rm -i --userns=keep-id --network pasta -e HOME=/home/agent \
+      --tmpfs /home/agent:rw,mode=1777 -v "$STATE/push-creds/gh:/home/agent/.config/gh" --entrypoint bash "$IMAGE" -c '
+        gh auth login --hostname github.com --git-protocol https --with-token || exit 1
+        echo; echo "Logged in as: $(gh api user --jq .login)"
+        echo "Repos it can reach (and access level):"
+        gh repo list "$(gh api user --jq .login)" --limit 100 --json nameWithOwner,viewerPermission \
+          --jq ".[] | \"  \(.nameWithOwner)  \(.viewerPermission)\""'
+    rc=$?; unset tok; exit $rc ;;
+  supervised)   cmd=(claude --dangerously-skip-permissions) ;;
+  local-claude) cmd=(local-claude) ;;
+  local-qwen)   cmd=(local-qwen) ;;
+  shell)        cmd=(bash) ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
+
+if [ "$mode" != shell ] && ! curl -sf -m 3 http://127.0.0.1:8080/v1/models | grep -q '"loaded"'; then
+  echo "Basalt is not running or still loading. Start it with: systemctl --user start basalt" >&2; exit 1
+fi
+podman image exists "$IMAGE" || { echo "Building the sandbox image first (one time) ..."; podman build -t "$IMAGE" "$HERE"; }
+mkdir -p "$WORK/.agent-logs" "$STATE/home" "$STATE/android-sdk"
+
+run=(podman run --rm --init "${cname[@]}" --userns=keep-id --cap-drop=ALL --security-opt no-new-privileges
+     --network "$net" --hostname agent-sandbox -w "$wdir"
+     -e HOME=/home/agent -e TERM="${TERM:-xterm-256color}"
+     -v "$STATE/home:/home/agent" -v "$STATE/android-sdk:/opt/android-sdk" -v "$WORK:/work")
+
+# JAIL (2026-11-11): local AI modes ALWAYS run with no internet, a credential-free home
+# (state/home-local) and only their own project folder. The flags live in
+# jail/podman-local.sh, shared with jail/podman-selftest.sh so they cannot drift.
+# No --in (interactive chat) -> the folder ~/agent-work/chat.
+case "$mode" in local-claude|local-qwen)
+  . "$HERE/jail/podman-local.sh"
+  [ -n "$folder" ] || folder=chat
+  case "$folder" in */*|.*|"") echo "agent: bad folder '$folder'" >&2; exit 2 ;; esac
+  mkdir -p "$WORK/$folder" "$JAIL_HOME_LOCAL"
+  jail_bridge_start || exit 1
+  trap jail_bridge_stop EXIT
+  trap 'exit 143' INT TERM
+  jail_local_args "$WORK/$folder" "$folder"
+  run=(podman run "${cname[@]}" "${JAIL_ARGS[@]}") ;;
+supervised)
+  # JAIL (split, 2026-11-11): the supervisor keeps internet + state/home (Claude login) and
+  # sees only its project, but it can NOT run a local model itself: no route to Basalt
+  # (pasta without -T 8080), and local-claude/local-qwen are shims that ask a host broker
+  # (jail/agent-broker.py) to run the agent in the separate offline local-job sandbox.
+  [ -n "$folder" ] || { folder=chat; wdir=/work/chat; }
+  case "$folder" in */*|.*) echo "agent: bad folder '$folder'" >&2; exit 2 ;; esac
+  mkdir -p "$WORK/$folder" "$WORK/.agent-logs"
+  [ ${#cname[@]} -gt 0 ] || cname=(--name "agentsup-$$")
+  BROKER_DIR=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/agent-broker.XXXXXX"); chmod 700 "$BROKER_DIR"
+  python3 "$HERE/jail/agent-broker.py" --sock "$BROKER_DIR/broker.sock" --work "$WORK" --folder "$folder" \
+    --name "${cname[1]}" --log "$WORK/.agent-logs/$(date +%Y%m%d-%H%M%S)-broker-${cname[1]}.log" &
+  BROKER_PID=$!
+  trap 'kill $BROKER_PID 2>/dev/null; wait $BROKER_PID 2>/dev/null; rm -rf "$BROKER_DIR"' EXIT
+  trap 'exit 143' INT TERM
+  for _ in $(seq 100); do [ -S "$BROKER_DIR/broker.sock" ] && break; sleep 0.05; done
+  [ -S "$BROKER_DIR/broker.sock" ] || { echo "agent: local-agent broker did not start" >&2; exit 1; }
+  SHIM="$HERE/jail/shim/local-agent"
+  run=(podman run --rm --init "${cname[@]}" --userns=keep-id --cap-drop=ALL --security-opt no-new-privileges
+       --network pasta --hostname agent-sandbox -w "$wdir"
+       -e HOME=/home/agent -e TERM="${TERM:-xterm-256color}"
+       -v "$STATE/home:/home/agent" -v "$STATE/android-sdk:/opt/android-sdk"
+       --tmpfs /work:rw,mode=1777 -v "$WORK/$folder:/work/$folder"
+       -v "$BROKER_DIR:/run/agent-broker"
+       -v "$SHIM:/opt/agent/bin/local-claude:ro" -v "$SHIM:/opt/agent/bin/local-qwen:ro"
+       -v "$SHIM:/opt/agent/bin/sandbox-run:ro")
+  cname=() ;;
+esac
+
+if [ $# -eq 0 ]; then
+  [ -n "${JAIL_BRIDGE_PID:-}${BROKER_PID:-}" ] && { "${run[@]}" -it "$IMAGE" "${cmd[@]}"; exit $?; }  # JAIL: keep bridge alive, no exec
+  exec "${run[@]}" -it "$IMAGE" "${cmd[@]}"
+fi
+fmt=()
+if [ $stream = 1 ]; then case "$mode" in local-qwen) fmt=(-o stream-json) ;; shell) ;; *) fmt=(--output-format stream-json --verbose) ;; esac; fi
+job="$*"; ts=$(date +%Y%m%d-%H%M%S); log="$WORK/.agent-logs/$ts-$mode.log"
+echo "Running $mode unattended. Log: $log"
+{ echo "# $mode  $ts"; echo "# job: $job"; echo; } > "$log"
+"${run[@]}" -i "$IMAGE" "${cmd[@]}" "${resume[@]}" -p "$job" "${fmt[@]}" 2>&1 | tee -a "$log"

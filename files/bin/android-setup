@@ -1,0 +1,6 @@
+#!/bin/bash
+# Install Android SDK packages into the persistent SDK folder. Usage: android-setup [platform-api] [build-tools]
+set -e
+API=${1:-36}; BT=${2:-36.0.0}
+yes | sdkmanager --sdk_root=$ANDROID_HOME --licenses >/dev/null
+sdkmanager --sdk_root=$ANDROID_HOME "platform-tools" "platforms;android-$API" "build-tools;$BT"
