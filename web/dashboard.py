@@ -189,5 +189,4 @@ ul.tl li.ok{color:var(--ok)}ul.tl li.bad{color:var(--bad);font-weight:600}ul.tl 
 .feed .it.edit b{color:var(--warn)}.feed .it.read{color:var(--mut)}
 .feed .it.text{white-space:pre-wrap}
 button.more{background:none;color:var(--acc);border:0;padding:0;font-size:12px;cursor:pointer}
-.hit{background:rgba(255,200,0,.35)}
 </style>"""
