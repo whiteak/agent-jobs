@@ -24,6 +24,7 @@ import badges     # U07b: one badge per check, linking to its output
 import diffcard   # U07b: the Changes card (file list + diff viewer)
 import diffview   # U07b: what the job changed (git in the jail, parsed diffs)
 import notifycfg  # U09b: phone alerts (ntfy) - settings page, events, quiet hours
+import attempts   # U05: best-of-N for hard steps (fresh copies, ranking, Attempts card)
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -161,6 +162,13 @@ def check_record(name, m):
         return "fix_rounds"
     if not isinstance(m.get("verify_off", False), bool):
         return "verify_off"
+    a = m.get("attempts")                                   # U05: best-of-N
+    if a is not None and (isinstance(a, bool) or not isinstance(a, int)
+                          or not 0 <= a <= attempts.MAX_N):
+        return "attempts"
+    for key in ("hard", "stop_early"):                      # U05
+        if m.get(key) is not None and not isinstance(m[key], bool):
+            return key
     if m.get("mode") == upgrades.FAKE_MODE:
         try:
             json.loads(job)
@@ -257,8 +265,9 @@ def process_job(name):
     record_git_start(m)
     upgrades.freeze_checks(m, WORK / m["folder"])   # U01: what the gate checks is fixed BEFORE the agent runs
     save_meta(m, name)
-    run_agent_job(m, name)                         # U01: agent + watchdog, then the verify gate
+    run_planned(m, name)                           # U01/U05: agent + watchdog + gate, or N fresh attempts
     m = load_meta(name)
+    maybe_auto_attempts(m)                         # U05: "try fresh attempts" without the button
     try:
         notify_finished(m, m["status"] == "done" and (m.get("verify") or {}).get("status") != "failed")
     except Exception:
@@ -284,6 +293,8 @@ class JobCtx:
     def __init__(self, m, name, cfg):
         self.m, self.name, self.cfg = m, name, cfg
         self.root = WORK / m["folder"]
+        sub = str(m.get("attempt_sub") or "")   # U05: an attempt's check logs stay apart
+        self.checks_root = job_dir(name) / sub if attempts.SUB_RE.fullmatch(sub) else job_dir(name)
         self.ev = upgrades.EventLog(job_dir(name) / "events.jsonl")
         proj = str(self.root) if upgrades.HOST_MODE else f"/work/{m['folder']}"
         self.wd = wdm.Watchdog(upgrades.watchdog_settings(cfg), proj)
@@ -417,7 +428,8 @@ def run_gate(ctx):
         update_meta(name, phase="Running checks" + (f" after fix round {r}" if r else ""))
         ctx.ev.emit("checks_start", "Running checks in the sandbox" + (f" after fix round {r}" if r else ""))
         ctx.ev.release()
-        summary = ck.run_all(ctx.root, job_dir(name) / "checks" / f"round-{r}", wrap, checks=upgrades.job_checks(m))
+        summary = ck.run_all(ctx.root, ctx.checks_root / "checks" / f"round-{r}", wrap,
+                             checks=upgrades.job_checks(m))
         if stopped():
             raise GateAbort("user_stop")
         return summary
@@ -435,9 +447,11 @@ def run_gate(ctx):
     ctx.ev.release()
     return out
 
-def run_agent_job(m, name):
+def run_agent_job(m, name, fresh_log=True):
     """The agent run (with watchdog), then - if it ended normally - the verify gate.
-    Leaves the final status, verify outcome, checkpoints and watchdog actions in meta."""
+    Leaves the final status, verify outcome, checkpoints and watchdog actions in meta.
+    U05: best-of-N calls this once per attempt, in the attempt's own folder; only the
+    first attempt starts a fresh log, so the job page shows every try."""
     cfg = upgrades.load_settings(SETTINGS_FILE, write_defaults=False)
     ctx = JobCtx(m, name, cfg)
     note = None
@@ -445,12 +459,12 @@ def run_agent_job(m, name):
         note = "Checkpoints off: the project folder is not a git repository"
     else:
         try:
-            ctx.mgr = upgrades.make_checkpoints(m, ctx.root, job_dir(name) / "checks", ctx.ev)
+            ctx.mgr = upgrades.make_checkpoints(m, ctx.root, ctx.checks_root / "checks", ctx.ev)
         except Exception as ex:
             note = f"Checkpoints off: {str(ex)[:200]}"
     if note:
         update_meta(name, checkpoints_note=note)
-    rc, fok, how, act = run_agent_loop(ctx, m["job"], m.get("resume"), 0, fresh_log=True)
+    rc, fok, how, act = run_agent_loop(ctx, m["job"], m.get("resume"), 0, fresh_log=fresh_log)
     cur = load_meta(name) or m
     extra = {}
     if how == "user_stop" or cur.get("status") == "stopping":
@@ -504,6 +518,53 @@ def run_agent_job(m, name):
     return cur
 
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+# ---------------------------------------------------------------- U05: best-of-N
+
+def run_planned(m, name):
+    """One run (U01), or N fresh attempts one after another when the record asks for
+    them (U05). Everything else - the gate, the watchdog, the timeline - is the same."""
+    if not m.get("attempts"):
+        return run_agent_job(m, name)
+    return attempts.run_best_of_n(m, name, work=WORK, job_dir=job_dir, load=load_meta,
+                                  update=update_meta, run_one=run_agent_job,
+                                  settings=upgrades.load_settings(SETTINGS_FILE, write_defaults=False))
+
+def maybe_auto_attempts(m):
+    """U05: with auto_attempts on, a job that failed after its fix rounds gets a fresh
+    best-of-N run straight away - as a new job, so this one stays reviewable as it is."""
+    if READONLY or not m or m.get("kind") == "bench" or m.get("attempts") or m.get("verify_off"):
+        return None
+    if (m.get("verify") or {}).get("status") != "failed":
+        return None
+    cfg = upgrades.load_settings(SETTINGS_FILE, write_defaults=False)
+    if not cfg.get("auto_attempts") or not upgrades.git_repo(WORK / m["folder"]):
+        return None
+    extra = attempts.retry_extra(m, cfg)
+    child = new_job(m["mode"], m["folder"], m["job"], m.get("offline", False), parent=m["id"], extra=extra)
+    dashboard.tl_add(job_dir(m["id"]), "attempt",
+                     f"Starting {extra['attempts']} fresh attempts (job {child['id']})")
+    return child["id"]
+
+def hard_retry(m):
+    """The "Try N fresh attempts" button: the same job again, best of N, as a new job."""
+    cfg = upgrades.load_settings(SETTINGS_FILE, write_defaults=False)
+    return new_job(m["mode"], m["folder"], m["job"], m.get("offline", False), parent=m["id"],
+                   extra=attempts.retry_extra(m, cfg))
+
+def u05_button(jid, get):
+    """"Use this one instead": the job branch becomes another attempt's branch. Only for a
+    finished job whose folder has nothing running, on a record that passes the safety check."""
+    m = load_meta(jid)
+    if (not m or m.get("kind") == "bench" or not m.get("attempt_log")
+            or m["status"] in ("queued", "running", "stopping") or check_record(jid, m)
+            or folder_busy(m["folder"]) or not upgrades.git_repo(WORK / m["folder"])):
+        return
+    err = attempts.use_attempt(m, get("k"), work=WORK, update=update_meta, job_dir=job_dir)
+    if err:
+        dashboard.tl_add(job_dir(jid), "attempt", err)
+        update_meta(jid, attempts_note=err)
+
 
 def record_git_start(m):
     """Remember the project's starting commit (and branch) right before the job
@@ -1180,7 +1241,8 @@ def basalt_status():
         return "offline"
 
 def folders():
-    return sorted(d.name for d in WORK.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name != "eval")
+    return sorted(d.name for d in WORK.iterdir() if d.is_dir() and not d.name.startswith(".")
+                  and d.name != "eval" and not attempts.is_attempt_folder(d.name))   # U05: tries stay out of the list
 
 
 # ---------------------------------------------------------------- web
@@ -1344,6 +1406,7 @@ def home_page():
 {jailcfg.OFFLINE_FIELD}
 {jailcfg.FETCH_FORM_FIELD}
 {upgrades.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False)["fix_rounds"])}
+{attempts.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False))}
 <p class="hint">Jobs run one at a time. When the agent finishes, the board runs the project's checks in the sandbox and sends failures back for fix rounds. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
 <button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
 {upgrades.CSS}{badges.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
@@ -1428,6 +1491,8 @@ def job_page(jid):
     can_act = not active and not READONLY and not folder_busy(m["folder"]) and m.get("kind") != "bench"
     u01_cards = (upgrades.checks_card_html(m, jid, can_act and m["status"] != "cancelled")
                  + upgrades.checkpoints_card_html(m, jid, can_act) + upgrades.watchdog_card_html(m) + upgrades.CSS)
+    u05_cards = attempts.card_html(m, jid, can_act,
+                                   upgrades.load_settings(SETTINGS_FILE, write_defaults=False))   # U05
     body = header() + f"""
 <div class="card banner {s['state']}{' t-' + s['tone'] if s.get('tone') else ''}" id="banner">
 <div class="bhead"><span class="btitle s-{s['state']}{' t-' + s['tone'] if s.get('tone') else ''}" id="st">{glyph} {esc(s['label'])}</span><span style="flex:1"></span><span id="stopform">{stop}</span></div>
@@ -1440,7 +1505,7 @@ def job_page(jid):
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{u01_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{u01_cards}{u05_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 {diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
@@ -1753,6 +1818,11 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self.send(render(header() + '<div class="card bad">The checks, fix rounds (0-10) or the fake '
                                         'scenario could not be read. <a href="/">Back</a></div>'), code=400)
             extra.update(u01)
+            u05 = attempts.form_extra(form, upgrades.load_settings(SETTINGS_FILE, write_defaults=False))
+            if u05 is None:   # U05: the "try it N times" box was ticked with a bad number
+                return self.send(render(header() + '<div class="card bad">A hard job is tried 2 to 4 times. '
+                                                   '<a href="/">Back</a></div>'), code=400)
+            extra.update(u05)
             m = new_job(mode, folder, job, bool(get("offline")) and mode != "supervised", extra=extra or None)
             if m.get("checks") and m.get("checks_source") == "the new-job form":
                 try:   # the agent can see what it will be checked with
@@ -1791,6 +1861,16 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.redirect(f"/job/{parts[1]}")
         if len(parts) == 2 and parts[0] in ("recheck", "rollback", "ckpt-cleanup") and load_meta(parts[1]):   # U01
             u01_button(parts[0], parts[1], get)
+            return self.redirect(f"/job/{parts[1]}")
+        if len(parts) == 2 and parts[0] == "use-attempt" and load_meta(parts[1]):   # U05
+            u05_button(parts[1], get)
+            return self.redirect(f"/job/{parts[1]}")
+        if len(parts) == 2 and parts[0] == "try-hard" and load_meta(parts[1]):   # U05: N fresh attempts
+            pm = load_meta(parts[1])
+            if (pm.get("kind") != "bench" and pm["status"] not in ("queued", "running", "stopping")
+                    and not pm.get("attempts") and not check_record(parts[1], pm)
+                    and (pm.get("verify") or {}).get("status") == "failed"):
+                return self.redirect(f"/job/{hard_retry(pm)['id']}")
             return self.redirect(f"/job/{parts[1]}")
         if len(parts) == 2 and parts[0] == "stop" and load_meta(parts[1]):
             was_bench = load_meta(parts[1]).get("kind") == "bench"

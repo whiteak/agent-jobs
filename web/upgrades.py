@@ -52,7 +52,11 @@ def _wd_defaults():
 
 
 DEFAULTS = {"fix_rounds": 3, "after_result_grace_s": 120, "watchdog": _wd_defaults(),
-            "watchdog_tick_s": 15, "model_ping_s": 30}
+            "watchdog_tick_s": 15, "model_ping_s": 30,
+            # U05: best-of-N for hard jobs (attempts 2-4, stop early unless marked hard,
+            # and start fresh attempts by hand only - auto_attempts = do it for a job that
+            # failed after its fix rounds)
+            "attempts": 3, "stop_early": True, "auto_attempts": False}
 
 
 def load_settings(path, write_defaults=True):
@@ -77,6 +81,8 @@ def load_settings(path, write_defaults=True):
     for k, v in data.items():
         if k == "watchdog" and isinstance(v, dict):
             out["watchdog"].update({a: b for a, b in v.items() if a in out["watchdog"]})
+        elif k in out and isinstance(v, bool) and isinstance(out[k], bool):   # U05: on/off settings
+            out[k] = v
         elif k in out and isinstance(v, (int, float)) and not isinstance(v, bool):
             out[k] = v
     return out
