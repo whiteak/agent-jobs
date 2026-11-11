@@ -57,8 +57,10 @@ CUTOFF_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 OPEN_STATES = ("queued", "interrupted", "running")
 DONE_LIKE = ("done", "failed", "skipped")
 
-# the queue file is written by the worker thread and by the page buttons at the same time
-_lock = threading.Lock()
+# the queue file is written by the worker thread and by the page buttons at the same time.
+# Re-entrant: action() holds it while it calls start_next(), and job_finished() holds it while
+# it queues the next task's job.
+_lock = threading.RLock()
 
 STATUS = {"idle": "not started", "ready": "ready to start", "running": "running",
           "paused": "paused", "stopped": "stopped after a failed task",
@@ -338,14 +340,22 @@ def start_next(folder, ctx):
         n = best_of_n(t, rec, cfg, tries)
         if n:
             extra.update(attempts=n, hard=False)
-        prev = str(t.get("job_id") or "")
-        prev = prev if linked_job(prev, ctx) else None
-        resume = ctx["session_of"](prev) if (t.get("state") == "interrupted" and prev) else None
+        # the job of the task before this one in the plan: the new job is its follow-up, and
+        # "starts from the previous job's final commit" is that job's last commit.
+        prev = None
+        for x in tasks[:tasks.index(t)][::-1]:
+            jid = str(x.get("job_id") or "")
+            if linked_job(jid, ctx):
+                prev = jid
+                break
+        own = str(t.get("job_id") or "")
+        own = own if linked_job(own, ctx) else None
+        resume = ctx["session_of"](own) if t.get("state") == "interrupted" else None
         note = keep_branch(root, folder)
         base = head_sha(root, folder)
         mode = rec.get("mode") if rec.get("mode") in ctx["modes"] else ctx["default_mode"]
         m = ctx["new_job"](mode, folder, task_prompt(rec, root, t, pos, len(tasks)), False,
-                           resume=resume, parent=prev, extra=extra)
+                           resume=resume, parent=prev or own, extra=extra)
         t["tries"] = tries + 1
         if base:
             t["base"] = base
@@ -450,6 +460,7 @@ def startup(queues, ctx):
             ck = ((ctx["load"](prev) or {}).get("checkpoints") or {}).get("checkpoints") or []
             if ck:
                 t["resume_from"] = str(ck[-1].get("commit") or "")[:40]
+                q.save()
                 dashboard.tl_add(ctx["job_dir"](prev), "queue",
                                  f"Interrupted by a restart - {t['id']} starts again from "
                                  f"checkpoint {ck[-1].get('n')} of that job.")
@@ -595,7 +606,8 @@ def card_html(rec, ctx, mode_html="", note=""):
     cut_val = time.strftime("%H:%M", time.localtime(cut)) if cut else ""
     n = best_of_n({"size": "M"}, rec, cfg, 0) or attempts.DEFAULT_N
     setup = f"""<form method="post" action="/queue/{esc(rec['folder'])}">
-<div class="row"><div><label>Which agent runs the tasks</label>{mode_html}</div>
+<div class="row"><div><label>Which agent runs the tasks</label>
+ <select name="mode">{mode_html}</select></div>
 <div><label>If a task fails</label><select name="onfail">
 <option value="stop"{" selected" if st.get("on_fail") != "skip" else ""}>Stop the queue</option>
 <option value="skip"{" selected" if st.get("on_fail") == "skip" else ""}>Skip the tasks that depend on it</option>
