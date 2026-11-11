@@ -1321,3 +1321,235 @@ still work: the full suite runs them.
 - No network, no installs, stdlib only. `~/agent-sandbox` untouched: every test and the 8091 run
   use their own `HOME` and state folders (`/tmp/u04a-smoke`, deleted after the run). Nothing was
   pushed; the branch `agent/jobboard-next` is ready for Jason to review, push and merge.
+
+---
+
+## Job 06 — Upgrade 5: best-of-N for hard steps (re-run, finished)
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md holds this job's findings, its step list all ticked, and a "what this run found"
+note.
+
+This job had been started before. The feature itself — `web/attempts.py` (540 lines) plus the 16
+`# U05` hooks in `jobboard.py`, the three settings keys in `upgrades.py` and 43 tests — is already
+in `2903bb7`, `7520a60` and `54feb77` (the last of those was left uncommitted by a run that
+stopped mid-way and was committed as found). That run never ticked its steps, never clicked the
+pages on its own port and never wrote its report section. This run did not rebuild anything: it
+clicked the whole feature end to end on 127.0.0.1:8091 with the fake agent, and fixed what the
+clicking found.
+
+Commits in this run:
+
+- `52a35a9` U05 found by the 8091 click-through: **Stop did not stop the tries** (a hard job went
+  on to attempt 3 of 3 after Jason had stopped it), and the card said "No more attempts: attempt 3
+  passed cleanly" when the tries had simply run out and none passed; 1 test.
+- (docs) PLAN.md ticked + this section.
+
+### Files changed
+
+| File | What changed |
+| --- | --- |
+| `web/attempts.py` | **new** (540 lines, `# U05`) — the plan (`attempts` 2-4, `hard`, `stop_early`), the new-job fields and their validation, attempt folder/branch names (`<folder>-try<k>-<id4>`, `agent/<id>-try<k>`), the phase tag, the git plumbing (`prepare` clone + branch, `collect` leftover commit + bundle, `bring_home`, `apply_winner`, `prune_old`, `changes`), the scores (`status_of`, `tests_passed`, `attempt_of`), the run (`run_best_of_n`), the buttons (`use_attempt`, `retry_extra`) and the Attempts card. This run added `stop_pressed()` and the accurate end-of-loop timeline line. |
+| `web/jobboard.py` | 16 `# U05` hooks, all small: `check_record` validates `attempts`/`hard`/`stop_early`; `run_planned` (one run, or N attempts); `JobCtx` puts an attempt's check logs under `JOBS/<id>/attempts/try-k/`; `run_agent_job(m, name, fresh_log=)`; `phase_tag` in the gate's phases; `folders()` hides try folders; `maybe_auto_attempts`; the card on the job page and the fields on the new-job form; POST `/use-attempt/<id>` and `/try-hard/<id>`. |
+| `web/upgrades.py` | `DEFAULTS` gained `attempts: 3`, `stop_early: True`, `auto_attempts: False`, and `load_settings` now keeps on/off settings (`test_settings_keep_the_new_keys`). |
+| `web/tests/test_u05_bestofn.py` | 43 → **44** tests (all listed under "Verified"). |
+| `PLAN.md`, `AGENT_REPORT.md` | this job's steps ticked + the re-run findings; this section. |
+
+Nothing else was touched. The ranking is `agentjobs_upgrades/bestofn.py` used exactly as given
+(`Attempt`, `pick_winner`, `should_continue`, `why`) — not reimplemented; `guard.is_test_file` and
+`safegit.SafeGit` are reused. `decisions` (8), `taskqueue` (4b), `dashboard`/`badges` (7a/7b),
+`phoneaccess`/`phonelayout` (9a), `morningreport` (10) and the `# JAIL:`, `# U01`, `# U05`,
+`# U07` and `# VOICE` blocks all still work: the full suite runs them.
+
+### How each requirement is met
+
+1. **"Hard: try 3 times" (N 2-4, default 3) + the fresh-attempts button.** The new-job form has a
+   `Hard job: try it 3 times` checkbox and a `Times` box (`min=2 max=4`, prefilled from the board
+   setting); `attempts.form_extra` refuses anything else — the page answers "A hard job is tried 2
+   to 4 times." (400), and `check_record` refuses a record whose `attempts` is not 0-4 / not an
+   int / a bool, so a forged record never reaches the worker. A job that ended **Failed after fix
+   rounds** (`verify.status == failed`, no attempts of its own) gets a **Try 3 fresh attempts**
+   button (`POST /try-hard/<id>`), which starts the same prompt again as a **new** job with
+   `attempts=N, hard=False, parent=<id>` so the failed one stays reviewable. `auto_attempts: true`
+   in `state/agentjobs-settings.json` does the same press by itself (`maybe_auto_attempts`, off by
+   default, never for a bench run, a job that already tried, a `verify_off` job or a
+   non-git folder).
+2. **Each attempt starts from the same base commit, in its own copy, one after another.** The base
+   is `git_start` — the sha `record_git_start` took before the agent ran. `prepare()` clones that
+   commit into `~/agent-work/<folder>-try<k>-<id4>` on branch `agent/<id>-try<k>`; the loop runs
+   one attempt at a time in the worker (one GPU) through the ordinary `run_agent_job` — same
+   checks (`AGENT_CHECKS.json`, frozen before the job by `freeze_checks`), same fix rounds, same
+   watchdog, same checkpoints — with `resume=None` so no try ever carries on another try's
+   conversation, and its check logs under `JOBS/<id>/attempts/try-k/checks/round-N`. **Why not a
+   git worktree** (the spec's word): the jail mounts exactly one folder (`podman-local.sh`:
+   `-v <dir>:/work/<name> -w /work/<name>`) and `agent --in` only accepts a top-level
+   `~/agent-work` name, and a worktree's git dir stays in the main repo — invisible in the
+   container, so git inside the sandbox would break. A full clone gives the same isolation
+   (an attempt can only ever see its own copy: `test_attempts_never_see_each_other`). Only two git
+   steps run on the host, because they need two folders at once — `clone --no-checkout` (objects
+   and refs only, so no agent-planted smudge filter or hook can run there) and `fetch <bundle>` —
+   both through `SafeGit` (`-c core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+   `GIT_CONFIG_NOSYSTEM=1`, `protocol.allow=never`, opening only the file transport); a bundle
+   carries no repo config, so the project repo never reads an attempt repo's settings. Every step
+   that writes a working tree (`checkout -B` in the attempt, `apply_winner` in the project folder)
+   runs inside that folder's own jail. Try folders are hidden from the folder picker
+   (`attempts.is_attempt_folder`), and `prune_old` clears attempt branches older than 7 days.
+3. **The winner is chosen automatically, and every try's scores are kept.** Each finished attempt
+   becomes a `bestofn.Attempt` — status from its checks (`verify.status`, or how the run itself
+   ended), tests passing summed from `verify.final.results`, test files changed and diff size from
+   `git diff --numstat` (`guard.is_test_file` for the test files), seconds from the clock — then
+   `bestofn.pick_winner` in the spec's order: a clean pass with no needs-review flag, most tests
+   passing, fewest test files changed, smallest diff, fastest (`why` says which one decided it, in
+   plain words: "Attempt 3 won: a smaller change."). Every attempt's row (`k`, status, tests,
+   files with +/-, diff lines, minutes, branch, commit, session, watchdog/checkpoint counts, the
+   checks banner) is stored in `meta["attempt_log"]`, ranked in `attempts_final`, shown on the
+   card and written to the timeline.
+4. **Winner on the job branch, losers for 7 days, "Use this one instead".** `apply_winner` checks
+   the winner out as `agent/<job id>` **in the project folder**, so the Changes card, the review
+   bundle, Push and upgrade 8's merge all work exactly as before; the record's `verify`, `session`
+   and check badges are the winner's. A loser is never checked out, and if nothing passed cleanly
+   **nothing** goes in the folder — the note says so ("Nothing was put in the folder: no attempt
+   passed its checks. Each try is still on its own branch - pick one with 'Use this one
+   instead'."). The Attempts card on the job page (the board has no tabs) lists every try with its
+   result, tests, changed files and branch; every non-kept row has **Use this one instead**, which
+   re-points `agent/<job id>` at that try's branch (only for a finished job whose folder is idle
+   and whose record passes `check_record`), says so on the card and timeline, and moves the
+   "(kept)" marker. A branch that already went past 7 days answers "Branch … is gone - attempts
+   are kept for 7 days."
+5. **The cost and the progress are on the page.** Before starting: "A hard job is tried 3 times in
+   a fresh copy of the project, one after another (about 3× longer)…" on the form, and the same
+   "(about N× longer)" next to the fresh-attempts button. While it runs: the record's phase is
+   `Attempt 2 of 3 - Running checks` / `… - Fix round 1 of 2` (the gate rewrites the phase, so the
+   tag is put back by `attempts.phase_tag`), so the banner's action line and the job list both say
+   which try is running; the card's own line says **Attempt 2 of 3** with the cost note; the
+   timeline has `Attempt 2 of 3 started` and `Attempt 2 of 3: passed - 2 tests passing`.
+6. **Stop early (default on).** `bestofn.should_continue(done, n, hard, stop_early)`: a job that
+   was *not* marked hard stops as soon as attempt 1 passes cleanly (`stop_early` from the record,
+   else the board setting, default on) — the timeline says "No more attempts: attempt 1 passed
+   cleanly" and no further copy is ever made. A `hard` job always runs all N. A safety stop stops
+   the rest at once; `len(log) >= n` ends with "All N attempts tried".
+7. **Tests with the fake agent, a different scenario per attempt**: in fake mode the job text may
+   be `{"attempts": [scenario1, scenario2, …]}` and `attempt_job` hands each try its own
+   (`Jobs` runs real jobs in a child process with `JOBBOARD_JAIL=host JOBBOARD_FAKE=1`): every
+   tie-break, early stop, every attempt failing, "Use this one instead", Stop, auto_attempts, and
+   the buttons/routes.
+
+### Verified
+
+- Gate command, exactly as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 791 tests in 284.523s` / `OK`**. Baseline when this run started: **790 tests, OK**.
+  Nothing deleted, skipped or weakened; this run adds 1.
+- This module alone: `cd web && python3 -W ignore -m unittest tests.test_u05_bestofn` →
+  **44 tests OK** (43 before this run). `Pieces` 18 (names, folder-picker, settings, plan, phase
+  tag, record validation, form fields, retry fields, per-attempt scenarios, `status_of`,
+  `tests_passed`, `attempt_of`, **every tie-break in order**, stop-early rules, `prune_old` with a
+  fake clock, the card's three states) · `Git` 7 (own repo/branch, tries never see each other,
+  leftovers committed and packed into a bundle, winner onto `agent/<id>`, a dirty project folder
+  reported not bulldozed, a do-nothing try still gets its branch, per-file sizes) · `Jobs` 9 (hard
+  job keeps the best, early stop, all fail, use-this-one-instead, a missing branch, auto_attempts,
+  the button without the setting, a non-git folder runs once, each try its own conversation) ·
+  `Run` 4 (a try that cannot start, Stop between tries, **a try that came back "stopped" does not
+  start the next one** — this run's fix, a branch that will not come home) · `Pages` 6 (the form,
+  the card, both POST routes, a try that is not there, a bad N).
+- Click-through on a real board at **127.0.0.1:8091** (never 8090; 8080 never touched): a
+  throwaway driver (`/tmp/u05_smoke.py`, not part of the repo) starts `web/jobboard.py` as a child
+  with its own temp `HOME` and state folders, `JOBBOARD_FAKE=1`, `JOBBOARD_JAIL=host`, in a temp
+  git project (`AGENT_CHECKS.json` runs unittest), then presses the real form and buttons over
+  HTTP with the `jb=` cookie. **55 checks, all passing.** Key output:
+
+```
+[ok ] progress shown while running :: ['Attempt 1 of 3', 'Attempt 2 of 3', 'Attempt 3 of 3']
+[ok ] scores recorded :: [('failed', 1, 0), ('passed', 2, 13), ('passed', 2, 2)]
+[ok ] winner is the smallest clean try :: Attempt 3 won: a smaller change.
+[ok ] winner on the job branch in the folder / every try kept on its own branch
+        ['agent/…-c646', 'agent/…-c646-try1', '…-try2', '…-try3']
+[ok ] tries' folders are gone :: ['proj']     each try's checks kept apart     one conversation per try
+[ok ] card: cost note while a try runs :: <p><b>Attempt 3 of 3</b> … (about 3&times; longer)
+[ok ] use this one instead: switch / branch is the job branch / (kept) moved to try 1
+[ok ] all tries fail: job failed, folder left alone, both branches stay, "Nothing was put in the folder…"
+[ok ] button starts a fresh best-of-N job :: (3, False, '20261111-212618-eb06')
+[ok ] stop early: one clean try ends it :: [1]   · only one try folder used
+[ok ] auto_attempts queues a fresh run :: ['20261111-212710-c16b']  · the automatic job is a 2-try job
+[ok ] Stop between tries ends the job :: ('stopped', 2)  · the tries after it never start
+[ok ] Stop: Stopped before all attempts finished. · 'Stopped after attempt 2 of 3: no more tries'
+[ok ] folder picker never lists try folders · Changes card still works for a winner · board log clean
+[ok ] board stopped, port 8091 closed
+```
+
+  The **first** pass through that click-through is what found the bug: the Stop job ended
+  `('failed', 3)` — all three tries had run after Stop — and the timeline carried
+  `Attempt 3 of 3 started` after `Attempt 2 of 3: stopped`. After `52a35a9` the same script ends
+  `('stopped', 2)` with the explanation on the timeline (55/55; two of the earlier failures were
+  the driver's own wrong expectations — the first job really does fix the project, so the later
+  "failing" scenarios had to reset it, and the base repo already had one passing test).
+
+### Try it by hand, click by click
+
+1. `cd web && JOBBOARD_PORT=8091 python3 jobboard.py` (own state folders if you want them apart),
+   open the printed `http://127.0.0.1:8091/?t=…` link. Pressing **Stop** is the same for a hard
+   job as for any other.
+2. Home page: tick **Hard job: try it 3 times**, set **Times** (2-4), pick the folder, describe the
+   job. The words under the box say what it costs: a fresh copy each time, one after another,
+   about 3× longer, best try kept, branches for 7 days. A hard job on a **non-git** folder says so
+   and just runs once.
+3. While it runs the banner action line reads `Attempt 2 of 3 - Running checks`, the job list says
+   the same, and the **Attempts** card shows **Attempt 2 of 3** with the cost note. Stop now and
+   the rest of the tries never start.
+4. When it ends the card has one row per try: result (checks failed / passed / needs review /
+   safety stop / stopped), tests passing and test files touched, `N files, M lines` (opens to the
+   file list with +/-), minutes, its branch, and the kept one marked **(kept)**. Above the table
+   one line says who won and why, in words.
+5. **Use this one instead** on another row: confirm, and the folder switches to that try's work —
+   `git -C ~/agent-work/<folder> rev-parse --abbrev-ref HEAD` stays `agent/<job id>`, now at that
+   try's commit; the Changes card, the review bundle and the Decide buttons follow it. Press it on
+   a try that is not in the list and the card just says so.
+6. A job that ended **Failed after fix rounds** shows **Try 3 fresh attempts**; pressing it starts
+   a new job (a follow-up of the first) that is best-of-3 and not marked hard, so a clean first
+   try stops the rest. With `auto_attempts: true` in `state/agentjobs-settings.json` that press
+   happens by itself, and the first job's timeline records it.
+7. In the project folder: `git branch --list 'agent/*'` shows `agent/<job id>` (the kept try) plus
+   `agent/<job id>-try1…k`. Old jobs' `-try` branches are deleted once they are 7 days past, the
+   next time a best-of-N job runs in that folder.
+
+### Unfinished / assumed
+
+- **Nothing of upgrade 5 is unfinished** — all six requirements are implemented and tested, and
+  the feature was clicked end to end on 8091.
+- Two deliberate departures from the spec's wording, both forced by the jail and recorded in
+  `attempts.py`'s docstring: a try is **a full clone of the base commit in its own `~/agent-work`
+  folder**, not a git worktree (reasoning above), and the attempts live on an **Attempts card on
+  the job page**, not a separate tab — this board has no tabs; every upgrade adds a card there.
+- **The podman path was not exercised here** — this sandbox has no `podman` and no `bwrap`, so
+  every test and the 8091 copy run with `JOBBOARD_JAIL=host`. On the live board the same calls go
+  through `jail/run-local.sh`: the attempt's `checkout -B`, its checks and the winner's
+  `apply_winner` run inside the jail; the host only does `clone --no-checkout` and
+  `fetch <bundle>`, both with `protocol.allow=never` opened for the file transport only. The
+  first real hard job is worth watching once for two things: that `agent --in <folder>-try1-<id4>`
+  is accepted (it is a plain top-level `~/agent-work` name, ≤ 64 chars, matching `FOLDER_RE`) and
+  that the bundle fetch lands (if it ever fails, the note on the card says which try and where its
+  copy is left).
+- **No real agent and no model here**: every attempt in the tests and the 8091 run is the fake
+  agent, so "the usual checks, fix rounds and watchdog" are proven wired, not proven against a
+  thinking agent. The ranking numbers come from `verify` and from git, so a real agent only
+  changes the values.
+- Board-level `attempts` / `stop_early` / `auto_attempts` have **no settings page** — like
+  `fix_rounds` and the watchdog thresholds, they live in `state/agentjobs-settings.json` (written
+  with the defaults on first start). 4b's project page has its own "Try big tasks (and ones that
+  failed before) 3 times" tick, which is how a queue task becomes best-of-N (with `hard=False`, so
+  stop-early applies).
+- The 7-day prune runs when the next best-of-N job starts in that folder, not on a timer — an old
+  `-try` branch of a folder that never runs again stays until some later hard job clears it. A
+  try whose branch could not be brought home keeps its folder in `~/agent-work` on purpose, and the
+  card names the folder; nothing deletes a folder it did not make.
+- A finished best-of-N job has **no checkpoint list of its own**: checkpoints were taken in the
+  try copies, which are gone, so the record clears `checkpoints` and the Checkpoints card stays
+  empty for it. Upgrade 8 picks the branch by `agent/<id>` for such a job (tested in
+  `test_u08_decide.py`).
+- "about 3× longer" is a plain-language warning on the form, not a measured estimate; a real
+  estimate per task would want the task's own history (4b's queue already multiplies its minutes by
+  the number of tries).
+- No network, no installs, stdlib only. `~/agent-sandbox` untouched — the tests and the 8091 copy
+  use their own `HOME`, and the throwaway state folders under `/tmp/u05-smoke-*` were left there
+  for inspection only. Nothing was pushed; the branch `agent/jobboard-next` is ready for Jason to
+  review, push and merge.

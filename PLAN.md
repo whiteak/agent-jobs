@@ -762,32 +762,70 @@
   `fetch <bundle>`, and the working trees are built inside the jail so no agent-planted filter
   ever runs on the host).
 
+### What this run found on top of that plan (re-run, 12 Nov)
+
+- The run that wrote the plan above got as far as the code and its tests — `2903bb7`
+  (`web/attempts.py` + the `jobboard.py` hooks), `7520a60` (branches come home even when a try
+  changed nothing; only a clean winner is checked out; 38 tests) and `54feb77` (the phase tag and
+  the stopped/failed endings, left uncommitted). It stopped before ticking anything, before the
+  port-8091 click-through and before its AGENT_REPORT.md section. Nothing needed rebuilding: this
+  run clicked the feature and fixed what the clicking found.
+- Two baselines were wrong on the way here. The plan says "382 tests, OK"; the shared copy was at
+  **790** (jobs 01-11 landed in between), and `test_u05_bestofn.py` is at **44** tests, not 38 —
+  this run's Stop fix adds the 44th, so the suite is green at **791**.
+- One real bug, found by clicking the page and reading the record afterwards (`52a35a9`): **Stop
+  did not stop the tries**. Pressing Stop while an attempt ran ended that try (its row said
+  "stopped"), but `run_best_of_n` only looked for status `stopping`, and `run_agent_job` has
+  already written `stopped` by the time the loop looks — so attempt 3 of 3 started after Jason had
+  stopped the job. `stop_pressed()` accepts `stopping`/`cancelled`/`stopped`/`interrupted` and is
+  checked after every try and again before the next one; the timeline now says why the rest were
+  skipped. The same click-through showed the card claiming "No more attempts: attempt 3 passed
+  cleanly" when the tries had simply run out and none passed — a hard job now ends with
+  "All 3 attempts tried".
+- Two places where the implementation deliberately differs from the words of the spec, both
+  because of the jail (recorded in `attempts.py`'s docstring and in the report):
+  - "its own git worktree" → **a full clone of the base commit** in its own `~/agent-work` folder.
+    The jail mounts exactly one folder and `agent --in` only takes a top-level `~/agent-work`
+    name, and a worktree's git dir stays in the main repo — invisible inside the container, so git
+    in the sandbox would break. Same base commit, own repo, own branch: an attempt still can only
+    ever see its own copy.
+  - "an Attempts tab" → an **Attempts card** on the job page (the board has no tabs; every
+    upgrade's information is a card there: Review bundle, Decide, Checks, Checkpoints, Changes).
+
 ### Steps
 
-- [ ] Commit job 05's leftover ntfy work as-is (its own commit) so this job's commits stay clean.
-- [ ] `web/attempts.py` (new glue): settings keys (`attempts` 2-4 default 3, `stop_early` on,
+- [x] Commit job 05's leftover ntfy work as-is (its own commit, `d04d5ab`) so this job's commits
+      stay clean.
+- [x] `web/attempts.py` (new glue): settings keys (`attempts` 2-4 default 3, `stop_early` on,
       `auto_attempts` off), record fields + plan, attempt folder/branch names, and the git
       plumbing: clone the base commit into its own folder, branch `agent/<id>-try<k>`, save
       leftover edits, bring the branch back through a bundle, `apply_winner` (job branch
       `agent/<id>`), `prune_old` (7 days) — all through SafeGit, working trees inside the jail.
-- [ ] Scores: turn one finished attempt into a `bestofn.Attempt` (status, tests passing, test
+- [x] Scores: turn one finished attempt into a `bestofn.Attempt` (status, tests passing, test
       files changed, diff lines, seconds, needs-review issues) + the file list for the page;
       rank with `bestofn.pick_winner`/`why`, stop early with `bestofn.should_continue`.
-- [ ] `run_best_of_n`: attempts one after another in the worker (one GPU), phase
+- [x] `run_best_of_n`: attempts one after another in the worker (one GPU), phase
       "Attempt 2 of 3", per-attempt check logs under `JOBS/<id>/attempts/try-k/checks/…`,
       attempts never resume each other's session, then apply the winner and clear the
-      per-attempt folders/verify/checkpoints from the record.
-- [ ] `jobboard.py` hooks: `check_record` validation, form fields ("Hard: try 3 times",
+      per-attempt folders/verify/checkpoints from the record. Re-run: Stop now really stops the
+      run (`stop_pressed`), and the timeline says which way it ended ("All 3 attempts tried" vs
+      "No more attempts: attempt 1 passed cleanly" vs "Stopped after attempt 2 of 3").
+- [x] `jobboard.py` hooks: `check_record` validation, form fields ("Hard job: try it 3 times",
       2-4, "about 3× longer"), `run_agent_job(..., fresh_log=)`, `JobCtx` per-attempt checks
-      dir, `folders()` hides attempt folders, the auto "try fresh attempts" setting.
-- [ ] UI: the Attempts card on the job page (every attempt's scores, changes and branch, cost
+      dir, `folders()` hides attempt folders, the auto "try fresh attempts" setting
+      (`maybe_auto_attempts`, off by default).
+- [x] UI: the Attempts card on the job page (every attempt's scores, changes and branch, cost
       note), "Use this one instead", "Try 3 fresh attempts" on a job that failed after fix
-      rounds, and their POST routes.
-- [ ] `web/tests/test_u05_bestofn.py`: unit tests for names/settings/plan, scores + every
+      rounds, and their POST routes (`/use-attempt/<id>`, `/try-hard/<id>`).
+- [x] `web/tests/test_u05_bestofn.py`: unit tests for names/settings/plan, scores + every
       tie-break, early stop, all-attempts-fail, clone/branch/bundle/apply/prune on a real temp
       repo, and fake-agent runs (hard job with 3 different scenarios, early stop, all fail +
-      "Use this one instead", the buttons/routes).
-- [ ] Full suite passes with the gate's command; AGENT_REPORT.md section for this job.
+      "Use this one instead", the buttons/routes). 44 tests; the re-run adds
+      `test_a_try_that_came_back_stopped_does_not_start_the_next_one`.
+- [x] Full suite passes with the gate's command; click the pages on a copy of the board on
+      127.0.0.1:8091 (never 8090). (791 tests OK; 55 checks clicked on 8091, all passing — the
+      first two passes through the click-through are what found `52a35a9`.)
+- [x] AGENT_REPORT.md section for this job.
 
 ---
 
