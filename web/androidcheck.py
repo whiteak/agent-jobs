@@ -109,6 +109,11 @@ def check_ok(entry) -> bool:
             if isinstance(v, str):
                 if len(v) > 200 or "\x00" in v:
                     return False
+                # U06b: a text step is typed on the phone through `adb shell input text`, so
+                # a shell metacharacter in it is a command on the device. It never gets as
+                # far as the job record.
+                if k == "text" and not android.TEXT_RE.match(v):
+                    return False
             elif isinstance(v, (list, tuple)):
                 if len(v) != {"tap": 2, "swipe": 4}.get(k, len(v)) or not all(
                         isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 100000 for x in v):

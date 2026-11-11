@@ -257,6 +257,63 @@ class Engine(DeviceCase):
             self.assertIsNone(words, bad)
             self.assertTrue(why, bad)
 
+    def test_a_text_step_is_only_ever_typed(self):
+        """Plain text still works, and so does everything a normal field accepts."""
+        for ok in ("buy milk", "hello@example.com", "what is this", "50% off", "a/b-c.d:e+f",
+                   "Item 1", "42", "price: 3.50", "^ _ - = ,"):
+            words, why = ad.step_words({"text": ok})
+            self.assertEqual(words, ["input", "text", ok.replace(" ", "%s")], (ok, why))
+            self.assertEqual(why, "")
+
+    def test_text_that_the_phone_would_run_is_refused(self):
+        """# U06b: adb joins the words of `adb shell` and the PHONE's shell parses them, so a
+        text step holding shell metacharacters is a command on the device. Every one the
+        review named is refused, and step_words says why."""
+        for bad in ("a; pm uninstall com.example.app", "a | ls", "a & bg", "$(reboot)",
+                    "`id`", "a(b)", "a<b", "a>c", "a\\b", 'say "hi"', "it's", "a\nb",
+                    "a*b", "a?b", "a~b", "a#b", "a!b", "a{b}", "a[b]"):
+            words, why = ad.step_words({"text": bad})
+            self.assertIsNone(words, bad)
+            self.assertTrue(why, bad)
+        self.assertIsNone(ad.TEXT_RE.match("a; pm uninstall x"))
+        for ch in ad.SHELL_META:
+            self.assertTrue(ad.SHELL_META_RE.search("x" + ch + "y"), repr(ch))
+        self.assertIsNone(ad.SHELL_META_RE.search("buy milk, 100% - ok"))
+
+    def test_the_shell_guard_never_sends_a_dangerous_word_to_adb(self):
+        """Every value that goes through `adb shell` is checked at one place, whatever
+        produced it - a check step, a package name or a device that answers badly."""
+        self.scenario(devices=["d"])
+        adb = self.adb("d")
+        for words in (("input", "text", "a; pm uninstall x"), ("pidof", "com.x; reboot"),
+                      ("am", "start", "-W", "-n", "com.x/com.$(reboot)"), ("logcat", "-d`id`")):
+            rc, out, err = adb.shell(*words)
+            self.assertNotEqual(rc, 0, words)
+            self.assertIn("the phone's shell would run", err)
+        self.assertEqual(self.calls(), [])               # nothing of that ever reached adb
+        self.assertIn("refused", "\n".join(adb.log))
+        adb2 = self.adb("d")                             # a normal command still goes through
+        self.assertEqual(adb2.shell("pidof", "com.example.app")[0], 0)
+        self.assertEqual(self.calls(), ["-s d shell pidof com.example.app"])
+
+    def test_a_package_name_the_device_invents_never_goes_back_into_the_shell(self):
+        self.scenario(devices=["d"], packages=["com.x; reboot", "com.example.app"])
+        self.assertEqual(ad.package_list(self.adb("d")), {"com.example.app"})
+
+    def test_a_dangerous_text_step_is_never_sent_to_the_device(self):
+        self.scenario(devices=["d"], installed=["com.example.app"])
+        bad = ("a; pm uninstall com.example.app", "$(reboot)", "id > /sdcard/x")
+        cap = ad.capture(self.project(), {"steps": [{"text": bad[0]}, {"text": bad[1]},
+                                                     {"text": "buy milk"}, {"text": bad[2]}]},
+                         adb_path=str(FAKE_ADB), serial="d")
+        seen = self.device_saw()
+        for never in ("uninstall", "reboot", "/sdcard"):
+            self.assertNotIn(never, seen)
+        self.assertIn("shell input text buy%smilk", seen)     # the safe one is still typed
+        self.assertEqual([s["error"] for s in cap["steps"]],
+                         [ad.step_words({"text": t})[1] for t in (bad[0], bad[1])]
+                         + [None, ad.step_words({"text": bad[2]})[1]])
+
 
 # ------------------------------------------------------------------ android-smoke
 
@@ -484,6 +541,10 @@ class Record(unittest.TestCase):
                     {**self.SCREEN, "device": "one two"}, {**self.SCREEN, "device": "x" * 200},
                     {**self.SCREEN, "steps": [{"shell": "ls"}]}, {**self.SCREEN, "steps": "tap it"},
                     {**self.SCREEN, "steps": [{"tap": [1, 2, 3]}]},
+                    # U06b: a text step is typed through the phone's shell, so a step that
+                    # would run something there is not a check at all
+                    {**self.SCREEN, "steps": [{"text": "a; pm uninstall x"}]},
+                    {**self.SCREEN, "steps": [{"text": "$(reboot)"}]},
                     {**self.SCREEN, "votes": 9}, {"name": "n", "type": "vision",
                                                   "target": "android", "spec": "x" * 5000}):
             self.assertFalse(androidcheck.check_ok(bad), bad)

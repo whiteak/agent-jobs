@@ -3,8 +3,11 @@
 The board's screen check (6a) needs a picture; for an Android app the picture comes from a
 device. Everything here is a plain function over one `Adb` object that turns an argv list
 into (exit code, stdout bytes, stderr text): the board injects the real subprocess call and
-the tests put a fake adb script on PATH. No shell is ever used, so a path or a step that
-came out of a project file can only ever be one argument of a fixed command.
+the tests put a fake adb script on PATH. No shell is used on THIS machine, so a path or a
+step that came out of a project file can only ever be one argument of a fixed command.
+`adb shell` is the one exception: adb joins its words with spaces and the phone runs them
+through /system/bin/sh, so everything that goes through `Adb.shell` has to be text that
+shell would take literally - see SHELL_META.
 
 Why adb runs on the host and not inside the job jail: jail/podman-local.sh starts every job
 container with `--network none` and no USB, so a container has no way to reach a device.
@@ -53,9 +56,17 @@ NO_APK = "APK not built - there is no debug APK under app/build/outputs/apk/debu
 NOT_FILLED = "the device was never chosen for this check"
 
 PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,120}(\.[A-Za-z][A-Za-z0-9_]{1,120}){1,10}$")
-COMP_RE = re.compile(r"^[A-Za-z0-9_.]{1,260}/[.$A-Za-z0-9_]{1,260}$")
+COMP_RE = re.compile(r"^[A-Za-z0-9_.]{1,260}/[A-Za-z0-9_.]{1,260}$")
 KEY_RE = re.compile(r"^(KEYCODE_[A-Z0-9_]{1,30}|[0-9]{1,3})$")
-TEXT_RE = re.compile(r"^[ -~]{1,200}$")
+
+# What `adb shell` really does: adb joins its arguments with spaces and hands the result to
+# /system/bin/sh ON THE PHONE, so a word holding one of these would be run on the device
+# (`{"text": "a; pm uninstall x"}` or `{"text": "$(reboot)"}` are commands, not typing).
+# SHELL_META is the list the review asked for; TEXT_RE is what is left of plain printable
+# ASCII once they are gone, so a step's text can only ever be typed into a field.
+SHELL_META = ";|&$`()<>\"'\\*?~#!{}[]" + "\n\r\t"
+SHELL_META_RE = re.compile("[" + re.escape(SHELL_META) + "]")
+TEXT_RE = re.compile(r"^[A-Za-z0-9 %,.:/=+@^_-]{1,200}$")
 
 
 def find_adb(extra: str = "") -> str:
@@ -122,6 +133,15 @@ class Adb:
         return rc, out or b"", (err or b"").decode("utf-8", "replace")
 
     def shell(self, *words, **kw):
+        """`adb shell ...`. adb joins these words with spaces and the PHONE's /system/bin/sh
+        parses what comes out, so a word holding `;` `|` `$` a quote or a backtick is a
+        command on the device, not an argument. Every caller validates what it passes; this
+        is the last line of defence: the command is refused, never sent."""
+        for w in words:
+            if SHELL_META_RE.search(str(w)):
+                bad = str(w)[:80]
+                self.note('(refused: "%s" holds a character the phone\'s shell would run)' % bad)
+                return 126, b"", ("refused: %s holds a character the phone's shell would run\n" % bad)
         return self.call(["shell"] + list(words), **kw)
 
     def time_left(self) -> float:
@@ -201,13 +221,15 @@ def find_apk(project, rel: str = ""):
 # ---------------------------------------------------------------- install and start
 
 def package_list(adb: Adb) -> set:
-    """Third-party packages on the device (the ones an install can add)."""
+    """Third-party packages on the device (the ones an install can add). What the device
+    reports goes back into `adb shell` later (force-stop, pidof, resolve-activity), so a
+    name that is not a package name is dropped here rather than sent back to the phone."""
     rc, out, err = adb.shell("pm", "list", "packages", "-3", timeout=LOG_TIMEOUT)
     if rc != 0:
         return set()
     text = (out or b"").decode("utf-8", "replace")
-    return {l.strip()[len("package:"):] for l in text.splitlines()
-            if l.strip().startswith("package:")}
+    return {name for name in (line.strip()[len("package:"):] for line in text.splitlines()
+                              if line.strip().startswith("package:")) if PKG_RE.match(name)}
 
 
 def gradle_app_id(project) -> str:
@@ -366,7 +388,9 @@ def step_words(step):
     if "text" in step:
         text = str(step["text"] or "")
         if not TEXT_RE.match(text):
-            return None, "text must be plain printable characters (up to 200)"
+            return None, ("text may only be letters, numbers and plain punctuation - never a "
+                          "character the phone's shell would run (; | & $ quotes ` ( ) < > "
+                          "* ? # ! { } [ ]), up to 200 of them")
         return ["input", "text", text.replace(" ", "%s")], ""
     if "key" in step or "keyevent" in step:
         key = str(step.get("key") if "key" in step else step.get("keyevent")).strip()
