@@ -1,6 +1,73 @@
-# Job 07 — Upgrade 4a: requirements → plan
+# Job 08 — Upgrade 4b: run the approved plan as a queue
 
 ## Findings
+
+- Server + pages: `web/jobboard.py` (2160 lines). `main()` starts `worker()` +
+  `ThreadingHTTPServer` on `127.0.0.1:PORT`; routes in `H.do_GET`/`H.do_POST` behind `H.guard()`.
+  Jobs run ONE at a time: `worker()` waits for a queued record and calls `process_job(name)`
+  (safety `check_record` → jail self-test → `record_git_start` → `freeze_checks` →
+  `run_planned` → follow-ups → notify → review bundle). A finished job can queue the next one
+  from the worker thread (`maybe_auto_attempts`, `planning.plan_finished` → `new_job(...)`),
+  which is exactly how a task queue advances.
+- 4a already did the plan side: `web/planning.py` (project records `PLANS/<folder>.json`,
+  `create_folder` = git init on `agent/<folder>` + first commit, the planner job,
+  `read_tasks`/`validate`/`approve` — the APPROVED tasks are copied into the record outside the
+  sandbox — plan review page with Save/Approve). `H.plan_edit` is where "Approve plan" lands.
+- Given logic (use, don't rewrite): `agentjobs_upgrades/plan.py` — `order()` (stable Kahn),
+  `job_prompt(outline_summary, milestone_text, task)` (the 4b task prompt: outline + milestone +
+  task + acceptance + "Read AGENT_NOTES.md first… add 2-5 lines"), and `Queue`
+  (`load_plan`, `recover`, `set_cutoff`, `next_task`, `mark` with on_fail stop/skip,
+  `progress`), already unit-tested in `tests/test_rest.py`.
+- U05 (`web/attempts.py`): `run_best_of_n` is reached from `run_planned` whenever the record
+  carries `attempts` (2-4) — so a queue task gets best-of-N by setting `attempts` in its
+  record; `MIN_N`/`MAX_N`/`DEFAULT_N` are the bounds; `phase_tag` keeps the banner honest.
+- Board git on a project folder always goes through `safegit.SafeGit` wrapped in that folder's
+  own jail (`upgrades.make_wrap(root, folder, "agentgit-…")` → `jail/run-local.sh sandbox-run`);
+  `upgrades.HOST_MODE` (`JOBBOARD_JAIL=host`) is how the tests run it on temp folders.
+- Fake agent for tests: hidden mode `fake` (`JOBBOARD_FAKE=1`), job text = a scenario JSON
+  (`{"rounds": [[write/say/tick/cmd/run/exit…]]}`), so a queued task in a test needs its prompt
+  swapped for a scenario — `tests/test_u04a_plan.py::DRIVER` already does that and keeps the real
+  prompt in a file, which is how the 4b prompt gets asserted end-to-end.
+- State must live outside anything the sandbox mounts (the agent can write anything in
+  `WORK/<folder>`): 4a added `PLANS`; 4b adds `QUEUES = state/queues/<folder>.json`
+  (env `JOBBOARD_QUEUES`), holding the `plan.Queue` state file.
+- Test command (`AGENT_CHECKS.json`): `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore
+  -m unittest discover -s tests`. Baseline before my changes: **478 tests, OK** (job 07 left its
+  PLAN.md uncommitted in this shared copy; committed as-is first).
+
+## Steps
+
+- [x] Commit job 07's leftover PLAN.md as-is (its own commit) so this job's diffs stay clean.
+- [x] `web/taskqueue.py` (new glue, `# U04b`): the queue file `QUEUES/<folder>.json` built from
+      the APPROVED tasks (`plan.Queue`, dependency order, nothing runs until started); the task
+      prompt (10-line outline summary + its ROADMAP.md milestone + task + acceptance via
+      `plan.job_prompt`); `start_next` (one job, in the project folder, task checks, best-of-N
+      for size M or a task that already failed when the project has it on, resume for a retried
+      task, AGENT_NOTES.md hash taken before it runs, base commit recorded, project branch kept);
+      `job_finished` (AGENT_NOTES note in the job record, seconds, end commit, done/failed/
+      interrupted, on_fail stop vs skip, then the next task); `startup` recovery; the time-left
+      estimate; the project-page card (milestone progress, current task, Pause/Resume/Cancel,
+      "Don't start new tasks after", on-fail choice, failed/skipped shown).
+- [x] `jobboard.py` hooks: `QUEUES`, `check_record` validation for the task fields, `worker()`
+      startup (interrupted job records + `taskqueue.startup`), `taskqueue.job_finished` in
+      `process_job`, the card on the project and plan pages, `POST /queue/<folder>`,
+      project-record settings (which agent runs tasks, best-of-N on/off).
+- [ ] `web/tests/test_u04b_queue.py`: queue from an approved plan, prompt content, best-of-N rule,
+      notes check, estimate, milestone progress, stop vs skip, cutoff, restart recovery, the
+      branch keeping, the card HTML, the routes — plus fake-agent runs through `process_job`
+      (dependency order + chained commits, checks of a task, a failure that stops vs skips, the
+      "don't start after" time, and the notes note in the job record).
+- [ ] Full suite passes with the gate's command; smoke-serve the board on a free port (never
+      8090) and click the queue with curl.
+- [ ] AGENT_REPORT.md section for this job.
+
+---
+
+## Plan left by the previous job (Upgrade 4a: requirements → plan) — kept verbatim so nothing is lost
+
+## Job 07 — Upgrade 4a: requirements → plan
+
+### Findings
 
 - Server + pages: `web/jobboard.py` (2022 lines). `main()` starts `worker()` +
   `http.server.ThreadingHTTPServer` on `127.0.0.1:PORT` (`jobboard.PORT`, env `JOBBOARD_PORT`);
@@ -46,7 +113,7 @@
   -m unittest discover -s tests`. Baseline before my changes: **425 tests, OK** (job 06's
   leftover best-of-N work was left uncommitted in this shared copy; committed as-is first).
 
-## Steps
+### Steps
 
 - [ ] Commit job 06's leftover work as-is (its own commit) so this job's diffs stay clean.
 - [ ] `prompts/planner.md` (repo root): the planner prompt with `{{NAME}} {{KIND}} {{FOLDER}}

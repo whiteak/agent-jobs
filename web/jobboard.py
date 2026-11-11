@@ -26,6 +26,7 @@ import diffview   # U07b: what the job changed (git in the jail, parsed diffs)
 import notifycfg  # U09b: phone alerts (ntfy) - settings page, events, quiet hours
 import attempts   # U05: best-of-N for hard steps (fresh copies, ranking, Attempts card)
 import planning   # U04a: an outline -> a plan of milestones and tasks to check before anything runs
+import taskqueue  # U04b: an approved plan runs as a queue of tasks, one job at a time
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -62,6 +63,11 @@ NOTIFY_FILE = Path(os.environ.get("JOBBOARD_NOTIFY") or (SANDBOX / "state" / "no
 # records these live outside anything the sandbox mounts, so a planner can never approve its
 # own plan or move a plan onto another folder.
 PLANS = Path(os.environ.get("JOBBOARD_PLANS") or (SANDBOX / "state" / "plans"))
+# U04b: the task queue of an approved plan (which task is running, which failed or was skipped,
+# what to do when one fails, the "don't start new tasks after" time). Same rule as the job and
+# project records: outside everything the sandbox mounts, so an agent cannot mark its own task
+# done or skip the tasks after it.
+QUEUES = Path(os.environ.get("JOBBOARD_QUEUES") or (SANDBOX / "state" / "queues"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # Bench auto-runs. Run data lives OUTSIDE the sandbox-visible folders; the worker
@@ -178,6 +184,15 @@ def check_record(name, m):
         if m.get(key) is not None and (isinstance(m[key], bool) or not isinstance(m[key], int)
                                        or not 0 <= m[key] <= 3):
             return key
+    tid = m.get("task_id")                                  # U04b: a task of an approved plan
+    if tid is not None and (not isinstance(tid, str) or not taskqueue.TASK_ID_RE.fullmatch(tid)):
+        return "task_id"
+    tt = m.get("task_try")
+    if tt is not None and (isinstance(tt, bool) or not isinstance(tt, int) or not 1 <= tt <= 9):
+        return "task_try"
+    nb = m.get("notes_before")
+    if nb is not None and (not isinstance(nb, str) or len(nb) > 80):
+        return "notes_before"
     if m.get("mode") == upgrades.FAKE_MODE:
         try:
             json.loads(job)
@@ -199,11 +214,18 @@ def new_job(mode, folder, job, offline, resume=None, parent=None, extra=None):
     with queue_cv: queue_cv.notify()
     return m
 
-def worker():
-    # Mark jobs that were running when the board last stopped.
+def mark_interrupted():
+    """Mark jobs that were running when the board last stopped."""
     for name, m in all_job_dirs():
         if m.get("status") == "running":
             m.update(status="interrupted", finished=time.time()); save_meta(m, name)
+
+def worker():
+    mark_interrupted()
+    try:   # U04b: a plan task that was running starts again from where its job left the folder
+        taskqueue.startup(QUEUES, queue_ctx())
+    except Exception:
+        pass
     while True:
         phone_model_check()   # U09b: tells the phone when the model server goes away
         with queue_cv:
@@ -280,6 +302,10 @@ def process_job(name):
     try:   # U04a: a planning job's plan is checked here; an unusable one goes back once, by itself
         planning.plan_finished(m, plans=PLANS, work=WORK, new_job=new_job,
                                session_of=session_of, job_dir=job_dir)
+    except Exception:
+        pass
+    try:   # U04b: the queue records this task (and whether it left its lessons) and queues the next
+        taskqueue.job_finished(m, queue_ctx())
     except Exception:
         pass
     try:
@@ -661,6 +687,15 @@ def phone_model_check():
         notifycfg.model_check(NOTIFY_FILE, lambda: basalt_status() == "loaded")
     except Exception:
         pass
+
+def queue_ctx():
+    """U04b: the board's tools handed to taskqueue in one bundle (taskqueue never imports
+    jobboard, so this is the only place the two are tied together)."""
+    return dict(queues=QUEUES, plans=PLANS, work=WORK, new_job=new_job, update=update_meta,
+                load=load_meta, session_of=session_of, job_dir=job_dir, busy=folder_busy,
+                modes=MODES, settings=lambda: upgrades.load_settings(SETTINGS_FILE, write_defaults=False),
+                default_mode=next((k for k in MODES if k != upgrades.FAKE_MODE), "local-qwen"),
+                stop=lambda jid: threading.Thread(target=stop_job, args=(jid,), daemon=True).start())
 
 def build_review_md(m):
     """Build the review bundle right after an agent job ends and save it to
@@ -1500,6 +1535,11 @@ def job_page(jid):
     meta_bits.append(f"created {fmt_time(m['created'])}")
     if m.get("parent") and load_meta(m["parent"]):
         meta_bits.append(f'follow-up to <a href="/job/{m["parent"]}">earlier job</a>')
+    if m.get("task_id"):   # U04b: which task of an approved plan this job is
+        meta_bits.append(f'task {esc(m["task_id"])} of '
+                         f'<a href="/project/{esc(m["folder"])}">{esc(m["folder"])}</a>')
+    if m.get("task_try", 1) > 1:
+        meta_bits.append(f'run {m["task_try"]} of this task')
     meta_line = " &middot; ".join(meta_bits)
     bundle_html = ""
     if m["status"] in ("done", "failed", "stopped", "interrupted", "safety_stop"):
@@ -1521,6 +1561,7 @@ def job_page(jid):
 {upgrades.verify_line_html(s)}
 <div class="cbadges" id="bchecks">{badges.badges_html(m, jid)}</div>
 <div class="bsum{' bad' if s['state'] == 'FAILED' else ''}" id="bsum">{esc(summary)}</div>
+{f'<p class="warn2">{esc(m["notes_note"])}</p>' if m.get("notes_note") else ''}
 <div class="bstats mut" id="bstats">{stats_text(s)}</div>
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
@@ -1738,7 +1779,11 @@ class H(http.server.BaseHTTPRequestHandler):
         elif (q.get("planned") or [""])[0] == "1":
             note = "The planner is working. The plan appears here when it finishes."
         st = planning.plan_state(PLANS, rec, WORK / folder)
-        return self.send(render(header() + planning.project_body(rec, st, mode_opts(), note)))
+        ctx = queue_ctx()                                     # U04b
+        return self.send(render(header() + planning.project_body(rec, st, mode_opts(), note)
+                                + taskqueue.CSS
+                                + taskqueue.card_html(rec, ctx, mode_opts(taskqueue.task_mode(rec, ctx)),
+                                                      taskqueue.NOTES.get((q.get("note") or [""])[0], ""))))
 
     def plan_page(self, folder, q):
         rec = planning.load(PLANS, folder)
@@ -1747,7 +1792,10 @@ class H(http.server.BaseHTTPRequestHandler):
         note = {"1": "Plan saved.", "2": "Plan approved. Nothing runs until you start the tasks."}.get(
             (q.get("ok") or [""])[0], "")
         st = planning.plan_state(PLANS, rec, WORK / folder)
-        return self.send(render(header() + planning.CSS + planning.plan_body(rec, st, st["tasks"], note)))
+        ctx = queue_ctx()                                     # U04b: the same queue card, so the
+        return self.send(render(header() + planning.CSS + planning.plan_body(rec, st, st["tasks"], note)
+                                + taskqueue.CSS
+                                + taskqueue.card_html(rec, ctx, mode_opts(taskqueue.task_mode(rec, ctx)))))
 
     def project_edit(self, folder, form):
         """The project page's two buttons: Save the outline, or Make a plan."""
@@ -1806,6 +1854,7 @@ class H(http.server.BaseHTTPRequestHandler):
             errs = planning.approve(PLANS, rec, root, tasks)
             if errs:
                 return shown(errs, tasks, "The plan was not approved.", code=400)
+            taskqueue.create(QUEUES, rec)   # U04b: the approved tasks become a queue (still nothing runs)
             return self.redirect(f"/plan/{folder}?ok=2")
         if form.get("save"):
             errs = planning.validate(tasks)
@@ -1969,6 +2018,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.project_edit(parts[2], form)
         if len(parts) == 3 and parts[:2] == ["plan", "edit"]:      # U04a: the plan review page
             return self.plan_edit(parts[2], form)
+        if len(parts) == 2 and parts[0] == "queue" and planning.load(PLANS, parts[1]):   # U04b
+            return self.redirect(f"/project/{parts[1]}?note={taskqueue.action(parts[1], form, queue_ctx())}")
         if len(parts) == 2 and parts[0] == "followup" and load_meta(parts[1]):
             prev = load_meta(parts[1]); job = get("job")
             if not job or not prev.get("session") or prev["status"] in ("queued", "running", "stopping"):
