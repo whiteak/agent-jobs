@@ -128,7 +128,7 @@ def check_record(name, m):
         return "parent"
     return None
 
-def new_job(mode, folder, job, offline, resume=None, parent=None):
+def new_job(mode, folder, job, offline, resume=None, parent=None, extra=None):
     jid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
     job_dir(jid).mkdir(parents=True)
     (WORK / folder).mkdir(parents=True, exist_ok=True)
@@ -136,6 +136,7 @@ def new_job(mode, folder, job, offline, resume=None, parent=None):
     m = {"id": jid, "mode": mode, "folder": folder, "job": job, "offline": offline, "status": "queued",
          "created": time.time(), "started": None, "finished": None, "exit": None,
          "resume": resume, "parent": parent, "session": None}
+    m.update(extra or {})   # JAIL: e.g. fetch_first
     save_meta(m)
     with queue_cv: queue_cv.notify()
     return m
@@ -188,6 +189,16 @@ def process_job(name):
         except Exception:
             pass
         return True
+    if m.get("fetch_first") is True:   # JAIL: download packages first (separate sandbox, no AI)
+        m.update(status="running", started=time.time(), fetch_result="downloading"); save_meta(m, name)
+        rc = jailcfg.run_fetch_sync(m["folder"], job_dir(name) / "fetch.log")
+        m = load_meta(name) or m
+        m["fetch_result"] = "OK" if rc == 0 else f"failed (exit {rc}, see fetch.log)"
+        if m.get("status") == "stopping" or rc != 0:
+            m.update(status="stopped" if m.get("status") == "stopping" else "failed", finished=time.time(),
+                     fail_note=None if m.get("status") == "stopping" else "Download packages failed - see the Packages card")
+            save_meta(m, name); return False
+        save_meta(m, name)
     if jailcfg.is_local(m):   # JAIL: prove the sandbox is tight before a local job starts
         ok, out = jailcfg.selftest()
         (job_dir(name) / "sandbox-check.txt").write_text(out + "\n")
@@ -1004,8 +1015,9 @@ def home_page():
 <input type="text" name="newfolder" placeholder="New folder name, e.g. my-app" style="margin-top:6px"></div></div>
 <label>Job</label><textarea name="job" required placeholder="Describe the job the way you would to Claude. Example: Clone https://github.com/... into this folder, add a dark mode toggle to the settings screen, and build a debug APK."></textarea>
 {jailcfg.OFFLINE_FIELD}
+{jailcfg.FETCH_FORM_FIELD}
 <p class="hint">Jobs run one at a time. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
-<button>Start job</button></form></div>{jailcfg.OFFLINE_JS}
+<button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
 <div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
 <script>
 (function(){{
@@ -1095,7 +1107,7 @@ def job_page(jid):
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}<div class="card"><h2>Activity</h2><details id="det"><summary class="hint">Show details</summary><div class="feed" id="feed"><span class="mut">Waiting for the agent...</span></div></details></div>
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 <div class="card"><h2>Changes</h2><pre id="git" class="mut">Loading...</pre></div>
@@ -1236,6 +1248,9 @@ class H(http.server.BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:3] == ["api", "bench", "live"]:
             j = bench_live(parts[3])
             return self.send(json.dumps(j), "application/json") if j else self.send_error(404)
+        if len(parts) == 2 and parts[0] == "fetch":   # JAIL: Download packages output
+            body = jailcfg.fetch_page_body(parts[1])
+            return self.send(render(header() + body)) if body else self.send_error(404)
         if len(parts) == 2 and parts[0] == "job" and load_meta(parts[1]):
             jm = load_meta(parts[1])
             if jm.get("kind") == "bench": return self.redirect(f"/bench/run/{jm['id']}")
@@ -1296,7 +1311,8 @@ class H(http.server.BaseHTTPRequestHandler):
             folder = get("newfolder") or get("folder")
             if mode not in MODES or not job or not FOLDER_RE.match(folder or "") or folder == "eval":
                 return self.send(render(header() + '<div class="card bad">Pick a mode, a valid folder name (letters, numbers, dot, dash, underscore) and describe the job. <a href="/">Back</a></div>'), code=400)
-            m = new_job(mode, folder, job, bool(get("offline")) and mode != "supervised")
+            m = new_job(mode, folder, job, bool(get("offline")) and mode != "supervised",
+                        extra={"fetch_first": True} if get("fetch_first") else None)   # JAIL
             return self.redirect(f"/job/{m['id']}")
         if len(parts) == 2 and parts[0] == "followup" and load_meta(parts[1]):
             prev = load_meta(parts[1]); job = get("job")
@@ -1306,6 +1322,13 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self.redirect(f"/job/{parts[1]}")
             m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"], parent=prev["id"])
             return self.redirect(f"/job/{m['id']}")
+        if parts == ["fetch"]:   # JAIL: Download packages (form button or job page)
+            folder = get("newfolder") or get("folder")
+            jid = get("job") if JOB_ID_RE.fullmatch(get("job")) and load_meta(get("job")) else None
+            rid = jailcfg.start_fetch(folder, WORK, jid)
+            if not rid:
+                return self.send(render(header() + '<div class="card bad">Pick an existing project folder first. <a href="/">Back</a></div>'), code=400)
+            return self.redirect(f"/fetch/{rid}")
         if len(parts) == 2 and parts[0] == "push" and load_meta(parts[1]):   # JAIL: Push branch button
             pm = load_meta(parts[1])
             if (pm.get("kind") != "bench" and pm["status"] in ("done", "failed", "stopped", "interrupted")

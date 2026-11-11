@@ -111,7 +111,10 @@ supervised)
        --tmpfs /work:rw,mode=1777 -v "$WORK/$folder:/work/$folder"
        -v "$BROKER_DIR:/run/agent-broker"
        -v "$SHIM:/opt/agent/bin/local-claude:ro" -v "$SHIM:/opt/agent/bin/local-qwen:ro"
-       -v "$SHIM:/opt/agent/bin/sandbox-run:ro")
+       -v "$SHIM:/opt/agent/bin/sandbox-run:ro"
+       # JAIL: no JDK in the supervisor, so agent-written Gradle builds can't run next to the
+       # Claude login (build via sandbox-run). Node stays (Claude Code needs it), npm scripts off.
+       --tmpfs /usr/lib/jvm:ro,notmpcopyup -e JAVA_HOME= -e npm_config_ignore_scripts=true)
   cname=() ;;
 esac
 

@@ -1,0 +1,21 @@
+// JAIL: resolve-deps.gradle - harness-owned Gradle init script used by fetch-deps.sh.
+// Adds one task that downloads (resolves) every resolvable dependency configuration in
+// every project, leniently, without compiling or running anything from the project.
+// (Gradle still EVALUATES the project's build scripts to know the dependencies.)
+allprojects {
+    tasks.register("jailResolveAll") {
+        doLast {
+            int ok = 0, bad = 0
+            project.configurations.findAll { it.canBeResolved }.each { c ->
+                try {
+                    c.incoming.artifactView { lenient(true) }.files.files
+                    ok++
+                } catch (Throwable t) {
+                    bad++
+                    println "jail: could not resolve ${project.path}:${c.name}: ${t.message?.readLines()?.first()}"
+                }
+            }
+            println "jail: ${project.path}: resolved ${ok} configurations (${bad} with problems)"
+        }
+    }
+}

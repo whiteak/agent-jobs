@@ -198,3 +198,119 @@ function sync(){const loc=LOCAL.includes(sel.value);
 box.addEventListener('change',()=>{mine=box.checked});sel.addEventListener('change',sync);setTimeout(sync,0);sync();
 })();
 </script>""" % ('["' + '","'.join(LOCAL_MODES) + '"]')
+
+
+# ------------------------------------------------------------------ download packages
+# JAIL (2026-11-11): the AI never gets internet; the harness downloads. jail/fetch-deps.sh
+# runs in a separate container with internet but no logins/model, only the folder + caches.
+
+FETCH = JAIL / "fetch-deps.sh"
+FETCH_RUNS = HOME / "agent-sandbox" / "state" / "fetch-runs"
+FETCH_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
+FOLDER_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_fetch_lock = threading.Lock()
+_fetching = set()                       # folders with a download running
+
+
+def _fmeta(rid):
+    import json
+    try: return json.loads((FETCH_RUNS / rid / "meta.json").read_text())
+    except Exception: return None
+
+
+def _fsave(rid, m):
+    import json
+    p = FETCH_RUNS / rid / "meta.json"; t = p.with_suffix(".tmp")
+    t.write_text(json.dumps(m, indent=1)); t.replace(p)
+
+
+def run_fetch_sync(folder, log_path, timeout=960):
+    """Run fetch-deps.sh, write its output to log_path; returns exit code (or 1)."""
+    with _fetch_lock:
+        if folder in _fetching:
+            Path(log_path).write_text("A download for this folder is already running.\n"); return 1
+        _fetching.add(folder)
+    try:
+        with open(log_path, "wb") as out:
+            r = subprocess.run([str(FETCH), folder], stdin=subprocess.DEVNULL, stdout=out,
+                               stderr=subprocess.STDOUT, timeout=timeout)
+        return r.returncode
+    except Exception as ex:
+        with open(log_path, "a") as f: f.write(f"\n(download failed to run: {ex})\n")
+        return 1
+    finally:
+        with _fetch_lock: _fetching.discard(folder)
+
+
+def start_fetch(folder, work_dir, job_id=None):
+    """Start a download in the background; returns the run id (or None if refused)."""
+    import secrets
+    if not FOLDER_OK.fullmatch(folder or "") or folder == "eval" or not (work_dir / folder).is_dir():
+        return None
+    rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+    (FETCH_RUNS / rid).mkdir(parents=True)
+    m = {"id": rid, "folder": folder, "job": job_id, "status": "running", "started": time.time(),
+         "finished": None, "exit": None}
+    _fsave(rid, m)
+
+    def go():
+        rc = run_fetch_sync(folder, FETCH_RUNS / rid / "output.log")
+        m.update(status="done" if rc == 0 else "failed", finished=time.time(), exit=rc); _fsave(rid, m)
+    threading.Thread(target=go, daemon=True).start()
+    return rid
+
+
+def fetch_runs_for(folder, n=3):
+    if not FETCH_RUNS.is_dir():
+        return []
+    out = []
+    for d in sorted(FETCH_RUNS.iterdir(), reverse=True):
+        m = _fmeta(d.name)
+        if m and m.get("folder") == folder:
+            out.append(m)
+            if len(out) >= n: break
+    return out
+
+
+def fetch_page_body(rid):
+    if not FETCH_ID_RE.fullmatch(rid or ""):
+        return None
+    m = _fmeta(rid)
+    if not m:
+        return None
+    try: out = (FETCH_RUNS / rid / "output.log").read_text(errors="replace")[-60000:]
+    except OSError: out = ""
+    running = m["status"] == "running"
+    state = {"running": "Downloading...", "done": "&#10003; Download OK", "failed": "&#10007; Download failed"}[m["status"]]
+    back = f'<a href="/job/{esc(m["job"])}">Back to the job</a>' if m.get("job") else '<a href="/">Back</a>'
+    refresh = '<meta http-equiv="refresh" content="3">' if running else ""
+    return (f'{refresh}<div class="card"><h2>Download packages: {esc(m["folder"])}</h2>'
+            f'<p><b>{state}</b> &middot; {back}</p>'
+            f'<p class="hint">Runs in a separate sandbox with internet but no logins and no AI, seeing only this folder and the shared '
+            f'package caches. Gradle still reads the project\'s build files to find the packages.</p>'
+            f'<pre>{esc(out) or "Starting..."}</pre></div>')
+
+
+def fetch_card_html(m, jid, readonly=False):
+    if m.get("kind") == "bench":
+        return ""
+    folder = m.get("folder") or ""
+    rows = "".join(f'<li><a href="/fetch/{esc(r["id"])}">{time.strftime("%d %b %H:%M", time.localtime(r["started"]))}</a> '
+                   f'{"running" if r["status"] == "running" else ("OK" if r["status"] == "done" else "failed")}</li>'
+                   for r in fetch_runs_for(folder))
+    log = ""
+    if m.get("fetch_first"):
+        log = f'<p class="mut">This job asked to download packages first: {esc(m.get("fetch_result", "pending"))}.</p>'
+    dis = " disabled" if readonly or m.get("status") in ("running", "stopping") else ""
+    return (f'<div class="card"><h2>Packages</h2><form method="post" action="/fetch">'
+            f'<input type="hidden" name="folder" value="{esc(folder)}"><input type="hidden" name="job" value="{esc(jid)}">'
+            f'<button class="ghost"{dis}>Download packages</button></form>'
+            f'<p class="hint">Local agents have no internet. This downloads the folder\'s Gradle / npm / pip packages into the '
+            f'shared cache (separate sandbox, no logins, no AI), so the next offline job can build.</p>'
+            f'{log}{"<ul>" + rows + "</ul>" if rows else ""}</div>')
+
+
+FETCH_FORM_FIELD = ('<label style="font-weight:400"><input type="checkbox" name="fetch_first"> '
+                    'Download packages before starting (Gradle / npm / pip, in a separate sandbox with internet but no AI)</label>')
+FETCH_FORM_BUTTON = ('<button class="ghost" formaction="/fetch" formnovalidate '
+                     'title="Download the selected folder\'s packages now, without starting a job">Download packages only</button>')
