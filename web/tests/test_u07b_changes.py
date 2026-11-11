@@ -356,6 +356,35 @@ class Collect(unittest.TestCase):
         self.assertEqual(diffview.file_diff(self.m, self.git, "c:" + outside, "src/a.py")["error"],
                          "unknown revision")
 
+    def test_only_the_dot_git_folder_is_a_bad_path_not_every_dot_git_name(self):
+        """# U07b review: ".gitignore", ".gitattributes" and ".github/workflows/x.yml" are
+        ordinary project files. Only .git itself (and what is inside it) is off limits."""
+        for p in (".gitignore", ".gitattributes", ".github/workflows/ci.yml", ".gitlab-ci.yml",
+                  "src/.gitkeep", "a/.gitlab-ci.yml"):
+            self.assertFalse(diffview.bad_path(p), p)
+        for p in (".git", ".git/", ".git/config", ".git//config", "src/.git/hooks/pre-commit"):
+            self.assertTrue(diffview.bad_path(p), p)
+        tmp = Path(tempfile.mkdtemp(prefix="jb7b-dot-"))
+        repo, base = make_repo(tmp)
+        want = {".gitignore": "*.pyc", ".gitattributes": "*.txt text",
+                ".github/workflows/ci.yml": "jobs: none"}
+        for rel, text in want.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text + "\n")
+        m, g = meta_of("u07b-dot", "proj", base), SafeGit(repo)
+        by = {f["path"]: f for f in diffview.summary(m, g, "all")["files"]}
+        for rel, text in want.items():
+            self.assertIn(rel, by, rel)                        # listed like any other file
+            self.assertTrue(by[rel]["shown"], by.get(rel))     # and not hidden
+            d = diffview.file_diff(m, g, "all", rel)
+            self.assertNotEqual(d.get("error"), "bad path", rel)
+            self.assertTrue(d.get("shown"), d)
+            self.assertEqual(d["hunks"][0]["lines"], [["+", None, 1, text]], rel)
+        # the folder itself stays refused, however it is spelled or reached
+        for p in (".git", ".git/", ".git/config", ".git/refs/heads/main",
+                  "src/../.git/config", ".git//config"):
+            self.assertEqual(diffview.file_diff(m, g, "all", p)["error"], "bad path", p)
+
     def test_huge_diff_is_cut_but_still_usable(self):
         """10,000+ changed lines: the JSON stays bounded and the page can still render it
         (the script inserts CHUNK rows at a time)."""

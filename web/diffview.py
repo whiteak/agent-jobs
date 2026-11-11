@@ -382,9 +382,14 @@ def _list(m, git, ref, pf):
 # ---------------------------------------------------------------- one file's diff
 
 def bad_path(p):
-    """Reject anything that could leave the project folder; git paths are repo data."""
+    """Reject anything that could leave the project folder; git paths are repo data.
+
+    Only the .git folder itself is refused - a ".git" path segment, matching the
+    `.git|.git/*` cases in FILE_SCRIPT. A plain startswith(".git") would hide
+    .gitignore, .gitattributes and .github/workflows/x.yml too (# U07b review)."""
     p = str(p or "")
-    return (not p or p.startswith("/") or p.startswith(".git") or ".." in p.split("/")
+    parts = p.split("/")
+    return (not p or p.startswith("/") or ".git" in parts or ".." in parts
             or "\x00" in p or len(p) > 1000)
 
 
