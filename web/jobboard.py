@@ -1078,6 +1078,13 @@ def summarize(inp):
 
 def in_sandbox(folder, script, timeout=60):
     """Run a read-only command on a project folder inside the sandbox (no network)."""
+    if upgrades.HOST_MODE:   # U01 tests only (temp folders, temp HOME without the image)
+        try:
+            r = subprocess.run(["bash", "-c", script], cwd=str(WORK / folder), capture_output=True,
+                               text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            return r.stdout.strip()
+        except Exception as ex:
+            return f"(could not read: {ex})"
     try:
         r = subprocess.run(["podman", "run", "--rm", "--userns=keep-id", "--network", "none", "--cap-drop=ALL",
                             "-v", f"{WORK / folder}:/p:ro", "-w", "/p", "--entrypoint", "bash", IMAGE, "-c", script],
