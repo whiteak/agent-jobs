@@ -1,0 +1,53 @@
+{
+  "model": {
+    "name": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S"
+  },
+  "$version": 4,
+  "ui": {
+    "autoModeAcknowledged": true
+  },
+  "env": {
+    "BASALT_API_KEY": "basalt"
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S",
+        "name": "Qwen3.8 Flash-Next (Basalt)",
+        "description": "Local Basalt server, 128K ctx, int8 KV",
+        "envKey": "BASALT_API_KEY",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "generationConfig": {
+          "contextWindowSize": 262144,
+          "timeout": 600000,
+          "maxRetries": 2,
+          "samplingParams": {
+            "temperature": 1,
+            "top_p": 0.95,
+            "top_k": 20,
+            "max_tokens": 32768
+          },
+          "modalities": {
+            "image": true
+          }
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "memory": {
+    "enableManagedAutoMemory": false,
+    "enableManagedAutoDream": false
+  },
+  "context": {
+    "fileName": [
+      "QWEN.md",
+      "CLAUDE.md",
+      "AGENTS.md"
+    ]
+  }
+}

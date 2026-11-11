@@ -1,0 +1,11 @@
+#!/bin/bash
+# First run: seed the agent's home with default configs (never overwrites your edits).
+mkdir -p "$HOME/.claude" "$HOME/.claude-local" "$HOME/.qwen" /work/.agent-logs
+seed(){ [ -e "$2" ] || cp "$1" "$2"; }
+seed /opt/agent/config/rules.md              "$HOME/.claude-local/CLAUDE.md"
+seed /opt/agent/config/rules.md              "$HOME/.qwen/QWEN.md"
+seed /opt/agent/config/supervisor.md         "$HOME/.claude/CLAUDE.md"
+seed /opt/agent/config/qwen-settings.json    "$HOME/.qwen/settings.json"
+seed /opt/agent/config/claude-local.json     "$HOME/.claude-local/.claude.json"
+git config --global --get user.name >/dev/null || { git config --global user.name "Local Agent"; git config --global user.email "agent@localhost"; git config --global core.autocrlf false; }
+exec "$@"

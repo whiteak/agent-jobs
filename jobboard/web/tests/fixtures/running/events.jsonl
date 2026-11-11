@@ -1,0 +1,4 @@
+Running local-claude unattended. Log: /home/jason/agent-work/.agent-logs/fixture.log
+{"type":"system","subtype":"init","session_id":"s-fixed-4","tools":["Bash","Read"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I will fix the tests now."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cd /work/demo && python3 -m pytest tests/ -q"}}]}}
