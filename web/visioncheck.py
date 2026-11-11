@@ -52,7 +52,8 @@ STEP_ARGS = ("text",)                         # {"type": "#name", "text": "hello
 STEP_MAX = 40
 DRIVER_EOF = "__VISIONSHOT_DRIVER_EOF__"
 OUT_MARK = "VISIONSHOT_JSON"
-WORD = {"pass": "looks right", "fail": "does not look right", "inconclusive": "not sure"}
+WORD = {"pass": "looks right", "fail": "does not look right", "inconclusive": "not sure",
+        "skipped": "no device"}          # U06b: "skipped" = there was no device to check on
 COLOUR = {"pass": "green", "fail": "red", "inconclusive": "yellow"}
 NO_BROWSER = ("Screenshots need a browser: this machine has no Playwright and no Chromium. "
               "Ask Jason to add one to the sandbox image "
@@ -408,10 +409,12 @@ def model_sees_images(url: str = "", timeout: int = 10):
 
 def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str = "",
               emit: Callable = None, capture_fn: Callable = None, call: Callable = None,
-              votes: int = None, budget: int = None) -> dict:
+              votes: int = None, budget: int = None, spec_fn: Callable = None) -> dict:
     """One vision check, in the shape checks.run_all wants (extra_runners entry).
     `budget` is the wall-clock ceiling; by default it is the check's own timeout_s, so a
-    slow browser or a model that never answers cannot stall the gate forever."""
+    slow browser or a model that never answers cannot stall the gate forever.
+    `spec_fn` says how the check becomes what the capture is told to do - U06b passes its
+    own for a check that runs on an Android device instead of in a browser."""
     t0 = time.time()
     budget = int(budget) if budget is not None else max(60, int(check.timeout_s or 600))
     deadline = t0 + budget
@@ -444,14 +447,15 @@ def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str 
         return finish({"verdict": "inconclusive", "issues": ["This vision check has no spec text "
                                                             "to compare the screen with."]})
 
-    cap = (capture_fn or (lambda pr, sp: capture(pr, sp, wrap=wrap, timeout=shot_timeout)))(project, spec_for(check))
+    cap = (capture_fn or (lambda pr, sp: capture(pr, sp, wrap=wrap, timeout=shot_timeout)))(
+        project, (spec_fn or spec_for)(check))
     for st in cap.get("steps") or []:
         lines.append("step %s: %s%s" % (st.get("step"), st.get("what"),
                                         " -> " + str(st.get("error")) if st.get("error") else ""))
     if cap.get("url"):
         lines.append("page: " + cap["url"])
     if cap.get("log"):
-        lines += ["", "browser output:", cap["log"]]
+        lines += ["", "capture log:", cap["log"]]
     if cap.get("error"):
         lines.append("capture error: " + str(cap["error"]))
     for i, (sname, png) in enumerate(cap.get("shots") or []):
@@ -472,6 +476,9 @@ def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str 
         final_png = png
     if final_png is None:
         issues = [str(cap.get("error") or "No screenshot could be taken.")]
+        issues += [str(x) for x in (cap.get("issue_extra") or [])][:20]
+        if cap.get("fatal"):        # U06b: the device said no - a real failure, not "not sure"
+            return finish({"verdict": "fail", "issues": issues}, cap)
         return finish({"verdict": "inconclusive", "issues": issues}, cap)
 
     raws, errors = [], []

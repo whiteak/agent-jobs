@@ -29,6 +29,7 @@ from agentjobs_upgrades import watchdog as wdm
 from agentjobs_upgrades.safegit import SafeGit
 import dashboard   # U07: timeline
 import visioncheck   # U06: vision checks (screenshot the app, ask the model)
+import androidcheck   # U06b: Android screen checks (install + start on a device)
 
 WEB = Path(__file__).resolve().parent
 JAIL_DIR = WEB.parent / "jail"
@@ -57,7 +58,10 @@ DEFAULTS = {"fix_rounds": 3, "after_result_grace_s": 120, "watchdog": _wd_defaul
             # U05: best-of-N for hard jobs (attempts 2-4, stop early unless marked hard,
             # and start fresh attempts by hand only - auto_attempts = do it for a job that
             # failed after its fix rounds)
-            "attempts": 3, "stop_early": True, "auto_attempts": False}
+            "attempts": 3, "stop_early": True, "auto_attempts": False,
+            # U06b: which device an Android check uses ("" = the first one adb reports),
+            # and which adb to use ("" = the one on PATH / in the SDK folder)
+            "android_device": "", "android_adb": ""}
 
 
 def load_settings(path, write_defaults=True):
@@ -86,6 +90,8 @@ def load_settings(path, write_defaults=True):
             out[k] = v
         elif k in out and isinstance(v, (int, float)) and not isinstance(v, bool):
             out[k] = v
+        elif k in out and isinstance(v, str) and isinstance(out[k], str):     # U06b: text settings
+            out[k] = v[:200]
     return out
 
 
@@ -177,8 +183,10 @@ def checks_ok(v):
         t = c.get("timeout_s", ck.DEFAULT_TIMEOUT)
         if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 7200:
             return False
-        if c.get("type", "command") == "vision":       # U06: a screenshot + model check (no cmd)
-            if not visioncheck.check_ok(c):
+        if c.get("type", "command") in ("vision", "android-smoke"):     # U06/U06b: no cmd
+            ok = (androidcheck.check_ok(c) if c.get("target") == "android" or c.get("type") == "android-smoke"
+                  else visioncheck.check_ok(c))
+            if not ok:
                 return False
             continue
         if c.get("type", "command") != "command" or not isinstance(c.get("cmd"), str) \
@@ -217,8 +225,12 @@ def freeze_checks(m, root):
         for c in checks[:CHECKS_MAX]:
             if c.type == "command" and c.cmd.strip():
                 lst.append({"name": c.name[:80], "cmd": c.cmd[:CHECK_CMD_MAX], "timeout_s": int(c.timeout_s)})
-            elif c.type == "vision":                   # U06
+            elif c.type == "vision" and (c.extra or {}).get("target") != "android":   # U06
                 frozen = visioncheck.frozen(c)
+                if frozen:
+                    lst.append(frozen)
+            elif c.type in ("vision", "android-smoke"):                 # U06b: an Android check
+                frozen = androidcheck.frozen(c)
                 if frozen:
                     lst.append(frozen)
         if lst and checks_ok(lst):
@@ -695,8 +707,11 @@ def _vision_row(i, r, jid, src):
         detail += " &middot; asked " + str(int(r["asked"])) + "x"
     if r.get("url"):
         detail += " &middot; " + esc(r["url"])[:80]
+    if r.get("device"):                                       # U06b: a check on a phone
+        detail += " &middot; on " + esc(str(r["device"]))[:40]
     rows = (f'<tr><td class="{cls}">{mark} {esc(r.get("name"))}</td><td class="hint">{detail}</td>'
-            f'<td class="{cls}">{esc(visioncheck.WORD.get(v, v))}</td><td>{esc(r.get("seconds"))} s</td></tr>')
+            f'<td class="{cls}">{esc(androidcheck.short_result(r) if r.get("crash") else visioncheck.WORD.get(v, v))}</td>'
+            f'<td>{esc(r.get("seconds"))} s</td></tr>')
     shots = [str(s) for s in (r.get("screenshots") or []) if str(s)]
     if shots:
         if jid and src:
@@ -715,11 +730,33 @@ def _vision_row(i, r, jid, src):
     return rows
 
 
+def _android_row(i, r):
+    """U06b: one device check - install the APK, start it, does it survive?"""
+    v = r.get("verdict") or "skipped"
+    cls = "c-ok" if r.get("ok") else "c-bad"
+    mark = "&#10003;" if r.get("ok") else ("&#63;" if v in ("inconclusive", "skipped") else "&#10007;")
+    detail = str(r.get("cmd") or "android") + " &middot; " + esc(r.get("mode", "required"))
+    if r.get("device"):
+        detail += " &middot; " + esc(str(r["device"]))[:40]
+    if r.get("pkg"):
+        detail += " &middot; " + esc(str(r["pkg"]))[:60]
+    rows = (f'<tr><td class="{cls}">{mark} {esc(r.get("name"))}</td><td class="hint">{detail}</td>'
+            f'<td class="{cls}">{esc(androidcheck.short_result(r))}</td>'
+            f'<td>{esc(r.get("seconds"))} s</td></tr>')
+    if r.get("issues"):
+        rows += ('<tr><td colspan=4><ul class="issues">'
+                 + "".join(f"<li>{esc(x)}</li>" for x in list(r["issues"])[:20]) + "</ul></td></tr>")
+    return rows
+
+
 def _res_rows(results, jid=None, src=None):
     rows = ""
     for i, r in enumerate(results or []):
         if r.get("type") == "vision":                     # U06: a screenshot check
             rows += _vision_row(i, r, jid, src)
+            continue
+        if r.get("type") == "android-smoke":              # U06b: a check on a phone
+            rows += _android_row(i, r)
             continue
         counts = " / ".join(f"{r.get(k)} {k}" for k in ("passed", "failed", "skipped") if r.get(k) is not None)
         cls = "c-ok" if r.get("ok") else "c-bad"
@@ -733,6 +770,10 @@ def _res_rows(results, jid=None, src=None):
 
 def _check_hint(c):
     """One frozen check, as a short piece of HTML (a screenshot check has no command)."""
+    if c.get("type") == "vision" and c.get("target") == "android":      # U06b
+        return "<code>screenshot of the app on a phone</code>"
+    if c.get("type") == "android-smoke":                                # U06b
+        return "<code>install and start the app on a phone</code>"
     if c.get("type") == "vision":
         return "<code>screenshot of %s</code>" % esc(str(c.get("open") or "")[:60])
     return f"<code>{esc(c.get('cmd', ''))}</code>"
@@ -859,6 +900,21 @@ def _vision_md(r):
     return out
 
 
+def _android_md(r):
+    """U06b: markdown for one device check - what ran on which phone, and the crash lines."""
+    out = [f"  - device check `{r.get('name')}`: {r.get('verdict')} ({r.get('mode', 'required')})"]
+    where = ", ".join(x for x in (f"device {r['device']}" if r.get("device") else "",
+                                  f"app {r['pkg']}" if r.get("pkg") else "",
+                                  f"apk {Path(str(r['apk'])).name}" if r.get("apk") else "") if x)
+    if where:
+        out.append(f"    - {where}")
+    for i in list(r.get("issues") or [])[:20]:
+        out.append(f"    - {i}")
+    for c in list(r.get("crash") or [])[:10]:
+        out.append(f"    - logcat: {c}")
+    return out
+
+
 def bundle_section(m):
     """Markdown for the review bundle: verify rounds, guard issues, checkpoints, watchdog."""
     out = []
@@ -880,6 +936,9 @@ def bundle_section(m):
                     if r.get("type") == "vision":                 # U06
                         out += _vision_md(r)
                         continue
+                    if r.get("type") == "android-smoke":          # U06b
+                        out += _android_md(r)
+                        continue
                     counts = ", ".join(f"{r.get(k)} {k}" for k in ("passed", "failed", "skipped") if r.get(k) is not None)
                     out.append(f"  - `{r.get('cmd')}` exit {r.get('exit_code')}" + (f" ({counts})" if counts else ""))
                 for i in rnd.get("issues") or []:
@@ -890,6 +949,8 @@ def bundle_section(m):
             for r in summ.get("results", []):
                 if r.get("type") == "vision":
                     out += _vision_md(r)
+                elif r.get("type") == "android-smoke":            # U06b
+                    out += _android_md(r)
     cp = m.get("checkpoints")
     if cp or m.get("checkpoints_note"):
         out.append("\n## Checkpoints")

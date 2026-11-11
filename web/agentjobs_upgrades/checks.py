@@ -99,12 +99,23 @@ def _has_pytest() -> bool:
         return False
 
 
+def _is_android_app(p: Path) -> bool:
+    """A real Android app, not just any Gradle project (a launcher activity to start)."""
+    for pattern in ("app/src/main/AndroidManifest.xml", "*/src/main/AndroidManifest.xml",
+                    "AndroidManifest.xml"):
+        if list(p.glob(pattern)):
+            return True
+    return False
+
+
 def detect_checks(project: Path) -> list[Check]:
     p = Path(project)
     checks: list[Check] = []
     if (p / "gradlew").is_file():
         checks.append(Check("build", "./gradlew --offline assembleDebug"))
         checks.append(Check("tests", "./gradlew --offline testDebugUnitTest"))
+        if _is_android_app(p):            # U06b: an app has to actually start on a device
+            checks.append(Check("app runs", "", type="android-smoke", extra={"mode": "required"}))
         return checks
     pkg = p / "package.json"
     if pkg.is_file():

@@ -28,6 +28,7 @@ import attempts   # U05: best-of-N for hard steps (fresh copies, ranking, Attemp
 import planning   # U04a: an outline -> a plan of milestones and tasks to check before anything runs
 import taskqueue  # U04b: an approved plan runs as a queue of tasks, one job at a time
 import visioncheck  # U06: screenshot the app and ask the model whether it looks right
+import androidcheck  # U06b: the same for an Android app - install it and start it on a device
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -459,8 +460,11 @@ def run_gate(ctx):
     wrap = upgrades.make_wrap(ctx.root, m["folder"], f"agentcheck-{jid}")
     # U06: a vision check screenshots the app in the same jail, then the board asks the
     # model - which is idle here, because the gate only runs after the agent has stopped.
-    shots = visioncheck.runners(wrap=upgrades.make_wrap(ctx.root, m["folder"], f"agentshot-{jid}"),
-                                emit=ctx.ev.emit)
+    web_checks = visioncheck.runners(wrap=upgrades.make_wrap(ctx.root, m["folder"], f"agentshot-{jid}"),
+                                     emit=ctx.ev.emit)
+    # U06b: an Android check goes to a connected device instead of a browser (adb cannot run
+    # inside the job container: no network, no USB); no device = skipped, never a failed job.
+    shots = androidcheck.runners(web=web_checks, emit=ctx.ev.emit, cfg=ctx.cfg)
     tag = attempts.phase_tag(m)   # U05: "Attempt 2 of 3 - " while a hard job is being tried
     state = {"round": 0}
 
@@ -2150,8 +2154,12 @@ def u01_button(kind, jid, get):
             try:
                 wrap = upgrades.make_wrap(root, m["folder"], f"agentcheck-{jid}")
                 # U06: "Run checks again" screenshots again too - the model is free, nothing is running
-                shots = visioncheck.runners(wrap=upgrades.make_wrap(root, m["folder"], f"agentshot-{jid}"),
-                                            emit=ev.emit)
+                web_checks = visioncheck.runners(wrap=upgrades.make_wrap(root, m["folder"],
+                                                                        f"agentshot-{jid}"),
+                                                 emit=ev.emit)
+                # U06b: and the Android checks run on a device, same rule as the gate
+                shots = androidcheck.runners(web=web_checks, emit=ev.emit,
+                                             cfg=upgrades.load_settings(SETTINGS_FILE, write_defaults=False))
                 summ = ck.run_all(root, job_dir(jid) / "checks" / f"again-{int(time.time())}", wrap,
                                   checks=upgrades.job_checks(m), extra_runners=shots)
                 colour, text = ck.banner_text(summ)
