@@ -1553,3 +1553,161 @@ Nothing else was touched. The ranking is `agentjobs_upgrades/bestofn.py` used ex
   use their own `HOME`, and the throwaway state folders under `/tmp/u05-smoke-*` were left there
   for inspection only. Nothing was pushed; the branch `agent/jobboard-next` is ready for Jason to
   review, push and merge.
+
+---
+
+## Fix job A — review fixes for upgrades 6b, 6a, 4b and 7b
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). Four findings from the review, one commit each, plus this section and PLAN.md. No feature
+work: each finding is a small local fix plus tests.
+
+Commits in this run:
+
+- `0d37a77` **6b (a)** — `adb shell` is a shell on the phone: a check's `text` step could run
+  anything on the device. 5 tests.
+- `c62cc14` **6b (b)** — installing an APK is opt-in (`"install": true` **and** a named device
+  serial). 5 tests.
+- `013744f` **6a (a)+(b)** — the sandbox's screenshot data is read with hard limits, and a missing
+  Playwright/Chromium is a skip, never a failed job. 11 tests.
+- `1bc9b63` **4b** — a task job of a plan queue is created with `offline` on. 1 test.
+- `ed96686` **7b** — `bad_path` refused every path merely starting `.git`; only the `.git` folder
+  is refused now. 1 test.
+- (docs) PLAN.md section for this job + this section.
+
+### Files changed
+
+| File | What changed |
+| --- | --- |
+| `web/agentjobs_upgrades/android.py` | `SHELL_META` / `SHELL_META_RE` and the guard in `Adb.shell` (the one place every `shell` word passes; a word holding a metacharacter is refused with exit 126 and a note, and never reaches adb); `TEXT_RE` (letters, numbers and plain punctuation, ≤ 200) for a `text` step; `package_list()` keeps only names matching `PKG_RE`, so a package name the device invents cannot be fed back into the shell; `$` removed from `COMP_RE` (the component pattern). |
+| `web/androidcheck.py` | `check_ok` refuses a `text` step `TEXT_RE` rejects (so it never gets frozen into a job record); `install` is an entry key, must be a bool, and is frozen; `install_opt_in(check, cfg)`, `NO_INSTALL`, `NO_SERIAL`; both `run_check` and `run_smoke` gate on it **before** `pick_device`, so an opted-out check sends not one adb command; `_skipped()` sets the `word` the badge and the Checks card show. |
+| `web/visioncheck.py` | `MAX_OUT`/`MAX_PNG` = 10 MB, `MAX_PIXELS` = 8 M, `MAX_RAW` = 48 MB; `default_run` (Popen + two reader threads) keeps at most 10 MB of the sandbox run's stdout/stderr, drains the rest and appends a note; `_inflate()` uses `zlib.decompressobj().decompress(..., max_length)` and returns `None` past the limit; `_png_decode` refuses an over-cap stream, an absurd `width × height`, and a header whose raw scanlines would be too big; `capture()` drops an over-cap shot with a note and sets `no_browser`; `run_check` turns a missing browser into a `skipped` verdict forced to `advisory` with the exact sentence the review asked for, and puts `word: "no browser"` in the result. |
+| `web/visionshot.py`, `web/visionshot.mjs` | Both drivers say "no browser" themselves instead of dying: the Python one sets `no_browser` on the `ImportError`; the Node one imports Playwright **dynamically** (a static import killed the process before it could answer, so the board only saw "the screenshot program did not answer"). |
+| `web/badges.py`, `web/upgrades.py` | A device/vision check that was skipped shows why (`install not asked for` / `no device named` / `no device` / `no adb` / `no browser`) instead of always "no device". |
+| `web/taskqueue.py` | `start_next` creates the task job with `offline=True` whatever agent the plan uses. |
+| `web/diffview.py` | `bad_path` refuses a `.git` path **segment** (`.git`, `.git/config`, `src/.git/hooks/…`) instead of anything starting `.git`. |
+| `web/tests/test_u06b_android.py` | 41 → **51** tests. |
+| `web/tests/test_u06a_vision.py` | 42 → **53** tests. |
+| `web/tests/test_u04b_queue.py` | 72 → **73** tests. |
+| `web/tests/test_u07b_changes.py` | 36 → **37** tests. |
+| `PLAN.md`, `AGENT_REPORT.md` | this job's findings, steps ticked, and this section. |
+
+`FILE_SCRIPT`'s shell-side path checks (`.git|.git/*`, `/*`, `../*`, `*/..`, `*/../*`) were
+already right, so they are unchanged — the new `bad_path` matches them. `# JAIL:`, `# U01`,
+`# U05`, `# U07` and `# VOICE` blocks are untouched and still run in the suite.
+
+### How each finding is met
+
+1. **(6b a) No check step can run a command on the phone.** adb joins the words of `adb shell …`
+   with spaces and `/system/bin/sh` on the device runs the result, so the injection surface is the
+   joined string, not the argv list. Every word going through `Adb.shell` is now checked at that
+   one choke point against `SHELL_META` (`; | & $ ` ( ) < > \ " ' newline/tab, `* ? ~ # ! { } [ ]`)
+   and refused — return code 126, an error the step records, and **nothing sent to adb**, so a
+   forged or hand-edited check cannot get past it even if it skipped validation. On top of that a
+   `text` step is an allowlist, `TEXT_RE`: only letters, numbers and plain punctuation
+   (` ,.:/=+@^_-`), up to 200 of them, spaces typed as `%s`; `androidcheck.check_ok` refuses a text
+   step that fails it, so such a step never enters a job record, and the page's own step validation
+   explains the rule. Values that come back **from** the device are treated the same way:
+   `package_list()` keeps only names matching `PKG_RE` before one is used in a later `shell`
+   command, and the launchable-component pattern no longer accepts `$`. `adb install` and
+   `exec-out` are client-side (never parsed by a shell), so they are unaffected.
+2. **(6b b) Installing is opt-in.** `install_opt_in()` needs both switches: the check says
+   `"install": true` (validated as a bool, frozen into the record) **and** a serial is named — the
+   check's own `"device"` or the board's `android_device` setting. Otherwise the check is reported
+   as skipped, before any adb call, with the message naming both (`Nothing was put on a device: an
+   Android check only installs when it says "install": true and names a device …`) and, when only
+   the serial is missing, `The check says "install": true but names no device, so nothing was put
+   on a phone: put "device": "emulator-5554" in the check or choose the phone in the board's
+   settings (android_device)`. The `app runs` check an Android project gets with no
+   `AGENT_CHECKS.json` has neither, so a plugged-in phone is never touched by itself; that skip is
+   advisory and the badge/Checks card say `install not asked for`.
+3. **(6a a) Nothing trusted comes out of the sandbox without a limit.** The run's stdout and
+   stderr are each read by their own thread into at most 10 MB (`MAX_OUT`); the rest is drained so
+   the child cannot block, and a note says it was dropped. A screenshot over 10 MB is left out of
+   the check with a note, and so is one whose decode would need more than `MAX_PNG` compressed
+   bytes or `MAX_PIXELS`/`MAX_RAW` raw bytes (a header claiming 60000×60000 stops there). The
+   inflate itself is bounded: `zlib.decompressobj().decompress(chunk, max_length)` in a loop over
+   `unconsumed_tail`, giving up past the limit rather than inflating a small file into gigabytes.
+   Every one of these is a note in the check output ("… could not be resized", "… is more than
+   10 MB - left out"), never a traceback, and the check still finishes.
+4. **(6a b) A missing browser is a skip.** `run_check` forces `mode = "advisory"` and returns
+   `verdict: skipped` with `Playwright isn't installed in the sandbox image; vision check skipped`
+   first in `issues`, plus the driver's own how-to-fix line when it gave one. It is recognised from
+   the driver's `no_browser` flag (both drivers set it) or from the error text
+   (`NO_BROWSER_MARKS`), and `summarize()` then leaves the job `unverified` rather than `failed` —
+   asserted for a check declared `mode: required`. The Node driver's import is now dynamic, which
+   is what lets it answer at all in an image without Playwright.
+5. **(4b) Plan tasks stay offline.** `start_next` passes `True` for `offline`, because
+   `jobboard.new_job` only forces the flag for `jailcfg.LOCAL_MODES`; the agent Jason chose for the
+   plan is unchanged, and the record still validates with `jobboard.check_record`.
+6. **(7b) Only the `.git` folder is a bad path.** `bad_path` tests the path **segments**, so
+   `.gitignore`, `.gitattributes`, `.github/workflows/ci.yml`, `.gitlab-ci.yml` and `src/.gitkeep`
+   are listed, shown and diffed like any other file, while `.git`, `.git/`, `.git/config`,
+   `.git/refs/heads/main`, `src/.git/hooks/pre-commit`, `.git//config` and `src/../.git/config`
+   stay refused. The `FILE_SCRIPT` shell cases already did exactly this, so the two sides now
+   agree.
+
+### Verified
+
+- Gate command, exactly as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 814 tests in 294.996s` / `OK`** (4 m 55 s). Before this job: **791 tests** (counted the
+  same way at `3888bb0`), so this job adds **23** and deletes, skips or weakens nothing.
+- The four touched modules alone, each run separately (running several web page modules in one
+  process is flaky in this repo — shared ports and threads — so the gate command is the authority):
+  `tests.test_u06b_android` **51 OK** · `tests.test_u06a_vision` **53 OK** ·
+  `tests.test_u04b_queue` **73 OK** · `tests.test_u07b_changes` **37 OK**.
+- New tests, by finding:
+  - *adb shell*: `test_a_text_step_is_only_ever_typed`,
+    `test_text_that_the_phone_would_run_is_refused`,
+    `test_the_shell_guard_never_sends_a_dangerous_word_to_adb`,
+    `test_a_package_name_the_device_invents_never_goes_back_into_the_shell`,
+    `test_a_dangerous_text_step_is_never_sent_to_the_device` (the last three read the fake adb's
+    argv log and assert the dangerous command is **not in it**), plus two junk cases added to the
+    existing record tests.
+  - *install opt-in*: `test_nothing_is_installed_unless_the_check_asks_for_it`,
+    `test_install_true_without_a_named_device_installs_nothing_either`,
+    `test_the_default_app_runs_check_never_installs_by_itself`,
+    `test_an_opted_in_check_named_only_in_the_settings_is_allowed`,
+    `test_the_screen_check_installs_nothing_unless_the_check_asks`.
+  - *vision limits*: `Limits` class — `test_the_sandbox_output_is_read_with_a_limit`,
+    `test_a_normal_run_of_the_driver_is_read_as_before`, `test_an_absurd_picture_size_is_refused`,
+    `test_a_png_that_lies_about_its_size_stops_at_the_limit`,
+    `test_undecodable_or_truncated_pixel_data_is_still_just_a_note`,
+    `test_the_limits_are_the_ones_the_review_asked_for`; and
+    `test_a_shot_bigger_than_the_limit_is_left_out_by_capture` / `…_by_the_check`.
+  - *missing browser*: `test_no_browser_check_is_a_skip_and_says_why`,
+    `test_a_required_vision_check_is_never_failed_by_a_missing_browser`,
+    `test_a_real_run_with_no_browser_in_the_image_skips`,
+    `test_capture_marks_a_missing_browser_as_such`, and `test_drivers_are_valid` now checks both
+    drivers say `no_browser` (and still runs `node --check` on the `.mjs`).
+  - *offline*: `test_a_task_job_is_offline_even_for_a_plan_that_uses_an_online_agent`, plus an
+    `assertIs(m["offline"], True)` in the existing start test.
+  - *.git paths*: `test_only_the_dot_git_folder_is_a_bad_path_not_every_dot_git_name`.
+- **Existing tests that were changed, none of them weakened** - each change is the behaviour the
+  review asked for: `test_no_browser_check_is_not_sure_and_says_why` →
+  `test_no_browser_check_is_a_skip_and_says_why` (a missing browser must be a skip carrying that
+  message, not "not sure"); `test_drivers_are_valid` now expects the dynamic
+  `await import("playwright")` and the `no_browser` answer in both drivers (it still runs
+  `node --check`); the android smoke tests now declare `"install": true` and a device, because the
+  checks they exercise are opted in - their assertions are unchanged; the two no-device tests now
+  assert `Device emulator-5554 is not connected (adb devices shows: no device)`, since a named
+  serial is now required before anything installs. No test was deleted, skipped or loosened.
+
+### Unfinished / uncertain
+
+- Nothing of the job is unfinished: all four findings are fixed, tested and committed, and the gate
+  command passes.
+- **Not verifiable in this sandbox, and how it is covered instead:** there is no phone and no real
+  adb, so the Android findings are proven against `tests/fixtures/fakeadb/adb`, which records every
+  argv it is given — "never sent to adb" is read back from that log; the quoting/allowlist rules
+  are the same ones a real device's `/system/bin/sh` would see. Playwright and Chromium are not
+  installed here, so the skip is exercised through the drivers' own `no_browser` answers and the
+  error-text marks, not through a real Chromium launch; a sandbox image that *does* have them still
+  goes down the old path (unchanged). There is no podman/bwrap here, so all of this ran in the host
+  jail (`JOBBOARD_JAIL=host`), as in the earlier jobs.
+- This job made no network calls at all — no board was served on 8091 (the fixes are library-level;
+  the badge and Checks-card wording is asserted in-process by the tests above). `~/agent-sandbox`
+  untouched, nothing installed, port 8090 never contacted. Nothing was pushed; the branch
+  `agent/jobboard-next` is ready for Jason to review, push and merge.
+

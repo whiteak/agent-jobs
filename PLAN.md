@@ -885,3 +885,72 @@
 - [ ] Full suite passes (same command as the verify gate); smoke-serve the board on a free
       port (never 8090) against a local fake ntfy server and curl the settings page.
 - [ ] AGENT_REPORT.md section for this job.
+
+---
+
+# Fix job A — review fixes for upgrades 6b, 6a, 4b and 7b
+
+Four findings from the review of those upgrades. Small, local changes; each finding needed tests;
+nothing else touched. Branch `agent/jobboard-next`, nothing pushed.
+
+## Findings
+
+1. **6b (a) — `adb shell` is a shell on the PHONE.** A check step `{"text": "a; pm uninstall x"}`
+   or `{"text": "$(reboot)"}` is joined by adb and run by `/system/bin/sh`, so the step's text was
+   a command, not typing. Reject (clear error, step not sent) any text holding a shell
+   metacharacter, or quote it so the device cannot interpret it; check every other value that goes
+   to `adb shell` the same way.
+2. **6b (b) — installing an APK must be opt-in.** Only when the check says `"install": true` AND
+   names a device serial (its own `device`, or the `android_device` setting). The automatic
+   `app runs` check an Android project gets when it has no `AGENT_CHECKS.json` must install
+   nothing and report a clear skip saying how to turn it on.
+3. **6a (a) — the screenshot data coming out of the sandbox is not trusted.** 10 MB cap on the
+   sandbox output that is read and on each decoded PNG; `_png_decode` must never call
+   `zlib.decompress` without a limit (`decompressobj` + `max_length`, and refuse absurd
+   width × height). Oversized data gives a clear note, never a crash or huge memory use.
+4. **6a (b) — no Playwright/Chromium in the sandbox image is a skip**, never a failed job:
+   "Playwright isn't installed in the sandbox image; vision check skipped", advisory.
+5. **4b — a task job of a plan queue was created with `offline=False`,** so a plan set to a
+   non-local agent gave its tasks the internet. Task jobs must be created with the flag on.
+6. **7b — `bad_path` refused every path that starts with ".git",** so `.gitignore`,
+   `.github/workflows/x.yml` and `.gitattributes` showed "bad path". Only the `.git` folder itself
+   (`.git` and `.git/...`) may be refused, the shell-side `FILE_SCRIPT` cases included.
+
+## Steps
+
+- [x] 1: `agentjobs_upgrades/android.py` — one guard at the `Adb.shell` choke point (every word
+      that holds a metacharacter is refused before anything is sent), `TEXT_RE` allowlist for a
+      `text` step (validated in `androidcheck.check_ok` as well, so a dangerous step never gets
+      into the job record), `PKG_RE` filter for package names the device reports, `$` dropped from
+      the component pattern. `test_u06b_android.py` +5. Commit `0d37a77`.
+- [x] 2: `androidcheck.py` — `install_opt_in()` (the check's `install` flag AND a named serial)
+      gates both runners before any adb call; the skip text names both switches; `install` is
+      validated (a bool) and frozen into the record; the badge and the Checks card say WHY a
+      device check was skipped. `test_u06b_android.py` +5. Commit `c62cc14`.
+- [x] 3: `visioncheck.py` — `MAX_OUT`/`MAX_PNG` 10 MB, `MAX_PIXELS`, `MAX_RAW`; `default_run`
+      keeps at most 10 MB of the run's stdout/stderr (drains the rest, leaves a note); a shot over
+      the cap is left out with a note; `_png_decode` inflates with `decompressobj(max_length)` and
+      refuses an absurd header. `test_u06a_vision.py` `Limits` +6. Commit `013744f`.
+- [x] 4: `visioncheck.py` — a missing browser (the driver's `no_browser` flag or the error text)
+      gives a `skipped` verdict forced to advisory with that exact sentence; both drivers say so
+      themselves (`visionshot.mjs` imports Playwright dynamically so it can answer at all).
+      `test_u06a_vision.py` +5. In the same commit as 3.
+- [x] 5: `taskqueue.start_next` passes `offline=True` whatever the plan's mode. `test_u04b_queue.py`
+      +1 (a supervised plan: the agent is kept, the flag is on, the record still validates).
+      Commit `1bc9b63`.
+- [x] 6: `diffview.bad_path` refuses a `.git` path **segment** (FILE_SCRIPT's shell cases
+      `.git|.git/*` were already right). `test_u07b_changes.py` +1. Commit `ed96686`.
+- [x] Gate: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+      → **Ran 814 tests in 294.996s / OK** (791 before this job: +23).
+- [x] PLAN.md steps ticked + AGENT_REPORT.md section for this job.
+
+## What this job could not do here
+
+There is no phone and no real adb in this sandbox: the Android findings are verified against the
+fake-adb fixture (`tests/fixtures/fakeadb/adb`), which logs every argv it is given, so "never sent
+to adb" is proven from that log. Playwright and Chromium are not installed here either, so the
+missing-browser skip is exercised through the drivers' own `no_browser` answer and the error-text
+marks, not through a real browser run; the screenshot path itself is covered by the envelope tests
+with fake shot data, as before. No podman/bwrap jail: the tests run in the host jail
+(`JOBBOARD_JAIL=host`), as in the earlier jobs.
+
