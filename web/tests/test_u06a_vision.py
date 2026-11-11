@@ -334,6 +334,58 @@ class Capture(unittest.TestCase):
             self.assertEqual(subprocess.run(["node", "--check", str(t)], capture_output=True).returncode, 0)
 
 
+# ------------------------------------------------------------------ the model can see pictures?
+
+class ModelCanSee(unittest.TestCase):
+    def serve(self, modalities):
+        body = json.dumps({"data": [{"id": "m", "architecture": {"input_modalities": modalities}}]}).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_reads_what_the_server_reports(self):
+        for mods, want in ((["text", "image"], True), (["text"], False)):
+            srv = self.serve(mods)
+            try:
+                url = "http://127.0.0.1:%d/v1/chat/completions" % srv.server_address[1]
+                self.assertEqual(visioncheck.model_sees_images(url), want)
+                self.assertEqual(visioncheck.models_url(url),
+                                 "http://127.0.0.1:%d/v1/models" % srv.server_address[1])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_a_silent_server_is_not_a_no(self):
+        self.assertIsNone(visioncheck.model_sees_images("http://127.0.0.1:1/v1/chat/completions"))
+
+    def test_a_text_only_model_says_so_instead_of_guessing(self):
+        srv = self.serve(["text"])
+        t = Path(tempfile.mkdtemp(prefix="u06a-"))
+        try:
+            res = visioncheck.run_check(t, vcheck(), t / "out",
+                                        model_url="http://127.0.0.1:%d/v1/chat/completions" % srv.server_address[1],
+                                        capture_fn=capture_shots(("final", small_png())))
+            self.assertEqual(res["verdict"], "inconclusive")
+            self.assertTrue(any("--vision" in i for i in res["issues"]))
+            self.assertNotIn("asked the model", Path(res["output_file"]).read_text())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 # ------------------------------------------------------------------ the check record
 
 class Record(unittest.TestCase):

@@ -35,6 +35,7 @@ import re
 import struct
 import subprocess
 import time
+import urllib.request
 import zlib
 from pathlib import Path
 from typing import Callable, Optional
@@ -387,6 +388,24 @@ def capture(project, spec: dict, wrap: Callable = None, kind: str = "",
 
 # ---------------------------------------------------------------- the check
 
+def models_url(chat_url: str = "") -> str:
+    """The /v1/models address of the server a chat URL points at."""
+    return (chat_url or MODEL_URL).replace("/chat/completions", "") + "/models"
+
+
+def model_sees_images(url: str = "", timeout: int = 10):
+    """True / False / None (the server does not say). Basalt lists "image" in
+    architecture.input_modalities only when it was started with --vision, which is the one
+    reason a screen check can never pass - worth saying plainly instead of "not sure"."""
+    try:
+        with urllib.request.urlopen(models_url(url), timeout=timeout) as r:
+            data = (json.loads(r.read()) or {}).get("data") or []
+        mods = ((data[0] if data else {}) or {}).get("architecture", {}).get("input_modalities")
+        return None if mods is None else ("image" in mods)
+    except Exception:
+        return None
+
+
 def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str = "",
               emit: Callable = None, capture_fn: Callable = None, call: Callable = None,
               votes: int = None, budget: int = None) -> dict:
@@ -456,6 +475,10 @@ def run_check(project, check, out_dir, *, wrap: Callable = None, model_url: str 
         return finish({"verdict": "inconclusive", "issues": issues}, cap)
 
     raws, errors = [], []
+    if call is None and model_sees_images(model_url) is False:
+        return finish({"verdict": "inconclusive",
+                       "issues": ["The model cannot see images: it answers /v1/models without "
+                                  "image input, so it needs to be started with --vision."]}, cap)
     ask = call or vision.http_call(model_url or MODEL_URL, timeout=min(300, max(30, budget)))
 
     def ask_and_record(body):
