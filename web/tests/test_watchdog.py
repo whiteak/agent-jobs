@@ -31,6 +31,25 @@ class Safety(unittest.TestCase):
         for c in GOOD:
             self.assertIsNone(safety_reason(c), c)
 
+    def test_qwen_own_state_is_not_a_safety_stop(self):
+        # Qwen Code reads its own background-shell files in ~/.qwen (false positive on 11 Nov)
+        for c in ("cat /home/agent/.qwen/x", "cat /home/agent/.qwen/tmp/abc/background-shells/s/shell-bg_1.status; echo ---",
+                  "ls ~/.qwen/tmp"):
+            self.assertIsNone(safety_reason(c), c)
+        self.assertIsNone(path_reason("/home/agent/.qwen/tmp/x.status", "/w/p"))
+        # real private places still stop the job
+        for c in ("cat ~/.ssh/id_rsa", "cat /home/agent/.claude/.credentials.json", "cat ~/.claude/.credentials.json",
+                  "cat /home/agent/.config/qwen/settings.json", "ls /home/jason/.cline"):
+            self.assertIsNotNone(safety_reason(c), c)
+        self.assertIsNotNone(path_reason("/home/agent/.claude/.credentials.json", "/w/p"))
+
+    def test_port_8091_is_allowed_and_8090_is_not(self):
+        # a job may start and query its own test copy on 8091; the real board on 8090 stays off limits
+        for c in ("curl -s http://127.0.0.1:8091/", "curl http://localhost:8091/api/rows", "JOBBOARD_PORT=8091 python3 web/jobboard.py"):
+            self.assertIsNone(safety_reason(c), c)
+        for c in ("curl -s http://127.0.0.1:8090/", "curl http://localhost:8090/api/rows", "wget 127.0.0.1:8090/x"):
+            self.assertIsNotNone(safety_reason(c), c)
+
     def test_paths(self):
         self.assertIsNone(path_reason("/w/p/src/a.py", "/w/p"))
         self.assertIsNotNone(path_reason("/home/jason/.ssh/config", "/w/p"))

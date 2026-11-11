@@ -31,7 +31,7 @@ class WatchdogSettings:
     max_wall_s: int = 4 * 3600
     model_down_pause_s: int = 120
     allowed_urls: tuple = ("http://127.0.0.1:8080", "http://localhost:8080")
-    blocked_ports: tuple = (8090, 8091)
+    blocked_ports: tuple = (8090,)   # 8091 is the test copy a job may start for itself
 
 
 @dataclass
@@ -56,11 +56,13 @@ INSTALLERS = {"pip": "install", "pip3": "install", "npm": "install", "pnpm": "ad
               "cargo": "install", "go": "get", "conda": "install", "brew": "install"}
 OFFLINE_FLAGS = ("--offline", "--no-index", "--prefer-offline")
 GIT_NET = {"push", "fetch", "pull", "clone", "ls-remote", "submodule"}
+# ~/.qwen is NOT here: in the job container it is Qwen Code's own state (no credentials) and Qwen
+# reads its background-shell files there. ~/.claude stays: a supervised job's home has real credentials.
 SECRET_PATH_RE = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/home/[^/\s'\"]+|/root)/("
     r"\.ssh|\.gnupg|\.aws|\.netrc|\.git-credentials|\.password-store|\.docker|\.kube"
     r"|\.local/share/keyrings|\.mozilla|\.config/(google-chrome|chromium|BraveSoftware|"
-    r"Code|gh|git|rclone|qwen)|\.qwen|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
+    r"Code|gh|git|rclone|qwen)|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
     r"basalt_config|agent-sandbox/(web|state/secrets))"
     r"|/etc/(shadow|sudoers)|/proc/\d+/environ")
 URL_RE = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]+", re.I)
