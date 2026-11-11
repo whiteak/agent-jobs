@@ -171,6 +171,16 @@ class TimelineRows(unittest.TestCase):
         self.assertIn("&lt;script&gt;", row)
         self.assertIn("&quot;quoted&quot;", row)
 
+    def test_the_started_row_names_the_agent_that_ran(self):
+        """The MODES values are new-job-form text ("Local: Qwen Code on the local model
+        (no cloud)"), so cutting one at the colon writes a row like "Started (Local" or
+        "Started (Fake agent (tests only" - what the 8091 smoke run caught."""
+        for mode in jobboard.MODES:
+            self.assertIn(mode, jobboard.AGENT_NAMES, mode)
+            self.assertRegex(jobboard.started_text(mode), r"^Started \([A-Za-z0-9 .-]+\)$", mode)
+        self.assertEqual(jobboard.started_text("local-qwen"), "Started (Qwen Code)")
+        self.assertEqual(jobboard.started_text("some-new-mode"), "Started (some-new-mode)")
+
     def test_board_events_land_on_the_timeline_with_the_right_type(self):
         """upgrades 1-3 emit through EventLog; the timeline is a second view of them."""
         log = upgrades.EventLog(self.dir / "events.jsonl")
@@ -511,6 +521,7 @@ class ARealJobFillsIt(unittest.TestCase):
         self.assertEqual([e["id"] for e in rows], list(range(1, len(rows) + 1)))
         self.assertTrue(all({"id", "time", "type", "text", "data"} <= set(e) for e in rows))
         self.assertIn("Step ticked: step one", [e["text"] for e in rows])
+        self.assertIn("Started (fake agent)", [e["text"] for e in rows])   # names the agent, plainly
         self.assertIn("colour", next(e for e in rows if e["type"] == "checks")["data"])   # colours the row
         self.assertIn("Checks passed", rows[-1]["text"])
 

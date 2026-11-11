@@ -72,6 +72,11 @@ PLANS = Path(os.environ.get("JOBBOARD_PLANS") or (SANDBOX / "state" / "plans"))
 QUEUES = Path(os.environ.get("JOBBOARD_QUEUES") or (SANDBOX / "state" / "queues"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
+# U07: what the job's timeline calls the agent that ran it. The MODES values are new-job-form
+# text ("Local: Qwen Code on the local model (no cloud)"), so cutting them at the colon would
+# write a row like "Started (Local" or "Started (Fake agent (tests only".
+AGENT_NAMES = {"local-claude": "Claude Code", "local-qwen": "Qwen Code", "supervised": "Supervised",
+               upgrades.FAKE_MODE: "fake agent"}
 # Bench auto-runs. Run data lives OUTSIDE the sandbox-visible folders; the worker
 # reads the run settings ONLY from BENCH_RUNS/<id>/spec.json (never from meta.json).
 # Job records also live outside the sandbox now, but they are plain files, so the
@@ -237,6 +242,10 @@ def worker():
                 queue_cv.wait(5)
         process_job(q[0])
 
+def started_text(mode):
+    """U07: the timeline's 'started' row names the agent that ran, in its own short words."""
+    return f"Started ({AGENT_NAMES.get(mode, mode)})"
+
 def process_job(name):
     """Take one queued record (by directory name) through to finished. The
     safety re-check happens here, right before anything runs: a record that
@@ -294,7 +303,7 @@ def process_job(name):
             phone_notify(m)   # U09b
             return False
     m.update(status="running", started=time.time()); save_meta(m, name)
-    dashboard.tl_add(job_dir(name), "started", f"Started ({MODES.get(m['mode'], m['mode']).split(':')[0]})")   # U07
+    dashboard.tl_add(job_dir(name), "started", started_text(m["mode"]))   # U07
     record_git_start(m)
     upgrades.freeze_checks(m, WORK / m["folder"])   # U01: what the gate checks is fixed BEFORE the agent runs
     save_meta(m, name)
