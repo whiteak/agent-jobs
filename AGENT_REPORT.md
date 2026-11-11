@@ -1780,6 +1780,15 @@ Ran 830 tests in 291.975s
 OK (skipped=2)
 ```
 
+Run again on the finished tree, with `.live-voice-ref/` already gone and nothing uncommitted
+(the state AGENT_CHECKS.json will build):
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+Ran 830 tests in 292.261s
+OK (skipped=2)
+```
+
 **830 tests, up from 814** before this job: +11 (`test_jobvoice.py`) and +5 (`test_jobvoice_merge.py`).
 Nothing was deleted, skipped or weakened; no existing test was edited. The only skips are
 `test_speak_real_piper` and `test_transcribe_real_whisper`, which `test_jobvoice.py` skips itself
