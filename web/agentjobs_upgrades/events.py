@@ -11,7 +11,7 @@ ICONS = {"queued": "🕒", "started": "▶", "step": "☑", "checks": "🧪", "f
          "checkpoint": "📌", "rollback": "↩", "watchdog": "🐕", "nudge": "🐕", "restart": "🔄",
          "safety_stop": "⛔", "needs_review": "⚠", "finished": "🏁", "failed": "✗",
          "approved": "✅", "merged": "🔀", "rejected": "🗑", "pause": "⏸", "resume": "▶",
-         "attempt": "🎲", "plan": "🗒", "queue": "🚂"}   # U07: one icon per timeline row
+         "changes": "✎", "attempt": "🎲", "plan": "🗒", "queue": "🚂"}   # U07: one icon per timeline row
 
 _lock = threading.Lock()
 
