@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Jobs project tasks",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "id",
+      "milestone",
+      "title",
+      "prompt",
+      "acceptance"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.-]{1,40}$"
+      },
+      "milestone": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string",
+        "maxLength": 120
+      },
+      "prompt": {
+        "type": "string"
+      },
+      "acceptance": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1
+      },
+      "checks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "depends_on": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "size": {
+        "enum": [
+          "S",
+          "M"
+        ]
+      },
+      "screen": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  }
+}

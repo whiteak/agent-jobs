@@ -25,6 +25,7 @@ import diffcard   # U07b: the Changes card (file list + diff viewer)
 import diffview   # U07b: what the job changed (git in the jail, parsed diffs)
 import notifycfg  # U09b: phone alerts (ntfy) - settings page, events, quiet hours
 import attempts   # U05: best-of-N for hard steps (fresh copies, ranking, Attempts card)
+import planning   # U04a: an outline -> a plan of milestones and tasks to check before anything runs
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -57,6 +58,10 @@ SETTINGS_FILE = Path(os.environ.get("JOBBOARD_SETTINGS") or (SANDBOX / "state" /
 # U09b: phone alerts (ntfy). The server is empty by default = off, and the topic starts
 # random. Kept next to the board settings, outside anything the sandbox can write.
 NOTIFY_FILE = Path(os.environ.get("JOBBOARD_NOTIFY") or (SANDBOX / "state" / "notify-settings.json"))
+# U04a: project records (the outline, the plan's state, the APPROVED tasks). Like the job
+# records these live outside anything the sandbox mounts, so a planner can never approve its
+# own plan or move a plan onto another folder.
+PLANS = Path(os.environ.get("JOBBOARD_PLANS") or (SANDBOX / "state" / "plans"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # Bench auto-runs. Run data lives OUTSIDE the sandbox-visible folders; the worker
@@ -169,6 +174,10 @@ def check_record(name, m):
     for key in ("hard", "stop_early"):                      # U05
         if m.get(key) is not None and not isinstance(m[key], bool):
             return key
+    for key in ("plan_job", "plan_retry"):                  # U04a: a job that only plans
+        if m.get(key) is not None and (isinstance(m[key], bool) or not isinstance(m[key], int)
+                                       or not 0 <= m[key] <= 3):
+            return key
     if m.get("mode") == upgrades.FAKE_MODE:
         try:
             json.loads(job)
@@ -268,6 +277,11 @@ def process_job(name):
     run_planned(m, name)                           # U01/U05: agent + watchdog + gate, or N fresh attempts
     m = load_meta(name)
     maybe_auto_attempts(m)                         # U05: "try fresh attempts" without the button
+    try:   # U04a: a planning job's plan is checked here; an unusable one goes back once, by itself
+        planning.plan_finished(m, plans=PLANS, work=WORK, new_job=new_job,
+                               session_of=session_of, job_dir=job_dir)
+    except Exception:
+        pass
     try:
         notify_finished(m, m["status"] == "done" and (m.get("verify") or {}).get("status") != "failed")
     except Exception:
@@ -1319,8 +1333,14 @@ def header(extra=""):
     st = basalt_status()
     cls = "ok" if st == "loaded" else "bad"
     return (f'<header><h1><a href="/" style="color:inherit;text-decoration:none">Agent jobs</a></h1>'
+            f'<a href="/projects">Projects</a> <a href="/project/new">New project</a> '   # U04a
             f'<a href="/bench">Bench</a> <a href="/notify">Phone</a> '   # U09b
             f'<span>Model: <b class="{cls}">{esc(st)}</b></span> <a href="http://127.0.0.1:8080/" target="_blank">GPU stats</a>{extra}</header>')
+
+def mode_opts(selected=""):
+    """The agent modes for a form. The hidden fake mode stays out of every page (U01)."""
+    return "".join(f'<option value="{k}"{" selected" if k == selected else ""}>{esc(v)}</option>'
+                   for k, v in MODES.items() if k != upgrades.FAKE_MODE)
 
 STATE_GLYPH = {"WORKING": '<span class="dot"></span>', "QUEUED": "&#8230;", "FINISHED": "&#10003;",
                "FAILED": "&#10007;", "STUCK": "&#9888;", "STOPPED": "&#9632;"}
@@ -1394,8 +1414,7 @@ def job_rows():
     return rows or '<tr><td colspan=7 class=mut>No jobs yet.</td></tr>'
 
 def home_page():
-    opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in MODES.items()
-                   if k != upgrades.FAKE_MODE)   # U01: the fake mode stays hidden
+    opts = mode_opts()
     fopts = "".join(f'<option value="{esc(f)}">{esc(f)}</option>' for f in folders())
     rows = job_rows()
     body = header() + f"""
@@ -1506,7 +1525,7 @@ def job_page(jid):
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{u01_cards}{u05_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 {diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
@@ -1704,6 +1723,98 @@ class H(http.server.BaseHTTPRequestHandler):
     def redirect(self, to):
         self.send_response(303); self.send_header("Location", to); self.end_headers()
 
+    # ---------------------------------------------------------------- U04a: projects and plans
+
+    def project_page(self, folder, q):
+        rec = planning.load(PLANS, folder)
+        if not rec:
+            return self.send_error(404)
+        note = ""
+        if (q.get("git") or [""])[0] == "0":
+            note = ("The folder is there, but git could not be started in it - the agent will "
+                    "work without checkpoints there.")
+        elif (q.get("saved") or [""])[0] == "1":
+            note = "Outline saved."
+        elif (q.get("planned") or [""])[0] == "1":
+            note = "The planner is working. The plan appears here when it finishes."
+        st = planning.plan_state(PLANS, rec, WORK / folder)
+        return self.send(render(header() + planning.project_body(rec, st, mode_opts(), note)))
+
+    def plan_page(self, folder, q):
+        rec = planning.load(PLANS, folder)
+        if not rec:
+            return self.send_error(404)
+        note = {"1": "Plan saved.", "2": "Plan approved. Nothing runs until you start the tasks."}.get(
+            (q.get("ok") or [""])[0], "")
+        st = planning.plan_state(PLANS, rec, WORK / folder)
+        return self.send(render(header() + planning.CSS + planning.plan_body(rec, st, st["tasks"], note)))
+
+    def project_edit(self, folder, form):
+        """The project page's two buttons: Save the outline, or Make a plan."""
+        rec = planning.load(PLANS, folder)
+        if not rec:
+            return self.send_error(404)
+        outline = (form.get("outline", [""])[0]).strip()[:planning.OUTLINE_MAX]
+        if not outline:
+            return self.project_form_error(rec, "The outline cannot be empty - the planner works "
+                                                "from it.")
+        rec["outline"] = outline
+        planning.save(PLANS, rec)
+        if form.get("plan"):
+            return self.start_plan(rec, form)
+        return self.redirect(f"/project/{folder}?saved=1")
+
+    def project_form_error(self, rec, message):
+        st = planning.plan_state(PLANS, rec, WORK / rec["folder"])
+        return self.send(render(header() + planning.project_body(rec, st, mode_opts(), message)), code=400)
+
+    def start_plan(self, rec, form):
+        """"Make a plan": a normal job, in the project's folder, told to write only the plan."""
+        folder = rec["folder"]
+        if folder_busy(folder):
+            return self.project_form_error(rec, "A job is already running in that folder - wait "
+                                                "for it to finish.")
+        mode = (form.get("mode", [""])[0]).strip()
+        if mode not in MODES:
+            mode = next((k for k in MODES if k != upgrades.FAKE_MODE), "local-qwen")
+        m = new_job(mode, folder, planning.planner_prompt(rec), False, extra=planning.plan_extra())
+        rec.update(plan_job=m["id"], plan_status="running")
+        planning.save(PLANS, rec)
+        return self.redirect(f"/job/{m['id']}")
+
+    def plan_edit(self, folder, form):
+        """The plan review page's one endpoint: Save / Approve plan, and Up / Down / Delete /
+        Add (which change the page only - Save keeps them)."""
+        rec = planning.load(PLANS, folder)
+        if not rec:
+            return self.send_error(404)
+        root = WORK / folder
+        st = planning.plan_state(PLANS, rec, root)
+        tasks = planning.form_tasks(form)
+
+        def shown(errors, tasks, note="", code=200):
+            st.update(errors=errors, tasks=tasks)
+            return self.send(render(header() + planning.CSS + planning.plan_body(rec, st, tasks, note)),
+                             code=code)
+
+        if not tasks:
+            return shown(["The plan form came back empty, so nothing was changed."], st["tasks"], code=400)
+        tasks, note = planning.apply_actions(tasks, form)
+        if len(tasks) > planning.MAX_TASKS:
+            return shown([f"A plan holds at most {planning.MAX_TASKS} tasks."], tasks, note, code=400)
+        if form.get("approve"):
+            errs = planning.approve(PLANS, rec, root, tasks)
+            if errs:
+                return shown(errs, tasks, "The plan was not approved.", code=400)
+            return self.redirect(f"/plan/{folder}?ok=2")
+        if form.get("save"):
+            errs = planning.validate(tasks)
+            if errs:
+                return shown(errs, tasks, "Not saved - fix these first.", code=400)
+            planning.write_tasks(root, tasks)
+            return self.redirect(f"/plan/{folder}?ok=1")
+        return shown([], tasks, note)
+
     def do_GET(self):
         if self.path == "/favicon.ico":  # browsers request this before login: no cookie needed
             self.send_response(204); self.end_headers(); return
@@ -1718,6 +1829,17 @@ class H(http.server.BaseHTTPRequestHandler):
             if (q.get("test") or [""])[0] == "1":
                 note += " The test is on its way - its result appears under Recent sends."
             return self.send(notify_page(note=note))
+        if u.path == "/projects":   # U04a: the projects and their plans
+            recs = planning.projects(PLANS)
+            states = {r["folder"]: planning.state_line(planning.plan_state(PLANS, r, WORK / r["folder"]))
+                      for r in recs}
+            return self.send(render(header() + planning.projects_body(recs, states)))
+        if parts == ["project", "new"]:   # U04a: the New project page
+            return self.send(render(header() + planning.new_project_body(folders())))
+        if len(parts) == 2 and parts[0] == "project" and planning.load(PLANS, parts[1]):
+            return self.project_page(parts[1], q)
+        if len(parts) == 2 and parts[0] == "plan" and planning.load(PLANS, parts[1]):
+            return self.plan_page(parts[1], q)
         if u.path == "/api/bench/rows": return self.send(bench_rows())
         if parts == ["bench", "compare"]:
             page = bench_compare_page((q.get("a") or [""])[0], (q.get("b") or [""])[0])
@@ -1831,6 +1953,22 @@ class H(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     pass
             return self.redirect(f"/job/{m['id']}")
+        if parts == ["project", "new"]:   # U04a: a new project (folder + git) or planning inside an existing one
+            fields, errs = planning.project_form(form)
+            if not errs and fields["new"] and (WORK / fields["folder"]).exists():
+                errs = ["That folder already exists. Pick it from the folder list instead."]
+            if errs:
+                return self.send(render(header() + planning.new_project_body(folders(), fields, errs)), code=400)
+            note = ""
+            if fields["new"]:
+                note = planning.create_folder(WORK, fields["folder"], fields["name"], fields["kind"])
+            planning.save(PLANS, planning.new_record(fields["folder"], fields["name"],
+                                                     fields["kind"], fields["outline"]))
+            return self.redirect(f"/project/{fields['folder']}" + ("?git=0" if note else ""))
+        if len(parts) == 3 and parts[:2] == ["project", "edit"]:   # U04a: outline / Make a plan
+            return self.project_edit(parts[2], form)
+        if len(parts) == 3 and parts[:2] == ["plan", "edit"]:      # U04a: the plan review page
+            return self.plan_edit(parts[2], form)
         if len(parts) == 2 and parts[0] == "followup" and load_meta(parts[1]):
             prev = load_meta(parts[1]); job = get("job")
             if not job or not prev.get("session") or prev["status"] in ("queued", "running", "stopping"):
