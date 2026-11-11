@@ -34,6 +34,7 @@ import androidcheck  # U06b: the same for an Android app - install it and start 
 import decisions  # U08: Approve & merge / Ask for changes / Reject, for a person at the page only
 import phoneaccess  # U09a: phone access (off by default), the password login, the Access page
 import phonelayout  # U09a: the phone layout, the home-screen manifest and its icons
+import morningreport  # U10: the morning report - what ran overnight, and what needs Jason
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -81,6 +82,11 @@ PLANS = Path(os.environ.get("JOBBOARD_PLANS") or (SANDBOX / "state" / "plans"))
 # project records: outside everything the sandbox mounts, so an agent cannot mark its own task
 # done or skip the tasks after it.
 QUEUES = Path(os.environ.get("JOBBOARD_QUEUES") or (SANDBOX / "state" / "queues"))
+# U10: the morning report and its settings. Same rule as every other record - outside anything
+# the sandbox mounts, so a job can neither write its own report nor move the window it covers.
+REPORTS = Path(os.environ.get("JOBBOARD_REPORTS") or (SANDBOX / "state" / "reports"))
+REPORT_SETTINGS = Path(os.environ.get("JOBBOARD_REPORT_SETTINGS")
+                       or (SANDBOX / "state" / "report-settings.json"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # U07: what the job's timeline calls the agent that ran it. The MODES values are new-job-form
@@ -246,6 +252,7 @@ def worker():
         pass
     while True:
         phone_model_check()   # U09b: tells the phone when the model server goes away
+        report_tick()         # U10: the morning report, when the clock says it is due
         with queue_cv:
             while True:
                 q = [name for name, m in reversed(all_job_dirs()) if m["status"] == "queued"]
@@ -330,6 +337,8 @@ def process_job(name):
         taskqueue.job_finished(m, queue_ctx())
     except Exception:
         pass
+    if m.get("task_id"):   # U10: an overnight queue that finishes or halts gets its report now
+        report_queue_finished(m.get("folder"))
     try:
         notify_finished(m, m["status"] == "done" and (m.get("verify") or {}).get("status") != "failed")
     except Exception:
@@ -714,6 +723,53 @@ def phone_model_check():
     alerts are off, so nothing extra is ever requested."""
     try:
         notifycfg.model_check(NOTIFY_FILE, lambda: basalt_status() == "loaded")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------- U10: the morning report
+
+def report_base_url():
+    """What a report's links point at. Jason's phone address when he gave the Phone page one;
+    this PC's own address otherwise, so the Reports tab always has working links."""
+    base = ""
+    try:
+        base = notifycfg.settings(NOTIFY_FILE).base_url
+    except Exception:
+        pass
+    return base or f"http://{BOUND or HOST}:{PORT}"
+
+def report_summary(facts):
+    """The optional paragraph at the end of a report. Nothing is asked of the model while it is
+    busy - the GPU answers one stream, and a report must not queue behind a job."""
+    return morningreport.qwen_summary(facts, status=basalt_status(), busy=bool(running))
+
+def report_kwargs():
+    """Everything the report needs from the board, read at call time (tests move these)."""
+    return dict(reports=REPORTS, settings_path=REPORT_SETTINGS, queues=QUEUES,
+                notify_path=NOTIFY_FILE, base_url=report_base_url(),
+                bench_verdict=bench_overall_text, model=report_summary)
+
+def make_report(force=True, trigger="manual"):
+    """Build one report now (the button, or --report-now). Returns its index entry or None.
+    Never raises: a strange record must not break a page or the worker."""
+    try:
+        return morningreport.make(jobs=all_jobs(), force=force, trigger=trigger, **report_kwargs())
+    except Exception:
+        return None
+
+def report_tick():
+    """U10: the worker's clock check - the daily report when it is due, made as soon as the
+    worker is free, so a long job delays it but never loses it."""
+    try:
+        morningreport.tick(jobs=all_jobs(), **report_kwargs())
+    except Exception:
+        pass
+
+def report_queue_finished(folder):
+    """U10: a project queue came to an end, so the overnight work is over and the report is
+    worth making now rather than at 07:00."""
+    try:
+        morningreport.queue_finished(folder=folder, jobs=all_jobs(), **report_kwargs())
     except Exception:
         pass
 
@@ -1404,7 +1460,8 @@ def header(extra=""):
             f'<span class="topst" id="topst"></span>'   # U09a: the sticky bar shows the running job
             f'<nav class="nav">'
             f'<a href="/projects">Projects</a> <a href="/project/new">New project</a> '   # U04a
-            f'<a href="/bench">Bench</a> <a href="/notify">Phone</a> '   # U09b
+            f'<a href="/bench">Bench</a> <a href="/reports">Reports</a> '   # U10: the morning report
+            f'<a href="/notify">Phone</a> '   # U09b
             f'<a href="/access">Access</a> '   # U09a: phone access and its password
             f'<span>Model: <b class="{cls}">{esc(st)}</b></span> <a href="http://127.0.0.1:8080/" target="_blank">GPU stats</a>{extra}</nav></header>')
 
@@ -2030,6 +2087,20 @@ class H(http.server.BaseHTTPRequestHandler):
             sid, hdrs = decisions.session_for(self.headers)   # U09a: so its Save is gated too
             return self.send(notify_page(note=note, token_field=decisions.TOKEN_FIELD,
                                          token=decisions.token_for(sid)), headers=hdrs)
+        if u.path == "/reports":   # U10: the morning report
+            note = "Report made." if (q.get("made") or [""])[0] == "1" else ""
+            if (q.get("ok") or [""])[0] == "1":
+                note = "Saved."
+            sid, hdrs = decisions.session_for(self.headers)   # its two forms carry that token
+            return self.send(render(header() + morningreport.page_body(
+                REPORTS, REPORT_SETTINGS, note=note, readonly=READONLY,
+                token_field=decisions.TOKEN_FIELD, token=decisions.token_for(sid))), headers=hdrs)
+        if len(parts) == 2 and parts[0] == "reports":   # one saved report
+            if (q.get("raw") or [""])[0] == "1":
+                md = morningreport.read_report(REPORTS, parts[1])
+                return self.send(md, "text/markdown; charset=utf-8") if md else self.send_error(404)
+            body = morningreport.report_body(REPORTS, parts[1])
+            return self.send(render(header() + body)) if body else self.send_error(404)
         if u.path == "/projects":   # U04a: the projects and their plans
             recs = planning.projects(PLANS)
             states = {r["folder"]: planning.state_line(planning.plan_state(PLANS, r, WORK / r["folder"]))
@@ -2054,6 +2125,13 @@ class H(http.server.BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "fetch":   # JAIL: Download packages output
             body = jailcfg.fetch_page_body(parts[1])
             return self.send(render(header() + body)) if body else self.send_error(404)
+        if len(parts) == 2 and parts[0] == "jobs":   # U10: what a report line and a phone alert link to
+            jid = parts[1]
+            if load_meta(jid):
+                return self.redirect(f"/job/{jid}")
+            if planning.load(PLANS, jid):   # a queue task that never ran links to its project
+                return self.redirect(f"/project/{jid}")
+            return self.send_error(404)
         if len(parts) == 2 and parts[0] == "job" and load_meta(parts[1]):
             jm = load_meta(parts[1])
             if jm.get("kind") == "bench": return self.redirect(f"/bench/run/{jm['id']}")
@@ -2103,7 +2181,10 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             with open(p, "rb") as f: shutil.copyfileobj(f, self.wfile)
             return
-        if len(parts) == 3 and parts[:2] == ["api", "bundle"] and load_meta(parts[2]):
+        if ((len(parts) == 3 and parts[:2] == ["api", "bundle"]) or
+                (len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "bundle")) \
+                and load_meta(parts[2]):
+            # U07b's route; U10 adds /api/jobs/<id>/bundle, which is what a failed report line links to
             m = load_meta(parts[2])
             if m.get("kind") == "bench":
                 return self.send("Bench runs have no review bundle.", "text/plain; charset=utf-8", code=404)
@@ -2221,6 +2302,23 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self.send(notify_page(errors=errors, form=form, token_field=decisions.TOKEN_FIELD,
                                              token=decisions.token_for(sid)), code=400)
             return self.redirect("/notify?ok=1" + ("&test=1" if test else ""))
+        if parts == ["report", "now"]:   # U10: "Make report now" - the same secret gate as the settings
+            if not self.secret_form_only(get(decisions.TOKEN_FIELD)):
+                return self.send_error(403, "Open the Reports page in your browser first - "
+                                            "its button carries your own token")
+            entry = make_report(force=True)
+            return self.redirect(f"/reports/{entry['name']}" if entry else "/reports?made=1")
+        if parts == ["report", "settings"]:   # U10: what time the report comes, and whether the model speaks
+            if not self.secret_form_only(get(decisions.TOKEN_FIELD)):
+                return self.send_error(403, "Open the Reports page in your browser first - "
+                                            "its Save button carries your own token")
+            errs = morningreport.save_form(REPORT_SETTINGS, form)
+            if errs:
+                sid, _h = decisions.session_for(self.headers)
+                return self.send(render(header() + morningreport.page_body(
+                    REPORTS, REPORT_SETTINGS, errors=errs, form=form, readonly=READONLY,
+                    token_field=decisions.TOKEN_FIELD, token=decisions.token_for(sid))), code=400)
+            return self.redirect("/reports?ok=1")
         if parts == ["fetch"]:   # JAIL: Download packages (form button or job page)
             folder = get("newfolder") or get("folder")
             jid = get("job") if JOB_ID_RE.fullmatch(get("job")) and load_meta(get("job")) else None
@@ -2385,11 +2483,16 @@ def main():
         sent, why = notifycfg.send_test(NOTIFY_FILE, background=False)
         print("Phone alert sent - look at the ntfy app." if sent else f"Not sent: {why}", flush=True)
         return
+    if "--report-now" in sys.argv:   # U10: make one report and exit (the button, from a terminal)
+        entry = make_report(force=True)
+        print(f"Wrote {REPORTS / entry['name']}" if entry else "No report - something is wrong.", flush=True)
+        return
     old_jobs_notice()
     if not READONLY:   # U01: create the settings file with the defaults, so it is easy to find
         upgrades.load_settings(SETTINGS_FILE, write_defaults=True)
         notifycfg.settings(NOTIFY_FILE, write_defaults=True)   # U09b: and the phone settings
         phoneaccess.load(ACCESS_FILE, write_defaults=True)     # U09a: off, address left to fill in
+        morningreport.settings(REPORT_SETTINGS, write_defaults=True)   # U10: 07:00, model asked when free
     if READONLY:
         print("Read-only mode: no worker thread, jobs are never changed.", flush=True)
     else:

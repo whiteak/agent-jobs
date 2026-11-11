@@ -482,6 +482,25 @@
 - Test command (`AGENT_CHECKS.json`): `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore
   -m unittest discover -s tests`. Baseline before my changes: **550 tests, OK** (job 08's count).
 
+## What this run found on top of that plan (re-run, 12 Nov)
+
+- The plan above was left uncommitted by the run that started this job; `37ebbf2` committed it
+  as found. Nothing of the U10 code existed, so the plan is still the plan.
+- Two baselines were wrong on the way here: the suite is **741** committed tests, not 550, and
+  the shared copy's working tree was **red** — job 04's (U09a) phone tests were left untracked
+  and half-written, 8 of them failing. `210271c` finishes that residue (Origin check on the
+  login POST, the Access page's restart wording, `.clamp`/`.act` split, and the four broken
+  tests: they now carry the `aj=` session their page was served with, so the upgrade 8 token is
+  really exercised). Suite is green at **785** from here on.
+- `report.build`'s own test (`tests/test_rest.py::Report`) pins its output, so `report.py` is
+  used exactly as it is. Every oddity is handled in the glue instead: it links `/jobs/<id>`, so
+  jobboard grows that alias (which also fixes 9b's click links), and a queue task that never
+  ran has no job id, so its line links to its project — the alias answers a folder name with
+  `/project/<folder>`.
+- A job record never carries `approval` (checked: nothing in the board writes it), so the glue
+  reads upgrade 8's `decision_log` through `decisions.state`: a finished job nobody has touched
+  is "waiting" — nothing on this board merges by itself.
+
 ## Steps
 
 - [ ] `web/morningreport.py` (new glue, `# U10`): settings (`state/report-settings.json`: the
