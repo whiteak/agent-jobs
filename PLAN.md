@@ -1,3 +1,79 @@
+# Job 09 — Upgrade 10: the morning report
+
+## Findings
+
+- Server + pages: `web/jobboard.py` (2211 lines). `main()` starts `worker()` (the
+  one-at-a-time job loop: `queue_cv.wait(5)` → `process_job(name)`) plus
+  `ThreadingHTTPServer` on `127.0.0.1:PORT`; routes are the `if` chain at the top of
+  `H.do_GET`/`H.do_POST` behind `H.guard()` (`jb=` cookie, Host must match `jobboard.PORT`).
+  `render()` wraps a page, `header()` is the top bar (Projects / New project / Bench / Phone —
+  that is where a Reports tab goes), `esc()` escapes.
+- Records, all outside anything the sandbox mounts (`state/…`, env-overridable): `JOBS/<id>/meta.json`
+  (+ `events.jsonl`, `timeline.jsonl`, `review.md`, `checks/`), `PLANS/<folder>.json`,
+  `QUEUES/<folder>.json`, `BENCH_RUNS/<id>/spec|samples|progress|env.json`, settings
+  `agentjobs-settings.json` (`upgrades.load_settings`) and `notify-settings.json`
+  (`notifycfg.settings`). The report must live in the same kind of place: new
+  `REPORTS = state/reports/` (env `JOBBOARD_REPORTS`) — reports/`YYYY-MM-DD.md` + `index.json`.
+- A job record's facts a report needs: `status` (queued/running/done/failed/stopped/cancelled/
+  interrupted/safety_stop), `folder`, `job`, `created/started/finished`, `fail_note`,
+  `verify = {status, rounds[{round, summary, issues}], issues, banner, final, timeline}`,
+  `checkpoints = {checkpoints[], rollbacks, discarded}`, `watchdog = [{time, kind, reason,
+  command?|path?}]` (a safety-stop reason already reads "Safety stop: tried to reach …", the
+  command is in `command`), `attempts`/`attempt_log` (U05 tries, each with `tests_passed`),
+  `task_id`/`task_try` (U04b), `push = {ok, branch, time}` (whether Jason pushed the job branch),
+  `recheck.summary`. Checks summary = `{status, results[{name, cmd, ok, exit_code, passed,
+  failed, skipped, first_error, timed_out, mode}]}`.
+- Given logic (use, do not rewrite): `agentjobs_upgrades/report.py` — `build(jobs, bench_sets,
+  since, until, base_url, qwen_summary)`. Its `DONE = {"passed"}`, `FAILED = {failed, stuck,
+  safety_stop, stopped}`, a `needs_review` line, and its own field names (`title`, `project`,
+  `rounds`, `rollbacks`, `attempts`, `approval`, `first_failure`, `watchdog_reason`,
+  `safety_command`, `queue_blocked`, `tests_passed`) — so the glue maps board records onto that
+  shape. It links `/jobs/<id>` and `/api/jobs/<id>/bundle` (the board's routes are `/job/<id>` and
+  `/api/bundle/<id>`), and `notify.py` builds click links as `<base>/jobs/<id>` too → add those
+  two aliases in `jobboard.py`; that also fixes 9b's click links.
+- "The model server is idle": `basalt_status()` (`/v1/models` → `data[0].status.value`, which
+  basalt answers as `loading` / `loaded` / `unloaded`) and nothing active on the board (the GPU
+  serves one stream). A summary call goes through `vision.http_call(url)` (POST
+  `/v1/chat/completions`); `tests/fakeserver.py` is the stand-in — tests never touch 8080.
+- The push notification for a finished report already exists: `notifycfg.report_ready(path,
+  lines)` → event `morning_report` (in `notify.EVENTS`, on the Phone page's tick list, tag
+  `sunrise`). Nothing to change in 9b.
+- A queue finishing is already detectable: `plan.Queue.mark` sets `status = "finished"` when
+  every task is done/failed/skipped, and `taskqueue.job_finished(m, queue_ctx())` is the hook
+  `process_job` already calls — so an overnight queue ending is one `# U10` hook there.
+- Test command (`AGENT_CHECKS.json`): `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore
+  -m unittest discover -s tests`. Baseline before my changes: **550 tests, OK** (job 08's count).
+
+## Steps
+
+- [ ] `web/morningreport.py` (new glue, `# U10`): settings (`state/report-settings.json`: the
+      time, default `07:00`, whether to ask the model); the "since last report" window from
+      `reports/index.json`; `fact(m)` (a job record → report.py's dict: status words, the first
+      failing check line, the watchdog reason, `Safety stop: <command>`, fix rounds, rollbacks,
+      attempts, tests passing, whether it blocks its queue, waiting-for-approval);
+      `facts_for(...)` (jobs + bench sets + skipped queue tasks + plans waiting for approval, in
+      the window); `make(...)` (report.build → `reports/YYYY-MM-DD.md` + index + push
+      notification, model paragraph only when the server is idle); `due(...)` for the clock
+      trigger; the Reports-tab HTML + a small markdown→HTML so the links work.
+- [ ] `jobboard.py` hooks: `REPORTS`, the Reports nav link, `GET /reports` and
+      `GET /reports/<name>`, `POST /report/now` and `/report/settings`, the `tick()` call in
+      `worker()`, the queue-finished hook after `taskqueue.job_finished`, and the
+      `/jobs/<id>` + `/api/jobs/<id>/bundle` aliases report.py/notify.py link to.
+- [ ] `web/tests/test_u10_report.py`: fixture records covering every state (done ✓ with checks,
+      failed ✗ with the first failing check line, watchdog stop, safety stop, needs review,
+      stopped, interrupted, cancelled, running, skipped queue task, waiting plan, bench sets),
+      the since-last-report window (and that a second report covers only what came after), the
+      no-model-call-when-busy rule (busy: a job running / model not loaded), the saved file +
+      index + push line, the clock trigger, and the routes in the real handler (Reports tab,
+      Make report now, the time form, the `/jobs/…` aliases, the guard).
+- [ ] Full suite passes with the gate's command; smoke-serve the board on a free port (never
+      8090) with its own state folders and click the Reports tab with curl.
+- [ ] PLAN.md steps ticked; AGENT_REPORT.md section for this job.
+
+---
+
+## Plan left by the previous job (Upgrade 4b: the task queue) — kept verbatim so nothing is lost
+
 # Job 08 — Upgrade 4b: run the approved plan as a queue
 
 ## Findings
