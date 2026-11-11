@@ -109,9 +109,9 @@ def bind_host(acc, default="127.0.0.1"):
 
 
 def phone_url(acc, port, bound=""):
-    """The address Jason types into his phone, or '' when there isn't one yet."""
+    """The address Jason types into his phone, or '' when there is none to show."""
     addr = (bound or "").strip() or listen_addr(acc)
-    if not acc.phone_access or not addr or addr in ("127.0.0.1", "0.0.0.0"):
+    if not acc.phone_access or "{" in addr or addr in ("", "127.0.0.1", "0.0.0.0"):
         return ""
     return f"http://{addr}:{port}"
 
@@ -124,12 +124,15 @@ def status_line(acc, port, bound=""):
     if not addr:
         return ("Turned on, but there is no address to listen on yet - fill in the box below "
                 "(your LAN address or your Tailscale address) and restart the board.")
-    url = phone_url(acc, port, bound)
-    if not url:
-        return f"Turned on: listening on {addr}, which is this PC itself."
     if bound and bound != addr:
         return (f"Saved for {addr}, but this board is still listening on {bound}. "
                 "Restart the board to take the new address.")
+    if addr == "0.0.0.0":
+        return (f"Turned on: listening on every network of this PC at once - open "
+                f"http://<this PC's address>:{port} on your phone.")
+    url = phone_url(acc, port, addr)
+    if not url:
+        return "Turned on, but 127.0.0.1 is this PC itself: a phone still cannot reach it."
     return f"On - open {url} on your phone and log in with the password below."
 
 
@@ -309,8 +312,8 @@ behind the job page buttons (upgrade 8), so a login alone cannot change anything
 <input type="text" name="listen" value="{html.escape(val("listen", acc.listen))}"
  placeholder="{PLACEHOLDER}">
 <span class="hint">Your LAN address (like 192.168.1.20) or your Tailscale address (like
-100.x.y.z). Not 0.0.0.0 unless you want every network on this PC. This one takes effect when the
-board restarts.</span></div>
+100.x.y.z). Not 0.0.0.0 unless you want every network on this PC.
+This one takes effect next time the board starts.</span></div>
 <div><label>What to open on the phone</label>
 <p style="margin:4px 0"><code>{html.escape(shown)}</code></p>
 <span class="hint">Log in there with the password. The login lasts 30 days.</span></div></div>

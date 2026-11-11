@@ -34,7 +34,8 @@ CSS = """<style>
 .row{display:block}
 .row>div{width:100%%;min-width:0;margin:0 0 10px}
 .jobtxt{max-width:none;white-space:normal}
-.clamp,.act{max-width:none}
+.clamp{max-width:none}
+.act{max-width:none}
 td.st,th.st,td.now,th.now{min-width:0;white-space:normal}
 .btitle{font-size:20px}
 .bact{font-size:16px}

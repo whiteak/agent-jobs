@@ -1852,6 +1852,9 @@ class H(http.server.BaseHTTPRequestHandler):
         the password itself is only ever compared against a PBKDF2 hash."""
         if not self.host_ok():
             return self.send_error(403, "Bad host")
+        origin = self.headers.get("Origin")
+        if origin and origin not in phoneaccess.origins(PORT, phoneaccess.load(ACCESS_FILE)):
+            return self.send_error(403, "That page did not come from this board")
         n = int(self.headers.get("Content-Length", "0") or 0)
         form = urllib.parse.parse_qs(self.rfile.read(min(n, 200000)).decode("utf-8", "replace"))
         nxt = (form.get("next", ["/"])[0])
