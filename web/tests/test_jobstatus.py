@@ -709,7 +709,8 @@ class ServerSmoke(unittest.TestCase):
         self.assertIn("<h2>Job</h2>", h)               # job prompt in its own card
         self.assertIn('class="check"', h)          # the step checklist
         self.assertIn("write hello.sh", h)
-        self.assertIn("Show details", h)           # the collapsed feed
+        self.assertIn('id="feed"', h)              # U07: the live log (was a collapsed feed)
+        self.assertIn("Live log", h)
         self.assertIn("/api/status/", h)           # the 3s poller
 
     def test_favicon_needs_no_cookie(self):

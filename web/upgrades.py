@@ -27,6 +27,7 @@ from agentjobs_upgrades import checks as ck
 from agentjobs_upgrades import checkpoints as cpm
 from agentjobs_upgrades import watchdog as wdm
 from agentjobs_upgrades.safegit import SafeGit
+import dashboard   # U07: timeline
 
 WEB = Path(__file__).resolve().parent
 JAIL_DIR = WEB.parent / "jail"
@@ -217,6 +218,9 @@ class EventLog:
             rec["tone"] = tone
         if data:
             rec["data"] = data
+        tl = dashboard.TL_KIND.get(kind)      # U07: also on the job's timeline
+        if tl:
+            dashboard.tl_add(self.path.parent, tl, rec["text"], data)
         with self.lock:
             self.history.append(rec)
             self.buf.append(rec)
@@ -596,8 +600,8 @@ def handover(m, root, last_error=""):
 
 # ------------------------------------------------------------------ status + HTML
 
-LABELS = {"passed": None, "unverified": "Done – not verified", "needs_review": "Needs review",
-          "stuck": "Stuck – needs a look", "failed": "Checks failed", "aborted": None}
+LABELS = {"passed": "Done ✓", "unverified": "Not verified", "needs_review": "Needs review",   # U07 badges
+          "stuck": "Stuck – needs a look", "failed": "Failed ✗", "aborted": None}
 
 
 def overlay_status(s, m):
@@ -616,7 +620,7 @@ def overlay_status(s, m):
     if b and s["state"] in ("FINISHED", "FAILED") and m.get("status") != "safety_stop":
         s["verify"] = b
         s["tone"] = b.get("colour", "")
-        lab = b.get("text") if v.get("status") == "passed" else LABELS.get(v.get("status"))
+        lab = LABELS.get(v.get("status"))
         if lab:
             s["label"] = lab[:60]
         if s["state"] == "FAILED" and v.get("status") in ("failed", "stuck"):

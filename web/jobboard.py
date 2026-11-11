@@ -19,6 +19,7 @@ import jailcfg   # JAIL: no-internet sandbox for local modes, self-test, Push bu
 import jobstatus
 import reviewbundle
 import upgrades   # U01: verify gate, git checkpoints, runaway watchdog
+import dashboard  # U07: timeline, live updates (SSE), live log, badges
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -170,6 +171,7 @@ def new_job(mode, folder, job, offline, resume=None, parent=None, extra=None):
          "resume": resume, "parent": parent, "session": None}
     m.update(extra or {})   # JAIL: e.g. fetch_first
     save_meta(m)
+    dashboard.tl_add(job_dir(jid), "queued", "Queued" + (f" (follow-up to {parent})" if parent else ""))   # U07
     with queue_cv: queue_cv.notify()
     return m
 
@@ -241,6 +243,7 @@ def process_job(name):
             except Exception: pass
             return False
     m.update(status="running", started=time.time()); save_meta(m, name)
+    dashboard.tl_add(job_dir(name), "started", f"Started ({MODES.get(m['mode'], m['mode']).split(':')[0]})")   # U07
     record_git_start(m)
     upgrades.freeze_checks(m, WORK / m["folder"])   # U01: what the gate checks is fixed BEFORE the agent runs
     save_meta(m, name)
@@ -278,18 +281,24 @@ class JobCtx:
         self.last_error = ""
         self.mgr = None        # CheckpointManager (git folders only)
         self.runs = 0
+        self.steps_seen = 0    # U07: PLAN.md ticks already on the timeline
 
     def on_plan(self, text, first):
-        """PLAN.md changed (polled every second while an agent runs) -> checkpoint."""
-        if self.mgr is None:
-            return
+        """PLAN.md changed (polled every second while an agent runs) -> timeline + checkpoint."""
+        ticks = upgrades.cpm.ticked_steps(text)
         try:   # ticks that were already there before this job started are not this job's steps
             if first and (self.root / "PLAN.md").stat().st_mtime < float(self.m.get("started") or 0):
-                self.mgr._seen_ticks = max(self.mgr._seen_ticks, len(upgrades.cpm.ticked_steps(text)))
+                self.steps_seen = len(ticks)
+                if self.mgr is not None:
+                    self.mgr._seen_ticks = max(self.mgr._seen_ticks, len(ticks))
                 return
         except OSError:
             return
-        self.mgr.on_plan_change(text)
+        for t in ticks[self.steps_seen:]:   # U07: each newly ticked step on the timeline
+            dashboard.tl_add(job_dir(self.name), "step", f"Step ticked: {t}")
+        self.steps_seen = max(self.steps_seen, len(ticks))
+        if self.mgr is not None:
+            self.mgr.on_plan_change(text)
 
 
 def agent_argv(m, prompt, resume, rnd):
@@ -480,6 +489,7 @@ def run_agent_job(m, name):
         if ctx.actions:
             cur["watchdog"] = ctx.actions[-100:]
         save_meta(cur, name)
+    dashboard.tl_add(job_dir(name), "finished" if status == "done" else "failed", dashboard.finished_text(cur))   # U07
     return cur
 
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -1054,22 +1064,30 @@ def events(jid, since=0):
                 ct = c.get("type")
                 if ct == "text" and c.get("text", "").strip(): items.append({"k": "text", "t": c["text"]})
                 elif ct == "thinking": items.append({"k": "think"})
-                elif ct == "tool_use": items.append({"k": "tool", "name": c.get("name", "?"), "t": summarize(c.get("input") or {})})
+                elif ct == "tool_use": items.append({"k": "tool", "name": c.get("name", "?"), "t": summarize(c.get("input") or {}),
+                                                     "cat": tool_cat(c.get("name", ""))})   # U07: row style
         elif t == "user":
             for c in (e.get("message") or {}).get("content") or []:
                 if isinstance(c, dict) and c.get("type") == "tool_result":
                     body = c.get("content")
                     if isinstance(body, list): body = "\n".join(x.get("text", "") for x in body if isinstance(x, dict))
                     body = str(body or "")
-                    lines = body.splitlines()
-                    short = "\n".join(lines[:12]) + (f"\n... ({len(lines) - 12} more lines)" if len(lines) > 12 else "")
-                    items.append({"k": "result", "err": bool(c.get("is_error")), "t": short[:2000]})
+                    # U07: the page shows 10 lines with "Show more"; send up to 20,000 chars
+                    cut = body[:20000] + ("\n... (cut - see the raw log)" if len(body) > 20000 else "")
+                    items.append({"k": "result", "err": bool(c.get("is_error")), "t": cut})
         elif t == "agentjobs":   # U01: the board's own lines (checks, fix rounds, watchdog)
             items.append({"k": "gate", "t": str(e.get("text") or ""), "tone": str(e.get("tone") or "")})
         elif t == "result":
             items.append({"k": "final", "t": str(e.get("result") or ""), "err": bool(e.get("is_error")),
                           "secs": round((e.get("duration_ms") or 0) / 1000), "turns": e.get("num_turns")})
     return items, nxt
+
+def tool_cat(name):
+    """U07: live-log row style for a tool call."""
+    if name in upgrades.CMD_TOOLS: return "cmd"
+    if name in upgrades.WRITE_TOOLS or name in upgrades.EDIT_TOOLS: return "edit"
+    if name in upgrades.READ_TOOLS or name in ("Glob", "Grep", "glob", "grep_search", "list_directory", "LS"): return "read"
+    return "other"
 
 def summarize(inp):
     for key in ("command", "file_path", "path", "pattern", "url", "description", "prompt"):
@@ -1269,8 +1287,9 @@ def job_rows():
         rows += (f'<tr><td class="now"><a href="/{"bench/run" if bench else "job"}/{m["id"]}">{fmt_time(m["created"])}</a></td>'
                  f'<td class="st" id="p-{m["id"]}">{status_pill(s)}</td>'
                  f'<td>{esc(m["mode"])}{" (offline)" if m.get("offline") else ""}</td><td>{esc(m["folder"]) or "-"}</td>'
-                 f'<td class="jobtxt" title="{esc(m["job"])}">{"&#8627; " if m.get("parent") else ""}{esc(m["job"])}</td><td>{dur(m)}</td></tr>')
-    return rows or '<tr><td colspan=6 class=mut>No jobs yet.</td></tr>'
+                 f'<td class="jobtxt" title="{esc(m["job"])}">{"&#8627; " if m.get("parent") else ""}{esc(m["job"])}</td><td>{dur(m)}</td>'
+                 f'<td class="chk">{esc(dashboard.checks_cell(m))}</td></tr>')   # U07: checks result
+    return rows or '<tr><td colspan=7 class=mut>No jobs yet.</td></tr>'
 
 def home_page():
     opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in MODES.items()
@@ -1288,7 +1307,7 @@ def home_page():
 {upgrades.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False)["fix_rounds"])}
 <p class="hint">Jobs run one at a time. When the agent finishes, the board runs the project's checks in the sandbox and sends failures back for fix rounds. Agents commit to agent/... branches and never push themselves; use Push branch on the finished job. Results land in the project folder with an AGENT_REPORT.md.</p>
 <button>Start job</button> {jailcfg.FETCH_FORM_BUTTON}</form></div>{jailcfg.OFFLINE_JS}
-{upgrades.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
+{upgrades.CSS}<div class="card"><h2>Jobs</h2><div class="tbl"><table><thead><tr><th class="now">Started</th><th class="st">Status</th><th>Mode</th><th>Folder</th><th>Job</th><th>Time</th><th>Checks</th></tr></thead><tbody id="jobrows">{rows}</tbody></table></div></div>
 <script>
 (function(){{
 // Refresh only the job list, never the form, so typing is never lost.
@@ -1382,7 +1401,7 @@ def job_page(jid):
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
 {bundle_html}{u01_cards}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
-{follow_html}<div class="card"><h2>Activity</h2><details id="det"><summary class="hint">Show details</summary><div class="feed" id="feed"><span class="mut">Waiting for the agent...</span></div></details></div>
+{follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 <div class="card"><h2>Changes</h2><pre id="git" class="mut">Loading...</pre></div>
 <div class="card"><h2>Build outputs</h2>{f'<ul>{out_html}</ul>' if outs else '<span class="mut">None found yet (APK, AAB, EXE, ZIP...).</span>'}</div>
@@ -1390,22 +1409,36 @@ def job_page(jid):
 (function(){{
 // IIFE so this script can never collide with another <script> on the page.
 const jid={json.dumps(jid)},jobShort={json.dumps(" ".join((m['job'] or 'job').split())[:40])};let off=0,first=true,prev=null;
-const feed=document.getElementById('feed'),det=document.getElementById('det'),banner=document.getElementById('banner');
+const feed=document.getElementById('feed'),banner=document.getElementById('banner');
+// U07: live log - styled rows, long output collapsed to 10 lines, search, auto-scroll that pauses when you scroll up
+const logq=document.getElementById('logq'),follow=document.getElementById('follow'),tl=document.getElementById('tl');
+let tlLast=+(tl?tl.dataset.last:0)||0;
+function atBottom(){{return feed.scrollTop+feed.clientHeight>=feed.scrollHeight-30}}
+let stick=true;feed.addEventListener('scroll',()=>{{stick=atBottom();follow.textContent=stick?'Following':'Paused - scroll to the bottom to follow'}});
+function match(d){{const q=(logq.value||'').trim().toLowerCase();d.hidden=!!q&&!d.textContent.toLowerCase().includes(q)}}
+logq.addEventListener('input',()=>{{for(const d of feed.children)match(d)}});
+const ICON={{cmd:'$ ',edit:'\u270E ',read:'',other:''}};
 function el(t,c,h){{const d=document.createElement(t);if(c)d.className=c;if(h!==undefined)d.textContent=h;return d}}
 function eh(s){{const d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML}}
-function add(it){{if(first){{feed.textContent='';first=false}}let d=el('div','it '+it.k+(it.tone?' '+it.tone:''));
+function add(it){{if(first){{feed.textContent='';first=false}}let d=el('div','it '+it.k+(it.cat?' '+it.cat:'')+(it.tone?' '+it.tone:''));
  if(it.k==='think'){{if(feed.lastChild&&feed.lastChild.classList.contains('think'))return;d.textContent='thinking...'}}
- else if(it.k==='tool'){{const b=el('b',null,it.name+' ');d.appendChild(b);d.appendChild(el('code',null,it.t))}}
- else if(it.k==='result'){{const p=el('pre',it.err?'bad':'mut',it.t);d.appendChild(p)}}
+ else if(it.k==='tool'){{const b=el('b',null,(ICON[it.cat]||'')+it.name+' ');d.appendChild(b);d.appendChild(el('code',null,it.t))}}
+ else if(it.k==='result'){{const lines=String(it.t).split('\n');const p=el('pre',it.err?'bad':'mut',lines.slice(0,10).join('\n'));d.appendChild(p);
+  if(lines.length>10){{const b=el('button','more','Show more ('+(lines.length-10)+' more lines)');b.onclick=()=>{{const open=b.dataset.o==='1';p.textContent=open?lines.slice(0,10).join('\n'):it.t;b.dataset.o=open?'0':'1';b.textContent=open?'Show more ('+(lines.length-10)+' more lines)':'Show less'}};d.appendChild(b)}}}}
  else if(it.k==='final'){{d.className='it final'+(it.err?' err':'');d.appendChild(el('b',null,(it.err?'Finished with an error':'Finished')+(it.secs?' in '+Math.round(it.secs/60)+' min':'')));d.appendChild(el('pre',null,it.t))}}
  else d.appendChild(el(it.k==='log'?'pre':'div',it.k==='log'?'mut':null,it.t));
- feed.appendChild(d)}}
+ match(d);feed.appendChild(d)}}
+function addItems(items){{const s=stick;items.forEach(add);if(items.length&&s)feed.scrollTop=feed.scrollHeight}}
+function addTl(ev){{if(!tl||ev.id<=tlLast)return;tlLast=ev.id;const e=tl.querySelector('.tlempty');if(e)e.remove();
+ const icons={json.dumps(dashboard.evm.ICONS)};const li=document.createElement('li');
+ const c=ev.type==='checks'?({{green:'ok',red:'bad',yellow:'warn',orange:'warn2'}}[(ev.data||{{}}).colour]||''):({{safety_stop:'bad',failed:'bad',rollback:'warn2',needs_review:'warn2',watchdog:'warn2',restart:'warn2'}}[ev.type]||'');
+ li.className=c;li.innerHTML='<span class="tli">'+(icons[ev.type]||'\u2022')+'</span><span class="tlt">'+new Date(ev.time*1000).toTimeString().slice(0,8)+'</span><span>'+eh(ev.text)+'</span>';tl.appendChild(li)}}
+// Polling = the fallback when the live stream (Server-Sent Events) is not available
+let polling=false;
 async function poll(){{try{{const r=await fetch('/api/events/'+jid+'?since='+off);const j=await r.json();
- const atEnd=det.open&&innerHeight+scrollY>=document.body.offsetHeight-80;
- j.items.forEach(add);off=j.next;
- if(j.items.length&&atEnd&&!first)scrollTo(0,document.body.scrollHeight);
+ addItems(j.items);off=j.next;
 }}catch(e){{}}setTimeout(poll,2000)}}
-poll();
+function startPolling(){{if(polling)return;polling=true;poll();pollStatus()}}
 // The status banner, checklist and tab title refresh every ~3s: no reload, no scroll jump.
 const GL={{WORKING:'<span class="dot"></span>',QUEUED:'&#8230;',FINISHED:'&#10003;',FAILED:'&#10007;',STUCK:'&#9888;',STOPPED:'&#9632;'}};
 const TIT={{WORKING:'\\u25CF',FINISHED:'\\u2713',FAILED:'\\u2717',STUCK:'\\u26A0',QUEUED:'\\u2026',STOPPED:'\\u25CB'}};
@@ -1442,7 +1475,19 @@ function apply(j){{const tn=j.tone?' t-'+j.tone:'';banner.className='card banner
   setTimeout(()=>location.reload(),4000);}}  // bring in the Report/Changes/Follow up cards; the Reload link stays as fallback
  prev=j.state}}
 async function pollStatus(){{try{{const r=await fetch('/api/status/'+jid);if(r.ok)apply(await r.json())}}catch(e){{}}setTimeout(pollStatus,3000)}}
-pollStatus();
+// U07: one live stream for status, log and timeline; reconnects by itself (Last-Event-ID),
+// falls back to polling after repeated failures
+let fails=0;
+function startStream(){{if(!window.EventSource){{startPolling();return}}
+ const es=new EventSource('/api/jobs/'+jid+'/events?log='+off+'&last='+tlLast);
+ es.addEventListener('open',()=>{{fails=0}});
+ es.addEventListener('status',e=>{{try{{apply(JSON.parse(e.data))}}catch(x){{}}}});
+ es.addEventListener('log',e=>{{try{{const d=JSON.parse(e.data);if(d.from<off)return;addItems(d.items);off=d.next}}catch(x){{}}}});
+ es.addEventListener('job',e=>{{try{{addTl(JSON.parse(e.data))}}catch(x){{}}}});
+ es.addEventListener('end',()=>{{es.close()}});
+ // reconnect ourselves with the CURRENT log offset and timeline id (the server also honours Last-Event-ID)
+ es.onerror=()=>{{es.close();fails++;if(fails>=3)startPolling();else setTimeout(startStream,2000)}}}}
+startStream();
 // Browser alerts: permission is asked only when Jason presses the button, never automatically.
 const btn=document.getElementById('alertbtn');
 if('Notification'in window){{if(Notification.permission==='granted'){{btn.hidden=false;btn.textContent='Alerts on';btn.disabled=true}}
@@ -1501,6 +1546,27 @@ class H(http.server.BaseHTTPRequestHandler):
         for k, v in headers: self.send_header(k, v)
         self.end_headers(); self.wfile.write(b)
 
+    def sse_job(self, jid, q):
+        """U07: Server-Sent Events for one job (timeline ids resume via Last-Event-ID)."""
+        def num(v):
+            try: return max(0, int(v))
+            except (TypeError, ValueError): return 0
+        last = num(self.headers.get("Last-Event-ID") or (q.get("last") or ["0"])[0])
+        off = num((q.get("log") or ["0"])[0])
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for chunk in dashboard.job_stream(jid, last, off, get_meta=load_meta, get_status=status_for,
+                                              get_log=events, job_dir=job_dir(jid)):
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def redirect(self, to):
         self.send_response(303); self.send_header("Location", to); self.end_headers()
 
@@ -1530,6 +1596,19 @@ class H(http.server.BaseHTTPRequestHandler):
             jm = load_meta(parts[1])
             if jm.get("kind") == "bench": return self.redirect(f"/bench/run/{jm['id']}")
             return self.send(job_page(parts[1]))
+        if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "events" and load_meta(parts[2]):
+            return self.sse_job(parts[2], q)     # U07: live stream for the job page
+        if len(parts) == 3 and parts[:2] == ["api", "raw"] and load_meta(parts[2]):   # U07: Show raw log
+            p = job_dir(parts[2]) / "events.jsonl"
+            try:
+                size = p.stat().st_size
+                with open(p, "rb") as f:
+                    f.seek(max(0, size - 8_000_000))
+                    data = f.read()
+            except OSError:
+                data = b""
+            head = b"(last 8 MB of the log)\n" if len(data) >= 8_000_000 else b""
+            return self.send(head + data, "text/plain; charset=utf-8")
         if u.path == "/api/statuses":
             return self.send(json.dumps({"statuses": {m["id"]: status_for(m) for m in all_jobs()[:50]}}), "application/json")
         if len(parts) == 3 and parts[:2] == ["api", "status"] and load_meta(parts[2]):
