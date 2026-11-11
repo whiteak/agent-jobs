@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""A fake adb for the U06b tests: the same commands, answers from one JSON scenario.
+
+Environment:
+  FAKE_ADB     - the scenario (keys below)
+  FAKE_ADB_LOG - a file every argument list this script was called with is appended to, so a
+                 test can read the exact device commands. It doubles as the state of the
+                 fake device: after an `install` line the installed app shows up in
+                 `pm list packages`, and the number of `screencap` lines decides which
+                 frame comes back.
+
+Scenario keys:
+  devices      ["emulator-5554"]          what `adb devices` lists
+  packages     ["com.other"]              third-party packages before the install
+  installed    ["com.example.app"]        what the install adds
+  activity     "com.example.app/.Main"    the launcher activity ("" = the app has none)
+  install_fail / start_fail / crash       the three ways it can go wrong
+  no_pidof     true                       this device has no pidof at all
+  frames       ["a","b","b"]              one screen per screencap (the last one repeats)
+  logcat       [lines]                    what `logcat -d` prints (a crash block by default)
+  steps_fail   true                       the device refuses `input ...`
+"""
+import json
+import os
+import struct
+import sys
+import zlib
+
+SC = json.loads(os.environ.get("FAKE_ADB") or "{}")
+LOGF = os.environ.get("FAKE_ADB_LOG") or ""
+CRASH = ["E AndroidRuntime: FATAL EXCEPTION: main",
+         "E AndroidRuntime: Process: com.example.app, PID: 4211",
+         "E AndroidRuntime: java.lang.IllegalStateException: nothing to show",
+         "E AndroidRuntime: \tat com.example.app.MainActivity.onCreate(MainActivity.java:22)"]
+
+
+def frame(n):
+    """A tiny valid PNG whose pixels depend on n, so "two screenshots identical" is real."""
+    v = zlib.crc32(str(n).encode()) & 0xFF
+    rows = b"".join(b"\x00" + bytes([v, 255 - v, (v * 3) % 256, 255]) * 4 for _ in range(4))
+
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def say(text=""):
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    argv = sys.argv[1:]
+    shots = 0
+    if LOGF:
+        installed_before = os.path.exists(LOGF) and "install " in open(LOGF).read()
+        with open(LOGF, "a") as fh:
+            fh.write(" ".join(argv) + "\n")
+        shots = sum(1 for line in open(LOGF) if "screencap" in line)
+    else:
+        installed_before = bool(SC.get("installed"))
+    if argv[:1] == ["-s"]:
+        argv = argv[2:]
+
+    if argv[:1] == ["devices"]:
+        say("List of devices attached")
+        for d in SC.get("devices", []):
+            say("%s\tdevice" % d)
+        return 0
+
+    if argv[:1] == ["install"]:
+        if SC.get("install_fail"):
+            sys.stderr.write("adb: failed to install %s: INSTALL_FAILED_UPDATE_INCOMPATIBLE\n" % argv[-1])
+            return 1
+        say("Performing Streamed Install")
+        say("Success")
+        return 0
+
+    if argv[:3] == ["shell", "pm", "list"]:
+        pk = list(SC.get("packages", []))
+        if installed_before or SC.get("installed_before"):
+            pk += list(SC.get("installed", ["com.example.app"]))
+        for p in pk:
+            say("package:" + p)
+        return 0
+
+    if argv[:5] == ["shell", "cmd", "package", "resolve-activity", "--brief"]:
+        act = SC.get("activity", "com.example.app/com.example.app.MainActivity")
+        if not act:
+            sys.stderr.write("No activity found\n")
+            return 1
+        say(act)
+        return 0
+
+    if argv[:4] == ["shell", "am", "start", "-W"]:
+        if SC.get("start_fail"):
+            say("Error type 3")
+            say("Error: Activity class {com.example.app/com.example.app.MainActivity} does not exist.")
+            return 1
+        say("Starting: Intent { cmp=%s }" % (argv[-1] if len(argv) > 4 else ""))
+        say("Status: ok")
+        say("TotalTime: 412")
+        return 0
+
+    if argv[:3] == ["shell", "am", "force-stop"]:
+        return 0
+
+    if argv[:3] == ["shell", "logcat", "-c"]:
+        return 0
+
+    if argv[:3] == ["shell", "logcat", "-d"]:
+        for line in SC.get("logcat", CRASH if SC.get("crash") else ["I ActivityManager: Displayed com.example.app/.MainActivity: +412ms"]):
+            say(line)
+        return 0
+
+    if argv[:2] == ["shell", "pidof"]:
+        if SC.get("no_pidof"):
+            sys.stderr.write("/system/bin/sh: pidof: inaccessible or not found\n")
+            return 127
+        if SC.get("crash"):
+            return 1
+        say("4211")
+        return 0
+
+    if argv[:2] == ["shell", "input"]:
+        if SC.get("steps_fail"):
+            sys.stderr.write("adb: shell command failed\n")
+            return 1
+        return 0
+
+    if argv[:3] == ["exec-out", "screencap", "-p"]:
+        frames_ = SC.get("frames", ["a", "a"])
+        which = frames_[min(shots - 1, len(frames_) - 1)] if shots else frames_[0]
+        sys.stdout.buffer.write(frame(which))
+        sys.stdout.buffer.flush()
+        return 0
+
+    sys.stderr.write("adb: unknown command %s\n" % " ".join(argv))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
