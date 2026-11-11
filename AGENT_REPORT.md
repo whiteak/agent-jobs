@@ -18,8 +18,8 @@ Commits in this job (on top of `55a0325`, the 7a merge):
 
 | File | What it is |
 | --- | --- |
-| `web/diffview.py` | **new** (506 lines) — the read side: which views exist (`all`, `c:<sha>`, `k:<n>`), the file list with `+/-` counts, one file's diff as rows. All git runs in the job's jail; results cached briefly. |
-| `web/diffcard.py` | **new** (290 lines) — the Changes card: the HTML shell, its CSS, and the page script (file list, unified/side-by-side, collapsed unchanged runs, "Next change", lazy chunked rendering, 10 s + event refresh). |
+| `web/diffview.py` | **new** (505 lines) — the read side: which views exist (`all`, `c:<sha>`, `k:<n>`), the file list with `+/-` counts, one file's diff as rows. All git runs in the job's jail; results cached briefly. |
+| `web/diffcard.py` | **new** (289 lines) — the Changes card: the HTML shell, its CSS, and the page script (file list, unified/side-by-side, collapsed unchanged runs, "Next change", lazy chunked rendering, 10 s + event refresh). |
 | `web/badges.py` | **new** (122 lines) — one badge per check (`build ✓`, `tests 41/42 ✗`) with the link to its output, plus the output reader. |
 | `web/jobboard.py` | routes `/api/changes/<jid>`, `/api/changes/<jid>/file`, `/api/check/<jid>`; the card replaces the old git-status card (that feature is kept inside it, in "Git status of the folder"); badges in the jobs list row and the job banner; `jobactivity`/`jobbadges` events from the 7a stream. |
 | `web/upgrades.py` | `EventLog.__call__` (7a's tests and gate callbacks call `ev("checks", …)`; the class only had `.emit`). |
