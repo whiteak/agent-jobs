@@ -505,6 +505,9 @@ def action(folder, form, ctx):
                 q.save()
             return "saved"
         if act in ("start", "resume"):
+            if act == "resume" and q.state.get("stop_starting_at") \
+                    and q.now() >= q.state["stop_starting_at"]:
+                q.set_cutoff(None)      # "press Resume to carry on" has to mean something
             if q.state.get("status") in ("cancelled", "ready", "paused", "stopped", "finished", "idle"):
                 q.state["status"] = "running"
                 q.save()

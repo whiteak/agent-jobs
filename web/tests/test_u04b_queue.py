@@ -506,6 +506,17 @@ class RestartAndCutoff(unittest.TestCase):
         self.assertEqual(self.b.started, [])
         self.assertIn("No new task starts after", taskqueue.idle_reason(q))
 
+    def test_resume_after_that_time_starts_the_next_task_again(self):
+        self.b.start()
+        m = self.b.started[0]
+        q = self.b.queue()
+        q.state["stop_starting_at"] = time.time() - 1
+        q.save()
+        self.assertIsNone(self.b.finish(m))                     # nothing started at the time
+        self.assertEqual(taskqueue.action("my-app", {"act": ["resume"]}, self.b.ctx()), "resumed")
+        self.assertIsNone(self.b.queue().state["stop_starting_at"])   # Resume means carry on now
+        self.assertEqual([x["task_id"] for x in self.b.started], ["t1", "t2"])
+
     def test_a_task_finishes_but_its_successor_waits_for_that_time(self):
         self.b.start()
         m = self.b.started[0]
