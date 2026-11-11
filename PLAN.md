@@ -993,7 +993,8 @@ the end so the merge is not left depending on a snapshot.
 - [x] 4: full suite green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest
       discover -s tests` → **Ran 830 tests in 291.975s / OK (skipped=2)** — 814 before this job
       (+11 `test_jobvoice.py`, +5 `test_jobvoice_merge.py`).
-- [ ] 5: `git rm -r .live-voice-ref`, commit, AGENT_REPORT.md section for this job.
+- [x] 5: `.live-voice-ref/` deleted (it was never tracked, so a plain `rm -rf`, not `git rm -r` —
+      `git ls-files .live-voice-ref` is empty), AGENT_REPORT.md section for this job. Commit.
 
 ## What this job cannot do here
 

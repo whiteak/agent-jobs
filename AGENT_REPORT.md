@@ -1711,3 +1711,90 @@ already right, so they are unchanged — the new `bad_path` matches them. `# JAI
   untouched, nothing installed, port 8090 never contacted. Nothing was pushed; the branch
   `agent/jobboard-next` is ready for Jason to review, push and merge.
 
+
+---
+
+## Fix job B — merge the live voice code (VOICE) into this copy
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). This copy was branched off the live board **before voice chat existed**, so it had no voice
+code at all: swapping this copy onto the live board would have deleted the microphone, the spoken
+status and the hands-free commands. The job was to bring voice in here, keeping every line this
+copy already has. Nothing was swapped into the live board and `~/agent-sandbox` was not touched.
+
+Commits in this run:
+
+- `47f7980` the merge itself (4 files copied in + the nine hunks in `web/jobboard.py` + the new
+  merge test). 16 tests.
+- (docs) PLAN.md section for this job + this section, and the `.live-voice-ref/` snapshot deleted.
+
+### Files changed
+
+| File | What changed |
+| --- | --- |
+| `web/voice_core.py` | new, **byte-identical** to the live file (md5 `cbf17522…`): `WhisperWorker` (long-lived CPU-only child, unloaded after 10 idle minutes), `transcribe_bytes`, `speak_to_file` (piper + a 50-file WAV cache), `clean_markdown`, `spoken_summary`, `status_speech`, `parse_command`. |
+| `web/voice_worker.py` | new, byte-identical (`c866e651…`): the faster-whisper child (int8, CPU, `initial_prompt` biased to Agent Jobs words), JSON lines over stdin/stdout. |
+| `web/static/voice.js` | new, byte-identical (`637982c6…`): mic buttons on the two textareas, read-aloud on the report, hands-free "Agent, …" commands; `window.AgentVoice`. |
+| `web/tests/test_jobvoice.py` | new, byte-identical (`f72696e8…`): **11 tests** — a real read-only board on a free port, the six routes, the page hooks, login/origin guard, size limits, the jobstatus → voice status mapping. 2 of them use the real whisper/piper models and skip where they are not installed, exactly as on the live board. |
+| `web/jobboard.py` | the nine hunks of `live-changes.patch`, by hand: `import voice_core`; `<script src="/static/voice.js">` in `PAGE`; `data-voice="new-job"`, `data-voice="follow-up" data-job="…"` and `<pre data-voice-read>`; the voice helper block (`VOICE_JS`, `VOICE_AUDIO_MAX`, `VOICE_STATE`, `voice_latest`, `voice_report_md`, `voice_status`, `voice_report`); `H.voice_post`; the `GET /static/voice.js` + `/api/voice/status` + `/api/voice/report` routes; the `POST /api/transcribe` / `/api/speak` / `/api/voice/command` routes. +86 lines, 4 lines rewritten (the only ones the patch rewrites). |
+| `web/tests/test_jobvoice_merge.py` | new, **5 tests**, pinning the merge from fixed lists (see below). |
+| `PLAN.md`, `AGENT_REPORT.md` | this job's findings, steps ticked, and this section. |
+
+### How the merge was done, and how it was checked
+
+The patch does not apply to this file (it grew from 1767 to 2537 lines since the branch point:
+U07/U07b cards, U09a login and layout, U04/U05/U06 blocks…), so each hunk was placed by hand in the
+same position relative to its neighbours as in the live file:
+
+- `voice_core` is imported where the live file imports it (after `reviewbundle`, before `upgrades`).
+- The voice helper block sits immediately before `class H`; `voice_post` immediately after `send`
+  (above U07's `sse_job`, which is where live has `redirect`).
+- `do_GET`: the voice routes go **after** `self.guard()` (a phone that has not logged in still gets
+  403, asserted) and **below** this copy's pre-login manifest/icon routes, which stay.
+- `do_POST`: the `/login` route stays above the guard; the voice routes come after
+  `guard(post=True)` and **before** the `READONLY` refusal — that is where live puts them, so the
+  speech routes keep working on a read-only board.
+- `PAGE` keeps this copy's `@@PHONE@@` (U09a phone CSS) and gains the voice script tag:
+  `</style>@@PHONE@@</head>…@@BODY@@</div><script src="/static/voice.js"></script></body>`.
+
+Checked three ways: (1) every line the patch adds is present here — 82 added lines, 81 of them word
+for word and exactly one deliberately different, the `PAGE` line, which here also holds
+`@@PHONE@@`; (2) every line containing
+`VOICE` in the live `jobboard.py` (13 of them) is here word for word; (3) `git diff` shows only
+additions plus those 4 rewritten lines, i.e. no code of this copy was dropped. `web/jobboard.py` was
+never replaced with the live file.
+
+`web/tests/test_jobvoice_merge.py` keeps that guarantee after the snapshot is gone: it compares the
+source of `jobboard.py` against **fixed lists in the test file** (all 13 `VOICE` lines, the helpers,
+hooks and route bodies, the four voice files by name and size) and against one marker line from
+every block that only this copy has (JAIL, U01, U04a, U04b, U05, U06, U06b, U07, U07b, U08, U09a,
+U10). It does not read `.live-voice-ref/`, which this run deleted at the end (it was never tracked,
+so a plain delete, not `git rm`). All 13 voice lines are absent from the commit before `47f7980`, so
+the test fails if voice is ever lost again — it is not vacuous.
+
+### Verification
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+Ran 830 tests in 291.975s
+OK (skipped=2)
+```
+
+**830 tests, up from 814** before this job: +11 (`test_jobvoice.py`) and +5 (`test_jobvoice_merge.py`).
+Nothing was deleted, skipped or weakened; no existing test was edited. The only skips are
+`test_speak_real_piper` and `test_transcribe_real_whisper`, which `test_jobvoice.py` skips itself
+when the models are not installed — copied verbatim. `python3 -m py_compile jobboard.py
+voice_core.py voice_worker.py` is clean, and `/static/voice.js` passes `node --check` (done by
+`test_static_voice_js`).
+
+### Unfinished / uncertain here
+
+- No whisper or piper install and no microphone in this sandbox (`~/agent-sandbox/voice` does not
+  exist and nothing can be downloaded), so transcription and talk-back were only exercised as far
+  as their error paths ("Voice is not installed…", empty recording, 413 over 25 MB). The routes,
+  limits, guards and status mapping are covered by the 11 HTTP tests.
+- `static/voice.js` is copied verbatim and syntax-checked, but its browser behaviour (MediaRecorder,
+  wake-word listening, autoplay) cannot be run here — there is no browser and no Playwright.
+- No live board was touched: this only makes the swap safe in one direction (this copy keeps voice).
+  The actual swap and release stay with Jason.
+- No build output: this is the web app (no APK). Run it with `python3 web/jobboard.py`.
