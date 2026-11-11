@@ -47,7 +47,9 @@ if "jobboard" not in sys.modules:      # standalone run: same isolated env as te
 import jobboard  # noqa: E402
 import upgrades  # noqa: E402
 import attempts  # noqa: E402
+import badges    # noqa: E402
 from agentjobs_upgrades import bestofn  # noqa: E402
+from agentjobs_upgrades.safegit import GitError  # noqa: E402
 
 GOOD = "def add(a, b):\n    return int(a + b)\n"
 BAD = "def add(a, b):\n    return a - b - 0\n"
@@ -97,6 +99,13 @@ class Pieces(unittest.TestCase):
         self.assertFalse(attempts.is_attempt_folder("proj-try1-zzzz"))  # someone else's folder
         self.assertFalse(attempts.is_attempt_folder("proj-try1"))
 
+    def test_attempt_folders_stay_out_of_the_folder_picker(self):
+        t = Path(tempfile.mkdtemp())
+        for name in ("proj", "proj-try1-ab12", "other-try2-9f3c", "plain-folder", "proj-try1-zzzz"):
+            (t / name).mkdir()
+        with mock.patch.object(jobboard, "WORK", t):
+            self.assertEqual(jobboard.folders(), ["plain-folder", "proj", "proj-try1-zzzz"])
+
     def test_settings_keep_the_new_keys(self):
         t = Path(tempfile.mkdtemp()) / "s.json"
         cfg = upgrades.load_settings(t)
@@ -117,6 +126,15 @@ class Pieces(unittest.TestCase):
                          {"n": 3, "hard": True, "stop_early": True})
         self.assertEqual(attempts.plan({"attempts": 2}, {"stop_early": False})["stop_early"], False)
         self.assertEqual(attempts.plan({"attempts": 2, "stop_early": True}, {"stop_early": False})["stop_early"], True)
+
+    def test_phase_tag_names_the_try_being_checked(self):
+        self.assertEqual(attempts.phase_tag({"attempts_total": 3, "attempts_current": 2}),
+                         "Attempt 2 of 3 - ")
+        for m in ({}, {"attempts_total": 3}, {"attempts_current": 2},
+                  {"attempts_total": 3, "attempts_current": 0},
+                  {"attempts_total": 3, "attempts_current": 4},
+                  {"attempts_total": True, "attempts_current": 1}):
+            self.assertEqual(attempts.phase_tag(m), "")
 
     def test_record_fields_are_validated_before_a_job_runs(self):
         base = {"id": "20261111-120000-ab12", "mode": "local-qwen", "folder": "proj", "job": "x",
@@ -461,10 +479,11 @@ class Jobs(unittest.TestCase):
         repo = self.project()
         big = GOOD + "\n# long note about how it was fixed\n" + "x = 1\ny = 2\n"
         scen = {"attempts": [[{"say": "I could not work it out"}],                       # try 1: fails
-                             [{"write": "calc.py", "content": big},
-                              {"write": "NOTES.md", "content": "notes\n"}],              # try 2: works, bigger
+                             {"rounds": [[{"say": "I think that works"}],                # try 2: needs a fix round
+                                         [{"write": "calc.py", "content": big},
+                                          {"write": "NOTES.md", "content": "notes\n"}]]},
                              [{"write": "calc.py", "content": GOOD}]]}                  # try 3: works, smallest
-        m = self.run_job(scen, extra={"fix_rounds": 0, "attempts": 3, "hard": True})
+        m = self.run_job(scen, extra={"fix_rounds": 1, "attempts": 3, "hard": True})
         log = m["attempt_log"]
         self.assertEqual([a["k"] for a in log], [1, 2, 3])               # a hard job never stops early
         self.assertEqual([a["status"] for a in log], ["failed", "passed", "passed"])
@@ -481,13 +500,21 @@ class Jobs(unittest.TestCase):
         self.assertEqual(git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip(), f"agent/{self.jid}")
         self.assertIn(f"agent/{self.jid}-try1", self.branches(repo))
         self.assertIn(f"agent/{self.jid}-try3", self.branches(repo))
-        # the tries' folders are gone, their check logs are apart from each other
+        # the tries' folders are gone, their check logs are apart from each other, and a try
+        # gets the usual fix rounds (try 2 needed one)
         self.assertEqual(sorted(d.name for d in self.work.iterdir() if d.is_dir()), ["proj"])
         for k in (1, 2, 3):
             self.assertTrue((self.jobs / self.jid / "attempts" / f"try-{k}" / "checks" / "round-0").is_dir())
+        self.assertTrue((self.jobs / self.jid / "attempts" / "try-2" / "checks" / "round-1").is_dir())
         self.assertFalse((self.jobs / self.jid / "checks").exists())
+        # the check badges of the job point at the winner's own log (U07b)
+        last = len((m["verify"].get("rounds") or [{}])) - 1
+        txt, _cut = badges.check_text(m, f"round{last}", 0, self.jobs / self.jid)
+        self.assertIn("Ran 2 tests", txt)
         # and the page tells the story
-        self.assertIn("Attempt 3 of 3 started", [e["text"] for e in self.timeline()])
+        tl = [e["text"] for e in self.timeline()]
+        self.assertIn("Attempt 3 of 3 started", tl)
+        self.assertIn("Attempt 2 of 3: passed - 2 tests passing", tl)
 
     def test_early_stop_after_one_clean_try_when_the_job_is_not_hard(self):
         self.project()
@@ -595,6 +622,92 @@ class Jobs(unittest.TestCase):
         self.assertTrue(all(s and s.startswith("fake-") for s in sessions))
         self.assertNotEqual(sessions[0], sessions[1], "each try starts its own conversation")
         self.assertIn(m["session"], sessions)                     # follow-up carries on the kept try
+
+
+# ------------------------------------------------------------------ the run, with a stand-in agent
+
+class Run(unittest.TestCase):
+    """run_best_of_n with a stand-in for run_agent_job, so the parts around the tries
+    (preparing them, Stop, a branch that will not come home) can be seen on their own."""
+
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp(prefix="u05-run-"))
+        self.work = self.t / "work"
+        self.repo = make_project(self.work)
+        self.base = git(self.repo, "rev-parse", "HEAD").strip()
+        self.jdir = self.t / "job"
+        self.jdir.mkdir()
+        self.jid = "20261111-120000-ab12"
+        self.host = mock.patch.object(upgrades, "HOST_MODE", True)
+        self.host.start()
+        self.addCleanup(self.host.stop)
+        self.rec = {"id": self.jid, "folder": "proj", "job": "fix calc", "status": "running",
+                    "git_start": self.base, "attempts": 2, "hard": True}
+
+    def drive(self, run_one):
+        box = {"m": dict(self.rec)}
+
+        def load(name):
+            return box["m"]
+
+        def update(name, **kw):
+            box["m"].update(kw)
+            return box["m"]
+
+        out = attempts.run_best_of_n(box["m"], self.jid, work=self.work, job_dir=lambda n: self.jdir,
+                                     load=load, update=update,
+                                     run_one=lambda am, name, fresh: run_one(am, name, fresh, box["m"]),
+                                     settings={})
+        return out, box["m"]
+
+    def branches(self, repo):
+        return re.findall(r"agent/\S+", git(repo, "branch", "--list", "agent/*"))
+
+    def test_a_try_that_cannot_start_fails_the_job_with_a_note(self):
+        (self.work / attempts.attempt_folder("proj", self.jid, 1)).write_text("in the way\n")
+
+        def no_agent(am, name, fresh, rec):
+            raise AssertionError("the agent must not start when a try cannot be prepared")
+
+        out, _ = self.drive(no_agent)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("Attempt 1 could not start", out["fail_note"])
+        self.assertEqual(out["attempts_note"], out["fail_note"])
+        self.assertEqual(out["attempts_final"]["ranked"], [])
+        self.assertEqual(sorted(d.name for d in self.work.iterdir() if d.is_dir()), ["proj"])
+
+    def test_stop_between_tries_ends_the_job_stopped_not_stopping(self):
+        started = []
+
+        def agent(am, name, fresh, rec):
+            started.append(am["folder"])
+            rec["status"] = "stopping"                     # the user pressed Stop during this try
+            return {"status": "stopped", "session": "fake-1", "verify": {"status": "unverified"}}
+
+        out, _ = self.drive(agent)
+        self.assertEqual(out["status"], "stopped")
+        self.assertEqual(out["fail_note"], "Stopped before all attempts finished.")
+        self.assertEqual([a["k"] for a in out["attempt_log"]], [1])
+        self.assertEqual(started, ["proj-try1-ab12"], "no further try starts after Stop")
+
+    def test_a_try_whose_branch_will_not_come_home_keeps_its_folder(self):
+        def agent(am, name, fresh, rec):
+            (self.work / am["folder"] / "work.py").write_text("print(1)\n")   # it did something
+            return {"status": "done", "verify": {"status": "passed",
+                                                 "final": {"results": [{"passed": 2, "failed": 0}]}}}
+
+        def refusing(m, work, bundle, branch, sha=None):
+            raise GitError("bundle went missing")
+
+        with mock.patch.object(attempts, "bring_home", refusing):
+            out, _ = self.drive(agent)
+        self.assertEqual([a["k"] for a in out["attempt_log"]], [1, 2])
+        for a in out["attempt_log"]:
+            self.assertIn("branch could not be saved", a["note"])
+            self.assertTrue((self.work / a["folder"]).is_dir(), "its copy is left where it is")
+        self.assertEqual(out["attempts_final"]["ranked"], [1, 2])   # still scored, still ranked
+        self.assertEqual(self.branches(self.repo), [])              # nothing came home to push
+        self.assertIn("Could not put", out["attempts_note"])        # and the page says so
 
 
 # ------------------------------------------------------------------ the pages

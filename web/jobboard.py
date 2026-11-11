@@ -416,6 +416,7 @@ def run_gate(ctx):
     m, name, jid = ctx.m, ctx.name, ctx.m["id"]
     maxr = m["fix_rounds"] if isinstance(m.get("fix_rounds"), int) else int(ctx.cfg["fix_rounds"])
     wrap = upgrades.make_wrap(ctx.root, m["folder"], f"agentcheck-{jid}")
+    tag = attempts.phase_tag(m)   # U05: "Attempt 2 of 3 - " while a hard job is being tried
     state = {"round": 0}
 
     def stopped():
@@ -425,7 +426,7 @@ def run_gate(ctx):
         if stopped():
             raise GateAbort("user_stop")
         r = state["round"]
-        update_meta(name, phase="Running checks" + (f" after fix round {r}" if r else ""))
+        update_meta(name, phase=tag + "Running checks" + (f" after fix round {r}" if r else ""))
         ctx.ev.emit("checks_start", "Running checks in the sandbox" + (f" after fix round {r}" if r else ""))
         ctx.ev.release()
         summary = ck.run_all(ctx.root, ctx.checks_root / "checks" / f"round-{r}", wrap,
@@ -436,7 +437,7 @@ def run_gate(ctx):
 
     def run_agent(prompt, rnd):
         state["round"] = rnd
-        update_meta(name, phase=f"Fix round {rnd} of {maxr}")
+        update_meta(name, phase=tag + f"Fix round {rnd} of {maxr}")
         rc, fok, how, act = run_agent_loop(ctx, prompt, session_of(jid) or m.get("resume"), rnd)
         if how in ("user_stop", "safety_stop", "stop"):
             raise GateAbort(how, act)

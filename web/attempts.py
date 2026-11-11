@@ -121,6 +121,16 @@ def attempt_sub(k):
     return f"attempts/try-{k}"
 
 
+def phase_tag(m):
+    """"Attempt 2 of 3 - ": the gate rewrites the phase for its checks and fix rounds, so
+    without this the live banner stops saying which try is running."""
+    n, k = m.get("attempts_total"), m.get("attempts_current")
+    if isinstance(n, int) and not isinstance(n, bool) and isinstance(k, int) \
+            and not isinstance(k, bool) and 1 <= k <= n:
+        return f"Attempt {k} of {n} - "
+    return ""
+
+
 def is_attempt_folder(name):
     """A ~/agent-work folder this module made - it must not clutter the folder picker."""
     return bool(ATTEMPT_TAIL.search(str(name or "")))
@@ -319,7 +329,7 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
                                             f"{KEEP_DAYS} days")
     except GitError:
         pass
-    stopped, how = False, None
+    stopped, how, note = False, None, None
 
     for k in range(1, n + 1):
         if (load(name) or {}).get("status") in ("stopping", "cancelled"):
@@ -335,7 +345,8 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
             update(name, attempts_note=note)
             dashboard.tl_add(jd, "attempt", note)
             break
-        am = dict(m, folder=folder, resume=None, attempt_sub=attempt_sub(k), job=attempt_job(m, k))
+        am = dict(m, folder=folder, resume=None, attempt_sub=attempt_sub(k), attempts_total=n,
+                  attempts_current=k, job=attempt_job(m, k))
         t0 = time.time()
         out = run_one(am, name, k == 1) or {}
         extra, note = {}, None
@@ -377,10 +388,17 @@ def run_best_of_n(m, name, *, work, job_dir, load, update, run_one, settings):
     final = {"winner": (winner.k if winner else None), "why": bestofn.why(winner, ranked),
              "ranked": [a.k for a in ranked]}
 
-    if stopped or not log:
-        cur = update(name, attempts_final=final, phase=None,
+    if not log:      # the first try never got going (its folder or its base commit was bad)
+        cur = update(name, status="failed", finished=time.time(), attempts_final=final, phase=None,
+                     attempts_note=note, fail_note=note or "No attempt could be started.") or {}
+        dashboard.tl_add(jd, "failed", dashboard.finished_text(cur))
+        return cur
+
+    if stopped:      # Stop between tries: say so instead of leaving the record "stopping"
+        how = "cancelled" if (load(name) or {}).get("status") == "cancelled" else "stopped"
+        cur = update(name, status=how, finished=time.time(), attempts_final=final, phase=None,
                      fail_note="Stopped before all attempts finished.") or {}
-        dashboard.tl_add(jd, "failed", "Stopped: " + final["why"])
+        dashboard.tl_add(jd, "failed", dashboard.finished_text(cur))
         return cur
 
     best = (by_k.get(ranked[0].k) if ranked else None) or {}
