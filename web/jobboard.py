@@ -20,6 +20,7 @@ import benchstats
 import jailcfg   # JAIL: no-internet sandbox for local modes, self-test, Push button
 import jobstatus
 import reviewbundle
+import voice_core   # VOICE: offline speech in/out (whisper worker + piper, CPU only)
 import upgrades   # U01: verify gate, git checkpoints, runaway watchdog
 import dashboard  # U07: timeline, live updates (SSE), live log, badges
 import badges     # U07b: one badge per check, linking to its output
@@ -1449,7 +1450,7 @@ a.btn{display:inline-block;background:var(--acc);color:#fff;border-radius:7px;pa
 .bundle-paste{min-height:160px;font:12px/1.4 ui-monospace,monospace;margin-top:8px}
 details summary{cursor:pointer}
 .act{max-width:300px}
-</style>@@PHONE@@</head><body><div class="wrap">@@BODY@@</div></body></html>"""
+</style>@@PHONE@@</head><body><div class="wrap">@@BODY@@</div><script src="/static/voice.js"></script></body></html>"""
 
 def render(body): return PAGE.replace("@@BODY@@", body).replace("@@PHONE@@", phonelayout.CSS)
 
@@ -1559,7 +1560,7 @@ def home_page():
 <div class="row"><div><label>Mode</label><select name="mode">{opts}</select></div>
 <div><label>Project folder (in ~/agent-work)</label><select name="folder"><option value="">New folder...</option>{fopts}</select>
 <input type="text" name="newfolder" placeholder="New folder name, e.g. my-app" style="margin-top:6px"></div></div>
-<label>Job</label><textarea name="job" required placeholder="Describe the job the way you would to Claude. Example: Clone https://github.com/... into this folder, add a dark mode toggle to the settings screen, and build a debug APK."></textarea>
+<label>Job</label><textarea name="job" data-voice="new-job" required placeholder="Describe the job the way you would to Claude. Example: Clone https://github.com/... into this folder, add a dark mode toggle to the settings screen, and build a debug APK."></textarea>
 {jailcfg.OFFLINE_FIELD}
 {jailcfg.FETCH_FORM_FIELD}
 {upgrades.new_job_fields(upgrades.load_settings(SETTINGS_FILE, write_defaults=False)["fix_rounds"])}
@@ -1625,7 +1626,7 @@ def job_page(jid, decide_tok="", decide_note=""):
     follow_html = ""
     if not active and m.get("session"):
         follow_html = (f'<div class="card"><h2>Follow up</h2><form method="post" action="/followup/{jid}">'
-                       f'<textarea name="job" required placeholder="Ask a follow-up question or give the next instruction. It continues this job\'s conversation, in the same folder."></textarea>'
+                       f'<textarea name="job" data-voice="follow-up" data-job="{esc(jid)}" required placeholder="Ask a follow-up question or give the next instruction. It continues this job\'s conversation, in the same folder."></textarea>'
                        f'<p class="hint">Runs as a new job in the queue, carrying on from where this one finished.</p><button>Send</button></form></div>')
     s = status_for(m)
     glyph = STATE_GLYPH[s["state"]]
@@ -1674,7 +1675,7 @@ def job_page(jid, decide_tok="", decide_note=""):
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
 {bundle_html}{decisions.card_html(m, jid, can_act, decide_tok, WORK / m["folder"], decide_note)}{decisions.CSS}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
-<div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
+<div class="card"><h2>Report</h2>{f'<pre data-voice-read>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 {diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
 <div class="card"><h2>Build outputs</h2>{f'<ul>{out_html}</ul>' if outs else '<span class="mut">None found yet (APK, AAB, EXE, ZIP...).</span>'}</div>
 <script>
@@ -1806,6 +1807,53 @@ def notify_page(errors=(), note="", form=None, token_field="", token=""):
                                                  token_field, token))
 
 
+# ---------------------------------------------------------------- voice (VOICE)
+# Routes: POST /api/transcribe, POST /api/speak, GET /api/voice/status,
+# GET /api/voice/report, POST /api/voice/command, GET /static/voice.js.
+# All local: whisper runs in a CPU-only child process (voice_core.WhisperWorker),
+# unloaded after 10 idle minutes; piper writes WAVs to a small temp cache.
+VOICE_JS = Path(__file__).with_name("static") / "voice.js"
+VOICE_AUDIO_MAX = 25 * 1024 * 1024
+VOICE_STATE = {"QUEUED": "queued", "WORKING": "running", "STUCK": "stuck",
+               "FINISHED": "finished", "FAILED": "failed", "STOPPED": "stopped"}
+
+def voice_latest():
+    """Newest agent job (bench runs are skipped) as (meta, status) or (None, None)."""
+    for m in all_jobs():
+        if m.get("kind") != "bench":
+            return m, status_for(m)
+    return None, None
+
+def voice_report_md(m, fresh=False):
+    """AGENT_REPORT.md of the job's folder. fresh=True: only if written since the job started
+    (an older job's report in the same folder must not be read out as this job's result)."""
+    p = safe_path(m.get("folder") or "", "AGENT_REPORT.md") if m.get("folder") else None
+    try:
+        if not p or (fresh and p.stat().st_mtime < float(m.get("started") or m.get("created") or 0)):
+            return ""
+        return p.read_text(errors="replace")[:60000]
+    except (OSError, ValueError): return ""
+
+def voice_status():
+    m, s = voice_latest()
+    if not m:
+        return {"job_id": None, "status": None, "text": voice_core.status_speech(None)}
+    st = VOICE_STATE.get(s["state"], s["state"].lower())
+    job = {"status": st, "title": s.get("short") or ""}
+    if st in ("finished", "failed", "stuck", "stopped"):
+        rep_md = voice_report_md(m, fresh=True) if st == "finished" else ""
+        job["report"] = rep_md or s.get("result_summary") or s.get("fail_reason") or ""
+    else:
+        if s.get("steps_total"): job.update(step=s.get("steps_done") or 0, steps=s["steps_total"])
+        if s.get("elapsed") is not None: job["elapsed_s"] = s["elapsed"]
+    return {"job_id": m["id"], "status": st, "text": voice_core.status_speech(job)}
+
+def voice_report():
+    m, _ = voice_latest()
+    md = voice_report_md(m) if m else ""
+    return {"text": voice_core.clean_markdown(md) or "No report yet."}
+
+
 class H(http.server.BaseHTTPRequestHandler):
     server_version = "jobboard"
 
@@ -1859,6 +1907,28 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store"); self.send_header("X-Frame-Options", "DENY")
         for k, v in headers: self.send_header(k, v)
         self.end_headers(); self.wfile.write(b)
+
+    def voice_post(self, path):
+        """VOICE: raw-body routes. Runs in this request's own thread (ThreadingHTTPServer),
+        so a slow transcription never blocks the page or the other routes."""
+        try: n = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError: n = -1
+        limit = VOICE_AUDIO_MAX if path == "/api/transcribe" else 64 * 1024
+        if n < 0 or n > limit:
+            return self.send(json.dumps({"error": "Recording too long." if path == "/api/transcribe" else "Too large."}),
+                             "application/json", code=413)
+        body = self.rfile.read(n)
+        try:
+            if path == "/api/transcribe":
+                return self.send(json.dumps({"text": voice_core.transcribe_bytes(body)}), "application/json")
+            try: text = json.loads(body or b"{}").get("text") or ""
+            except (ValueError, AttributeError): return self.send(json.dumps({"error": "Bad request."}), "application/json", code=400)
+            if not isinstance(text, str): text = ""
+            if path == "/api/speak":
+                return self.send(voice_core.speak_to_file(text).read_bytes(), "audio/wav")
+            return self.send(json.dumps({"command": voice_core.parse_command(text)}), "application/json")
+        except voice_core.VoiceError as e:
+            return self.send(json.dumps({"error": str(e)}), "application/json", code=400)
 
     def sse_job(self, jid, q):
         """U07: Server-Sent Events for one job (timeline ids resume via Last-Event-ID)."""
@@ -2081,6 +2151,11 @@ class H(http.server.BaseHTTPRequestHandler):
         if not self.guard(): return
         u = urllib.parse.urlparse(self.path); parts = u.path.strip("/").split("/")
         q = urllib.parse.parse_qs(u.query)
+        if u.path == "/static/voice.js":   # VOICE
+            try: return self.send(VOICE_JS.read_bytes(), "text/javascript; charset=utf-8")
+            except OSError: return self.send_error(404)
+        if u.path == "/api/voice/status": return self.send(json.dumps(voice_status()), "application/json")   # VOICE
+        if u.path == "/api/voice/report": return self.send(json.dumps(voice_report()), "application/json")   # VOICE
         if u.path == "/": return self.send(home_page())
         if u.path == "/api/rows": return self.send(job_rows())
         if u.path == "/bench": return self.send(bench_page())
@@ -2230,6 +2305,9 @@ class H(http.server.BaseHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path == "/login":
             return self.login_post()      # U09a: before the guard - a phone has no cookie yet
         if not self.guard(post=True): return
+        vpath = urllib.parse.urlparse(self.path).path
+        if vpath in ("/api/transcribe", "/api/speak", "/api/voice/command"):   # VOICE
+            return self.voice_post(vpath)
         if READONLY:
             return self.send_error(403, "This job board runs read-only: starting or stopping jobs is disabled")
         parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")

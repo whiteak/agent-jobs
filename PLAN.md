@@ -954,3 +954,50 @@ marks, not through a real browser run; the screenshot path itself is covered by 
 with fake shot data, as before. No podman/bwrap jail: the tests run in the host jail
 (`JOBBOARD_JAIL=host`), as in the earlier jobs.
 
+
+---
+
+# Fix job B — merge the live voice code (VOICE) into this copy
+
+This copy branched off the live board before voice chat existed, so it has no voice code at all.
+A later swap of this copy onto the live board would delete voice. The job: bring the voice code in
+here, keeping every line this copy already has (JAIL / U01 / U04 / U05 / U06 / U07 blocks included).
+`.live-voice-ref/` (live files + base + the base→live patch) is the only source; it is deleted at
+the end so the merge is not left depending on a snapshot.
+
+## Findings
+
+1. **No voice files here:** `voice_core.py`, `voice_worker.py`, `static/voice.js`,
+   `tests/test_jobvoice.py` are missing from `web/`.
+2. **`web/jobboard.py` has none of the nine voice changes** in `live-changes.patch` (import,
+   `voice.js` script tag, `data-voice` hooks on the two textareas and the report `<pre>`, the
+   voice helper block, `H.voice_post`, the two GET routes + static js, the POST route).
+   The patch does not apply: this file grew from 1767 to 2537 lines since the branch point.
+3. **Nothing may be lost from this copy** — the merge is by hand, block by block, never by
+   copying the live file over.
+
+## Steps
+
+- [x] 1+2: copy `voice_core.py`, `voice_worker.py`, `static/voice.js`, `tests/test_jobvoice.py` in
+      verbatim (same relative paths under `web/`, md5-identical to the live files) and apply the
+      nine hunks of `live-changes.patch` to `web/jobboard.py` by hand in the same commit — the two
+      only work together (the copied test needs the routes). `@@PHONE@@` (U09a), the U09a `/login`
+      route in `do_POST`, the U07 dashboard cards in the job page and the pre-login static routes
+      in `do_GET` all stay; `git diff` shows 86 added lines and only the 4 lines the patch itself
+      rewrites.
+- [x] 3: marker check — `tests/test_jobvoice_merge.py` (5 tests) pins all 13 `VOICE` lines of the
+      live `jobboard.py`, the helpers/hooks/routes around them, the four voice files, and one
+      marker line per block only this copy has (JAIL, U01, U04a/b, U05, U06, U06b, U07, U07b, U08,
+      U09a, U10). Fixed lists in the test file; nothing reads `.live-voice-ref`. All 13 voice lines
+      are absent from `HEAD`, so this test fails if the merge is ever lost.
+- [x] 4: full suite green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest
+      discover -s tests` → **Ran 830 tests in 291.975s / OK (skipped=2)** — 814 before this job
+      (+11 `test_jobvoice.py`, +5 `test_jobvoice_merge.py`).
+- [ ] 5: `git rm -r .live-voice-ref`, commit, AGENT_REPORT.md section for this job.
+
+## What this job cannot do here
+
+No whisper/piper models and no voice venv in this sandbox (`~/agent-sandbox/voice` does not
+exist), so the two real-model tests in `tests/test_jobvoice.py` skip exactly as they do on the
+live board — they are copied verbatim, not edited. There is no microphone either, so
+`static/voice.js` is only checked as served bytes plus `node --check`.
