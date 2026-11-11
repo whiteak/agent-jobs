@@ -646,31 +646,63 @@
   -m unittest discover -s tests`. Baseline before my changes: **425 tests, OK** (job 06's
   leftover best-of-N work was left uncommitted in this shared copy; committed as-is first).
 
+### What this run found on top of that plan (re-run, 12 Nov)
+
+- The plan above was written by the run that started this job; its code and its 53 tests are
+  `5b3efad`, but that run stopped before ticking anything, before the port-8091 click-through
+  and before its AGENT_REPORT.md section. Nothing here needed rebuilding — this run verified the
+  feature, clicked it, and fixed what the clicking found.
+- Two baselines were wrong on the way here. The note above says "425 tests, OK"; the shared copy
+  was at **785**, and job 09's (U10 morning report) work was still uncommitted from a run that
+  stopped mid-way — committed as found (`7a28338`) so this job's diff stays clean. Suite is
+  green at **790** from here (58 tests in `test_u04a_plan.py`).
+- Four real bugs, each found by clicking the pages or reading the state machine, each with a test:
+  - `ad8f340` — a planning job whose record the worker refuses, or whose jail self-test fails,
+    left `plan_status=running` for ever: the project page kept saying "The planner is working on
+    it.", hid **Review the plan**, and no retry was ever queued. `process_job` now runs the plan
+    hook on those paths too (`requeue=False`, so a job that never ran queues nothing behind
+    itself and the automatic re-send stays at one).
+  - `ad8f340` — when the planner wrote no `tasks.json` at all the page said "The plan is not
+    usable yet (0 problems)". Now: "The planner wrote no tasks.json - press Make a plan again."
+  - `8c911c9` — the New project page lists every folder in `~/agent-work`; picking one that was
+    already a project wrote a fresh record over the old one, losing its outline, its plan and
+    what Jason had approved, while the folder's 4b queue carried on under a project that no
+    longer said it was approved. One record per folder, so a second create is refused instead.
+  - `63472dc` — `planning.CSS` had no phone block (phonelayout's rule is that each module styles
+    its own classes), so on a phone the plan page's sticky Save / Approve bar sat under the
+    upgrade 9a sticky header — the buttons Jason needs after scrolling a long plan.
+- What the 8091 copy could not click: a real planner. There is no model agent in this sandbox, so
+  the planner-run path is covered by the `Run` tests (a child process with the real worker and the
+  fake agent, plan files written into a real folder). Pressing **Make a plan** there with mode
+  "Fake agent" gets its record refused — fake mode wants a scenario as its job text, as it does
+  for every fake job — which is exactly the case the first fix above now reports honestly.
+
 ### Steps
 
-- [ ] Commit job 06's leftover work as-is (its own commit) so this job's diffs stay clean.
-- [ ] `prompts/planner.md` (repo root): the planner prompt with `{{NAME}} {{KIND}} {{FOLDER}}
+- [x] Commit job 06's leftover work as-is (its own commit) so this job's diffs stay clean.
+- [x] `prompts/planner.md` (repo root): the planner prompt with `{{NAME}} {{KIND}} {{FOLDER}}
       {{OUTLINE}} {{ERRORS}}` placeholders — "do not write app code", write ROADMAP.md +
       tasks.json, ~45-minute tasks, task 1 = skeleton + test setup + AGENT_CHECKS.json,
       testable acceptance criteria.
-- [ ] `docs/tasks-schema.json`: the task schema, exactly `plan.SCHEMA` (a test keeps it in sync).
-- [ ] `web/planning.py` (new glue, `# U04a`): project records under `PLANS/`, project folder
+- [x] `docs/tasks-schema.json`: the task schema, exactly `plan.SCHEMA` (a test keeps it in sync).
+- [x] `web/planning.py` (new glue, `# U04a`): project records under `PLANS/`, project folder
       creation (jail git init on branch `agent/<name>` + a first commit), the planner prompt,
       `start_plan` (a normal job, `plan_job` marker, checks off), reading + validating the
       folder's `tasks.json`/`ROADMAP.md`, the one automatic re-send of the errors,
       save/approve, and the page HTML (new project, project, plan review).
-- [ ] `jobboard.py` hooks: `PLANS`, header links, `check_record` validation for
-      `plan_job`/`plan_retry`, `planning.plan_finished(...)` after `run_planned`, the plan card
-      on a planning job's page, GET `/projects` `/project/new` `/project/<folder>`
-      `/plan/<folder>`, POST `/project/new` `/project/edit/<folder>` `/plan/edit/<folder>`.
-- [ ] `web/tests/test_u04a_plan.py`: schema (good/bad/cycles) + the docs file stays in sync,
+- [x] `jobboard.py` hooks: `PLANS`, header links, `check_record` validation for
+      `plan_job`/`plan_retry`, `planning.plan_finished(...)` after `run_planned` (and now on the
+      paths where the record was refused), the plan card on a planning job's page, GET
+      `/projects` `/project/new` `/project/<folder>` `/plan/<folder>`, POST `/project/new`
+      `/project/edit/<folder>` `/plan/edit/<folder>`.
+- [x] `web/tests/test_u04a_plan.py`: schema (good/bad/cycles) + the docs file stays in sync,
       prompt content, project folder creation (git init, branch, first commit), records +
       approval state, the plan form parse (index-named fields, move/drop/add, blank values),
       a canned planner output through the fake agent (valid plan, and an invalid plan sent
-      back to the planner exactly once), and the pages/routes served in-process.
-- [ ] Full suite passes with the gate's command; smoke-serve the board on a free port
-      (never 8090) and click the new pages with curl.
-- [ ] AGENT_REPORT.md section for this job.
+      back to the planner exactly once), and the pages/routes served in-process. 58 tests.
+- [x] Full suite passes with the gate's command; smoke-serve the board on a free port
+      (never 8090) and click the new pages with curl. (790 tests OK; 76 curl checks on 8091.)
+- [x] AGENT_REPORT.md section for this job.
 
 ---
 

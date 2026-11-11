@@ -1152,3 +1152,172 @@ There is a driver for all of that — 46 printed checks against a real server on
 - `~/agent-sandbox` untouched; no installs, no network, stdlib only; no push. The branch is
   `agent/jobboard-next`, ready for Jason to review, push and merge.
 
+
+---
+
+## Job 07 — Upgrade 4a: requirements → plan (re-run, finished)
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md holds this job's findings and its step list, all ticked, plus a "what this run
+found" note.
+
+This job had been started before. The whole feature — `web/planning.py`, `prompts/planner.md`,
+`docs/tasks-schema.json`, the `jobboard.py` hooks and 53 tests — is commit `5b3efad`; the run that
+wrote it stopped before ticking its steps, before the 8091 click-through and before its report
+section. This run did not rebuild anything: it read it, clicked it end to end on its own port,
+and fixed the four things that came out of doing that.
+
+Commits in this run:
+
+- `7a28338` job 09 residue: the U10 morning report (`web/morningreport.py`, its jobboard hooks,
+  its PLAN.md note) left uncommitted by a run that stopped mid-way, committed as found so this
+  job's diff stays clean — the suite was green with it, and it is not finished work of job 07.
+- `ad8f340` U04a: a refused planning job stuck the project at "the planner is working on it" for
+  ever, and a missing `tasks.json` printed "The plan is not usable yet (0 problems)"; 3 tests.
+- `8c911c9` U04a: the New project page overwrote an existing project's record; 1 test.
+- `63472dc` U04a: the plan page had no phone rules, so its Save/Approve bar hid under the
+  upgrade 9a sticky header; 1 test.
+- (docs) PLAN.md ticked + this section.
+
+### Files changed in this run
+
+| File | What changed |
+| --- | --- |
+| `web/planning.py` | `plan_finished(..., requeue=...)`; the "no tasks.json" sentence in `state_line`; a phone media block for the plan page's own `.pbar`; imports `phonelayout` for its width. |
+| `web/jobboard.py` | `plan_hook(m, requeue)` (the one place the plan hook is called), now also on the two paths where the worker refuses a record before anything runs; `POST /project/new` refuses a folder that is already a project here. |
+| `web/tests/test_u04a_plan.py` | 53 → **58** tests (all listed under "Verified"). |
+| `PLAN.md` | job 07's steps ticked + the re-run findings. |
+| `AGENT_REPORT.md` | this section. |
+
+Nothing else was touched. `agentjobs_upgrades/plan.py` is used exactly as given (`validate`,
+`order`, `SCHEMA`) — not reimplemented; `taskqueue` (4b), `decisions` (8), `phoneaccess`/
+`phonelayout` (9a) and the `# JAIL:`, `# U01`, `# U05`, `# U07`, `# VOICE` and `# U10` blocks all
+still work: the full suite runs them.
+
+### How each requirement is met
+
+1. **New project page** (`/project/new`): name, kind (Android app / Windows app / web app /
+   other), the outline box, and the folder choice — an existing folder from `~/agent-work`, or
+   "Start a new folder", which creates `~/agent-work/<name>` with `git init -b agent/<name>` and
+   one starting commit, run through `SafeGit` inside that folder's own jail (`upgrades.make_wrap`
+   → `jail/run-local.sh sandbox-run`). A folder whose git could not start is said on the page
+   ("the agent will work without checkpoints there"), not raised.
+2. **Make a plan** (`/project/edit/<folder>`, button `plan`) starts a **normal job** — same
+   queue, same worker, same follow-up machinery — whose prompt comes from `prompts/planner.md`
+   and opens "Do not write any app code, do not build anything and do not install anything". The
+   record carries `plan_job` and `verify_off` (a plan is judged by its schema and by Jason, not
+   by a build that does not exist yet). The planner writes `ROADMAP.md` and `tasks.json`; the
+   schema those two files must satisfy is `docs/tasks-schema.json`, which a test keeps identical
+   to `plan.SCHEMA`.
+3. **Validation** is `agentjobs_upgrades/plan.py` (`validate` → fields, unknown fields, id
+   charset, duplicate ids, unknown or self dependencies, `order()`'s cycles). An unusable plan
+   goes back to the planner **once**, by itself: `plan_finished` queues a follow-up job (same
+   folder, `parent` = the failed plan job, resuming its session) whose prompt carries the errors,
+   and a second refusal stops with the errors on the timeline.
+4. **Plan review page** (`/plan/<folder>`): milestones as `<details>` sections, one card per task
+   with editable title / milestone / prompt / criteria / checks / size / screen, **Up** and
+   **Down** to reorder, **Delete**, **Add task**, `after: t2` under each card, one **Save** and
+   one **Approve plan**. Reordering, deleting and adding only change the page — **Save** writes
+   `tasks.json`; approving copies the validated tasks into `state/plans/<folder>.json`, outside
+   everything the sandbox mounts, so a later run follows what Jason approved. Nothing runs on
+   approve: 4b's queue card then offers *Start the tasks*.
+5. **`prompts/planner.md`** is the whole planner prompt, with `{{NAME}} {{KIND}} {{FOLDER}}
+   {{OUTLINE}} {{ERRORS}}`, kept out of the code so it can be improved without a change to it.
+
+### Verified
+
+- Gate command, as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 790 tests in 281.322s` / `OK`**. Baseline at the start of this run: **785 tests, OK**
+  (the committed U10 residue included). Nothing deleted, skipped or weakened; this run adds 5.
+- This module alone: `python3 -W ignore -m unittest tests.test_u04a_plan` → **58 tests OK**.
+  New since `5b3efad`:
+  * `test_a_planner_that_wrote_no_file_is_said_plainly` — no "0 problems" wording.
+  * `test_a_plan_job_that_never_ran_queues_nothing_behind_itself` — `requeue=False`: state
+    becomes `invalid`, the timeline says the job never started, and no follow-up is queued.
+  * `test_a_plan_job_the_worker_refused_leaves_nothing_waiting` — a real queued record refused
+    by `check_record` (`plan_retry=99`), run through the real `process_job`: the job is `failed`
+    with a "Refused:" note, the project is no longer `running`, its page no longer says the
+    planner is working, and nothing was queued behind it.
+  * `test_a_folder_that_is_already_a_project_is_not_started_again` — the old outline, name and
+    `approved_at` survive an attempted second create in the same folder.
+  * `test_the_plan_buttons_stay_reachable_on_a_phone` — `planning.CSS` carries a
+    `@media (max-width:700px)` rule un-sticking `.pbar`, and the bar is repeated under the tasks.
+- The 4a and 4b modules together: `python3 -W ignore -m unittest tests.test_u04a_plan
+  tests.test_u04b_queue` → **128 tests OK** (approving a plan still hands a sound queue to 4b).
+- Served the real board once on port **8091** with its own folders (`HOME`,
+  `JOBBOARD_JOBS/WORK/PLANS/QUEUES/REPORTS` under `/tmp/u04a-smoke`, `JOBBOARD_JAIL=host`,
+  `JOBBOARD_FAKE=1`) and clicked it with curl: **76 checks, 0 failed**, then stopped it and
+  verified the port was closed and the log held no traceback. What those checks cover, in order:
+  the guard (no cookie 403, the token link's 303 and its `jb=` cookie, a POST with no cookie
+  403, unknown projects 404); the new-project page (fields and all four kinds, a name that
+  cannot be a folder refused with what was typed kept, no outline refused, unknown kind refused);
+  creating `notes-app` (folder made, branch `agent/notes-app`, one commit, README); the outline
+  (empty refused, save 303, stored in the record, shown again); Make a plan (job queued with
+  `plan_job`/`verify_off`, `plan_status=running`, the page says the planner is working, no
+  *Review the plan* yet, the job waits behind a job running in another folder); the planner
+  writing through the fake agent (`ROADMAP.md` + `tasks.json` in the folder); the plan page
+  ("A draft to check: 3 tasks in 2 milestones", collapsible milestones, editable title/prompt/
+  criteria cards, `after: t2`, up/down, delete, Add/Save/Approve, a task's `checks`, the screen
+  note, the roadmap on the project page); reorder alone changes no file, Save writes the edited
+  title; a circular `after` cannot be approved and the broken form writes nothing; a task with
+  no title or criteria is not saved; Delete then Approve (record `approved`, the approved tasks
+  in the record, 4b's `QUEUES/notes-app.json` on disk, **no job created**, "Approved - 2 tasks.
+  Nothing runs until you start them.", `/projects` shows it); picking a folder that is already a
+  project is refused.
+
+### Try it by hand
+
+1. `cd web && JOBBOARD_PORT=8123 python3 jobboard.py`, open the printed
+   `http://127.0.0.1:8123/?t=…` link (never 8090, and never this sandbox).
+2. **New project** → type a name, pick *What is it?* (Android / Windows / web / other), leave the
+   folder on "Start a new folder", paste your outline in your own words → **Create project**.
+   You land on the project page; `~/agent-work/<name>` exists with git on `agent/<name>`.
+   (Picking a folder that already belongs to another project here is refused — that folder's
+   plan is opened instead of being overwritten.)
+3. **Make a plan**, pick the agent. The project page says "The planner is working on it." and the
+   job looks like any other job; its own page has a **Plan** card. When it finishes: if it wrote
+   no `tasks.json`, the page says so and tells you to press Make a plan again; if what it wrote
+   was not a usable plan, the errors go back to the planner once, by itself, and the second
+   refusal is reported instead of looping.
+4. **Review the plan**. Milestones open and close; every task is a card you can rewrite (title,
+   what to do, done-when lines, checks, size, screen note, `after:` ids). **Up**/**Down**/**Delete**/
+   **Add task** move things on the page; press **Save** to put them in `tasks.json` — the page says
+   so ("Moved t2 up. Press Save to keep it."). Fix anything the plan page complains about in red.
+5. **Approve plan**. The record outside the sandbox now holds the approved tasks, the project
+   page gains the 4b **Tasks** card, and nothing has started: "Approved - N tasks. Nothing runs
+   until you start them."
+6. Phone: open the same board on a phone with upgrade 9a's access on. The plan page is one column
+   and the Save / Approve / Add bar scrolls with the page instead of hiding under the sticky
+   header — the same bar is repeated under the last task.
+
+### Unfinished / assumed
+
+- **The planner itself was never run against the model here** — there is no agent and no model in
+  this sandbox. The "a canned planner output through the fake agent" requirement is met by the
+  `Run` class: a child process with `JOBBOARD_JAIL=host JOBBOARD_FAKE=1` that calls the real
+  `process_job`, so the plan files, the record, the timeline line and the one automatic re-send
+  are exercised for real, with the planner replaced by a scripted writer.
+- On a `JOBBOARD_FAKE=1` copy, pressing **Make a plan** with mode "Fake agent (tests only)"
+  produces a job whose text is the planner prompt, which the safety check refuses — fake mode
+  needs a *scenario* as its job text, exactly as it does for every other fake job (4b's task jobs
+  behave the same way). That is how this run proved the "a refused plan job leaves the project
+  waiting for nothing" fix live. It was left as it is: no canned planner output is shipped in the
+  board.
+- **Two plan files, one source of truth for running.** The draft lives in the project folder
+  (`tasks.json`, writable by anything running there); the approved copy lives in
+  `state/plans/<folder>.json`. 4b runs the approved copy. Editing `tasks.json` after approving
+  makes the page say so ("You approved an earlier version of this plan - approve again if this
+  one is what you want"); it does not silently replace the approved plan.
+- The automatic re-send is exactly one, as specified. A planner that writes nothing at all is not
+  re-sent by itself (the plan page says to press Make a plan again) — an empty folder is more
+  likely a stopped job than a malformed plan, and re-queueing a job nobody asked for was not
+  wanted.
+- Milestone sections are built from the order the tasks are written, so the same milestone name
+  used in two distant places shows as two sections. Left alone: the planner writes them
+  contiguous, and re-ordering is Jason's to do.
+- A project record is one per folder. A folder can be planned again only after its project is
+  gone from `state/plans/` (there is no "delete project" button — not asked for).
+- No network, no installs, stdlib only. `~/agent-sandbox` untouched: every test and the 8091 run
+  use their own `HOME` and state folders (`/tmp/u04a-smoke`, deleted after the run). Nothing was
+  pushed; the branch `agent/jobboard-next` is ready for Jason to review, push and merge.
