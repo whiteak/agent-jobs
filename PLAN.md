@@ -62,26 +62,36 @@
 
 ## Steps
 
-- [ ] PLAN.md (this file) committed before the code.
-- [ ] `web/decisions.py` (new glue, `# U08`): the secret file + session cookie + form token
+- [x] PLAN.md (this file) committed before the code.
+- [x] `web/decisions.py` (new glue, `# U08`): the secret file + session cookie + form token
       (`decide_allowed`), which branch a job worked on and which it merges into, the Decide
       card (Approve & merge / Ask for changes / Reject + Merge anyway + Undo + Ask Qwen to fix
       the conflict), and `action()` doing merge / undo-merge / reject / undo-reject /
       changes-requested / fix-conflict through `actions.Decisions`, writing the record
-      (`decision_log`) and the timeline.
-- [ ] `jobboard.py` hooks: `import decisions`, the decision card on the job page, the `aj=`
+      (`decision_log`) and the timeline. (`2212f33`; the guard is `cannot_decide`, not
+      `jobboard.check_record` — see the re-run step)
+- [x] `jobboard.py` hooks: `import decisions`, the decision card on the job page, the `aj=`
       HttpOnly cookie on `GET /job/<id>`, and the POST routes that refuse anything without
-      the secret token.
-- [ ] `watchdog.SECRET_PATH_RE`: `.local/state/agentjobs` is a private location.
-- [ ] Tests `web/tests/test_u08_decide.py`: temp repos — fast-forward, merge commit,
+      the secret token. (`c27136c`)
+- [x] `watchdog.SECRET_PATH_RE`: `.local/state/agentjobs` is a private location. (`cb1346a`)
+- [x] Tests `web/tests/test_u08_decide.py`: temp repos — fast-forward, merge commit,
       conflict leaves nothing and offers the fix job, merge blocked when checks failed,
       "Merge anyway" needs the typed word, the request without the cookie/token is rejected
       (and a GET is), reject + undo (+ the branch rename), undo merge and undo refusing when
       something was committed on top, the follow-up jobs' prompts, the card states, the
       record + timeline rows, the "Not pushed" rule, and that the jail never mounts the
-      secret.
-- [ ] Full suite green with the gate's command; PLAN ticked; AGENT_REPORT.md section for
+      secret. (`affca74`, 84 tests — the commit message says 97; the file has 84 test functions)
+- [x] Re-run (12 Nov): the work above was sitting uncommitted in the shared copy — committed it
+      as three commits and ran the live copy on 8091, which caught one real bug: `/decide/<id>`
+      gated on `jobboard.check_record` (the worker's "could I *start* this record" check), so a
+      press on a finished job whose record fails that check for an unrelated reason did nothing
+      at all — no merge, no record, no word on the page. `decisions.cannot_decide` is the check
+      that fits a decision, and a press the board will not take now comes back with its word on
+      the card; a rejected card offers Undo only. 9 more tests. (`24b06ad`)
+- [x] Full suite green with the gate's command; PLAN ticked; AGENT_REPORT.md section for
       this job (including how the sandbox can't read the secret).
+      `Ran 741 tests in 280.372s — OK` (measured 732 before my 9 tests, 741 after;
+      741 = 648 everywhere else + 93 in `test_u08_decide.py`).
 
 ---
 

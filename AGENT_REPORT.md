@@ -925,3 +925,230 @@ about exactly as a web screenshot is.
   the model is busy). If you want the board to boot an AVD for a check, that is a separate slice —
   it needs an emulator in the image and a rule for who owns it.
 - `~/agent-sandbox` untouched; no installs, no network, stdlib only; no push.
+
+---
+
+## Job 03 — Upgrade 8: approve / merge buttons
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md has the findings and the step list for this job, all ticked.
+
+This job ran twice. The first pass wrote the whole feature — `web/decisions.py`, the job-page
+hooks and 97 tests — and **stopped before committing any of it**, so the re-run (12 Nov) committed
+that work, ran the live copy on `127.0.0.1:8091` with its own state folders, and fixed the one real
+bug that run caught (a decision that could vanish without a word, `24b06ad`). Nothing was
+rewritten: the merge / reject / undo / token engine in `web/agentjobs_upgrades/actions.py` (already
+tested in `test_rest.py::Actions`) is used exactly as written.
+
+Commits in this job:
+
+- `8ef8dd7` PLAN.md — findings (the engine is already there and tested, so this job is the glue:
+  which branch a job worked on, the Decide card, the human-only secret, the follow-up jobs) and
+  the step list
+- `cb1346a` the watchdog half of requirement 6: `.local/state/agentjobs` is a private location, so
+  a job that goes looking for the secret is a safety stop (bundled in that commit)
+- `2212f33` `web/decisions.py` — the glue (623 lines) + the `changes` timeline icon
+- `c27136c` the job-page hooks in `jobboard.py` (the card, the `aj=` cookie, `POST /decide/<id>`)
+- `affca74` `web/tests/test_u08_decide.py` — 84 tests, temp repos (the commit message says 97; the
+  file has 84 test functions — see Verification)
+- `24b06ad` the bug the 8091 run caught: `POST /decide/<id>` used the worker's *launch* validator
+  as its gate, so a press on a finished job whose record fails that check for an unrelated reason
+  merged nothing, recorded nothing and said nothing; + 9 tests
+- last commit: PLAN.md steps ticked and this section
+
+### Files changed
+
+| File | What it is |
+| --- | --- |
+| `web/decisions.py` | **new** (623 lines, `# U08`) — the glue, all of it on top of `actions.py`: the secret file + the browser's `aj` session + that session's form token (`secret`, `session_for`, `token_for`, `allowed`); `cannot_decide` (what a press is checked against); which branch is whose (`target_branch` from `git_branch_start`, else main/master; `job_branch` = the branch carrying this job's checkpoint commits → `agent/<id>` for a best-of-N winner → the folder's current `agent/...` branch → the newest `agent/...` branch with commits the target lacks, never a `-try` branch or one already merged); the six actions (`do_merge`, `do_undo_merge`, `do_reject`, `do_undo_reject`, `do_ask`, `do_fix_conflict`), each writing the record and the timeline; `fix_conflict_prompt`; the Decide card and its CSS. |
+| `web/jobboard.py` | 36 lines: `import decisions`; the card between the review bundle and the Checks card; `GET /job/<id>` hands out the `aj=` session cookie and puts that session's token in the forms; `POST /decide/<id>` answers 403 without it and otherwise calls `decisions.action`; `decision_ctx()` is the only place the two modules are tied together. |
+| `web/agentjobs_upgrades/events.py` | one icon: `"changes": "✎"`, so an "ask for changes" row has an icon in the U07 timeline like every other row. |
+| `web/tests/test_u08_decide.py` | **new** (1006 lines), 93 tests (84 written by the first pass, +9 here). |
+| `PLAN.md` | findings + steps. |
+
+`agentjobs_upgrades/actions.py` is used as written — `Decisions.merge` (clean tree first,
+fast-forward when the target is an ancestor, else the `Merge agent job <id>: <title>` commit,
+`merge --abort` + `reset --hard` back to the recorded sha on a clash, the caller's branch restored
+in `finally`), `undo_merge` (refuses once the target moved), `reject`/`unreject` (the
+`agent/rejected/<id>` rename, 14 days), `merge_allowed`, `form_token`, `check_request`,
+`change_request_prompt`. `load_secret`, `safegit.SafeGit` and `jailcfg.push_branch` are untouched.
+
+### How each requirement is met
+
+1. **The three buttons** — a finished job (`done` / `failed` / `stopped` / `interrupted` /
+   `safety_stop`, the same set the board already uses) gets an "Approve or reject" card:
+   `Merge into main`, an "Ask for changes" text box and `Reject`. A running job, a bench run or a
+   read-only copy gets no buttons (a read-only copy still shows what was decided).
+2. **Approve & merge** — the button names the branch the job started from (`git_branch_start`,
+   main/master if the record has none) and the card spells out the pair: *Merges `agent/<id>` into
+   `main` in the project folder, right here on this PC. Nothing is pushed.* Fast-forward when main
+   has not moved, otherwise the merge commit `Merge agent job <id>: <title>`. Only enabled when
+   `verify.status == "passed"`; for failed / never-run / `needs_review` / `stuck` / `verify_off` the
+   button is grey with the reason in its tooltip and in a line above it ("The checks failed.", "The
+   checks were not run.", …) and a **Merge anyway** box that only works when you type `MERGE`. A
+   clash is aborted and the repo is left exactly as it was (`git status` clean, main unmoved, your
+   branch still checked out), the card says so with a "What git said" box, and offers **Ask Qwen to
+   fix the conflict** — a follow-up job whose prompt says *stay on `agent/<id>` and merge `main`
+   into it, resolve everything, run the checks, commit the merge, do not merge into main yourself
+   and never push*; it goes through the normal gate because it is an ordinary job.
+3. **Ask for changes** — the text box reuses the existing follow-up feature
+   (`new_job(mode, folder, prompt, offline, resume=session, parent=jid)`), so the child job is the
+   same folder, the same branch and, when the job has one, the same agent session; its prompt is
+   `actions.change_request_prompt`: your words plus the original task. An empty box records a
+   refusal and starts nothing.
+4. **Reject** — `m["decision"] = "rejected"`, the branch is renamed to `agent/rejected/<id>`, the
+   folder and its files are left alone, and the card offers **Undo** (14 days; after that it says
+   *Undo is only possible for 14 days*). A rejected card offers Undo only — no second Reject — and
+   Undo brings the three buttons back. The board never deletes a branch or a folder.
+5. **Pushing** — nothing here pushes: the merge is `SafeGit` on the project's own work copy, the
+   record keeps `pushed: false`, and the card says *Not pushed — the board only ever pushes
+   agent/... branches, so pushing main is yours to do*. `jailcfg.push_branch` /
+   `jail/push-agent-branch.sh` still refuse anything that is not `agent/...`.
+6. **Only a person at the page** — see "The secret and the sandbox" below.
+7. **Record and timeline** — every decision appends to `decision_log` (kind, time, target, branch,
+   how, the `before`/`after` shas, `pushed`, the follow-up job id, the reason for a refusal) and
+   sets `decision` (`merged` / `merge-undone` / `rejected` / `rejection-undone` / `changes` /
+   `conflict` / `fix-conflict`), and writes one timeline row: 🔀 merged, ↩ merge undone, 🗑 rejected,
+   🔄 rejection undone, ✎ changes requested, 🔧 fix-the-clash job, ⚠ the clash. **Undo merge** is
+   offered for the last merge and refuses once the target has moved since
+   (*Something was committed on top since; undo it by hand.*); otherwise it puts the branch back at
+   the recorded pre-merge commit.
+
+### The secret and the sandbox (requirement 6)
+
+A decision needs **all four** of: the board's existing `jb=` login cookie and Host/Origin checks,
+a `POST`, an `aj=` session cookie, and that session's form token
+(`HMAC(secret, "form:" + sid)`). Anything else is 403 before the record or the project is touched,
+and `GET /decide/<id>` is not a route at all (404). The cookie is
+`aj=…; Path=/; HttpOnly; SameSite=Strict`; a second visit keeps the session, so an old page still
+works and a new one gets its own token. The secret itself never leaves the server.
+
+How I checked that a job on this PC cannot read the secret file:
+
+- It is `~/.local/state/agentjobs/secret`, created once by `actions.load_secret` as **0600 in a
+  0700 directory**. Checked live, not assumed: the 8091 run printed
+  `the secret file /home/agent/.local/state/agentjobs/secret is 0600 in a 0700 dir`.
+- `jail/podman-local.sh` (`jail_local_args`) mounts **only** the job's own project folder
+  (`$hostdir` over an empty tmpfs `/work`), `state/home-local` → `/home/agent`,
+  `state/android-sdk` → `/opt/android-sdk` and two jail scripts. None of those contains
+  `.local/state/agentjobs`, and the container's `$HOME` is `state/home-local`, not this home.
+  `test_the_jail_scripts_mount_nothing_that_contains_it` reads the script's own `-v` arguments and
+  asserts that no mount is the secret's directory or a parent of it, so the test breaks if anyone
+  ever mounts the home folder.
+- `jail/agent-jail.sh` (the bwrap jail) gives a fake empty `/home/agent` and refuses
+  `$HOME/.local*` as a project folder, which the same test asserts.
+- Defence in depth: `watchdog.SECRET_PATH_RE` names `.local/state/agentjobs`, so a job that runs
+  `cat ~/.local/state/agentjobs/secret` gets a **safety stop**, not a read
+  (`test_a_job_that_goes_looking_for_it_is_stopped`).
+- **What was not done here:** this build sandbox has no container runtime
+  (`command -v podman bwrap` → nothing), so I could not run the secret-cat inside a real job
+  container. On your machine the one-line proof is
+  `jail/run-local.sh sandbox-run <project folder> agentcheck-<id> -- cat ~/.local/state/agentjobs/secret`
+  → no such file.
+- A forged request from a script on the same machine is refused anyway: a job knows the URL, the job
+  id and the record, but has no browser session and cannot make the token. That is a test
+  (`test_a_forged_body_from_a_script_on_this_machine_is_refused`) and a smoke check.
+
+### How to test it by hand, click by click
+
+Start your own copy (never 8090) with its own state folders:
+
+```
+cd web && JOBBOARD_PORT=8091 JOBBOARD_WORK=/tmp/u08/work JOBBOARD_JOBS=/tmp/u08/jobs \
+    JOBBOARD_PLANS=/tmp/u08/plans JOBBOARD_QUEUES=/tmp/u08/queues \
+    JOBBOARD_SETTINGS=/tmp/u08/settings.json JOBBOARD_NOTIFY=/tmp/u08/notify.json \
+    python3 jobboard.py
+```
+
+In that `$JOBBOARD_WORK/proj`, make a project whose work sits on a branch (`git init -b main`,
+commit, `git checkout -qb agent/<job id>`, commit) and run a job in it, so the record has
+`git_branch_start` and the gate ends `passed`. Then open that job's page:
+
+1. The card reads *All checks passed.* with `Merge into main`, the ask box and `Reject`; under the
+   button: *Merges `agent/<job id>` into `main` in the project folder, right here on this PC.
+   Nothing is pushed.*
+2. Press `Merge into main` → *Merged `agent/<job id>` into `main` (fast-forward) on 11 Nov 19:50*,
+   *Not pushed — the board only ever pushes agent/... branches, so pushing main is yours to do.*,
+   and `Undo merge`. The timeline gets 🔀 *Merged … (fast-forward) - not pushed*.
+   `git log --oneline -1 main` shows the job's commit; `git branch --show-current` is still the job
+   branch.
+3. Press `Undo merge` → main is back at the recorded commit and the merge button returns.
+4. Let main move on (`git checkout main`, commit, `git checkout -`), press merge again →
+   `git log -1 --format=%s main` is `Merge agent job <id>: <title>`.
+5. Take a job whose checks failed (the natural case): the button is grey with *The checks failed.*,
+   and **Merge anyway** opens a box — `merge` does nothing, `MERGE` merges, and the record keeps
+   which one it was.
+6. Make the two branches change the same line: the press answers *These changes clash with the
+   target branch. Nothing was changed.* with a "What git said" box; `git status` is clean and main
+   has not moved. Press **Ask Qwen to fix the conflict** and the queued job's prompt starts
+   *Jason asked to merge `agent/<id>` into main. The two changed the same lines, so the board
+   aborted the merge and changed nothing. … Stay on `agent/<id>` and merge main into it …*.
+7. Press `Reject` → *Rejected on … the branch is now `agent/rejected/<id>` and the folder is left
+   as it is.* + `Undo`; `git branch` shows the rename and the files are still there. `Undo` puts the
+   branch back and the three buttons return.
+8. Type in the ask box → *You asked for changes on …: "…" — the follow-up job*, queued in the same
+   folder with your words plus the original task.
+9. From any job or script: a `POST /decide/<id>` without the cookie and token answers *That button
+   only works from the job page in your browser* (403) and nothing moved.
+
+There is a driver for all of that — 46 printed checks against a real server on 8091, in
+`/home/agent/u08-smoke/smoke.py` (kept outside the repo on purpose):
+`python3 /home/agent/u08-smoke/smoke.py` → `SMOKE OK`.
+
+### Verification
+
+- Gate command (`AGENT_CHECKS.json`):
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 741 tests in 280.372s — OK`** (measured twice: 732 before this run's 9 tests, 741
+  after). Where 741 comes from: `unittest.TestLoader().discover('tests').countTestCases()` = 741 =
+  648 everywhere else + **93** in `web/tests/test_u08_decide.py` (84 from the first pass, +9 here).
+  Two counts the first pass wrote down are off and worth naming: its "635 baseline" predates job
+  01's 13 tests (the suite was 648 without any U08 test), and its "97 tests" for
+  `test_u08_decide.py` is really 84. No test was deleted, skipped or weakened.
+- Live copy: 46 checks, `SMOKE OK`, run twice. Timeline rows after the whole click-through:
+  `merged, rollback, merged, needs_review, fix_round, rejected, restart, merged, changes`.
+- The live run is what caught `24b06ad`: every in-process test used records that happened to pass
+  `jobboard.check_record`, so the swallowed press stayed invisible until a real record (mode `fake`
+  with plain text, which that validator refuses) went through the real route.
+- Nothing in these tests touches `127.0.0.1:8080`, a real agent, port 8090, or `~/agent-sandbox`.
+
+### Unfinished / assumed
+
+- **Which branch to merge is discovered, not recorded** — the board never wrote down the branch an
+  agent actually worked on. It tries, in order: a branch carrying this job's own checkpoint
+  commits, `agent/<id>` (the best-of-N winner), the folder's current `agent/...` branch, the newest
+  `agent/...` branch with commits the target lacks. It looks at the 8 newest `agent/...` branches
+  (each candidate is one git call inside the jail), and the card always names the branch it means to
+  merge. If the agent committed straight onto main the answer is honest: *Nothing to merge — this
+  job left no branch with changes of its own*, plus how many commits main already took.
+- A finished job's page now asks git for those branches: one `for-each-ref` plus up to 8
+  `merge-base` checks, per job per 30 s, in that project's own jail (`upgrades.git_for`). A
+  read-only copy never asks. If git cannot run at all, the card falls back to the record's own
+  branch name and says nothing is mergeable instead of guessing.
+- A merge needs a **clean working tree** in the project folder (the engine's rule, kept):
+  *The project has uncommitted changes. Commit or clear them first.* Uncommitted work is never
+  stashed or thrown away.
+- Deciding while another job is running in that folder is refused, as is any decision for a bench
+  run or for a record whose folder name is not a folder this board can use. A press the board will
+  not take now comes back to the page with its word on the card (*The job has to finish before you
+  can decide.*, *Another job is still working in that folder - decide once it has stopped.*)
+  instead of vanishing — that was the bug the live run caught.
+- All git for decisions goes through `upgrades.git_for` = `SafeGit` in the job's own jail
+  (`-c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never
+  -c credential.helper=`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`), so a hook or config
+  the agent planted in the project is not trusted and nothing can reach a remote. The live run used
+  `JOBBOARD_JAIL=host` because there is no podman/bwrap in this sandbox; the wiring is the one
+  upgrades 1–3 already use.
+- `Undo merge` only resets a branch that still points where the merge left it; `Undo` for a
+  rejection only renames back. Neither deletes anything, and neither undoes a **push** — pushing
+  main stays yours.
+- A decision does not change the job's `status` (a merged job stays `done`); the decision lives in
+  `decision` / `decision_log`. The jobs list does not yet show a merged/rejected badge — not asked
+  for, and easy to add on top of `badges.py` if you want it.
+- Nothing expired is cleaned up: an `agent/rejected/<id>` branch older than 14 days just stays, and
+  its Undo is not offered. Say the word if you want the board to prune them, or to list them.
+- Two people can decide from two browsers (each gets its own session), but there is no audit line
+  naming *who* decided — the board has no accounts, so a decision records its time only.
+- `~/agent-sandbox` untouched; no installs, no network, stdlib only; no push. The branch is
+  `agent/jobboard-next`, ready for Jason to review, push and merge.
+
