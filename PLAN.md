@@ -1,3 +1,93 @@
+# Job 10 — Upgrade 6a: vision check, part 1 (web pages + the checking engine)
+
+## Findings
+
+- Checks engine (given, do not rewrite): `web/agentjobs_upgrades/checks.py`.
+  `load_checks()` already keeps a check entry's unknown keys in `Check.extra` and
+  `type` is a first-class field (`"command" | "vision" | "android-smoke"`);
+  `run_all(project, out_dir, wrap, checks=..., extra_runners={type: fn})` calls
+  `fn(project, check, out_dir)` for every non-command check and **skips it silently
+  when no runner is registered**. `summarize()` decides pass/fail only over results
+  whose `mode != "advisory"`, so an advisory vision check never fails a job;
+  `banner_text()` names the failing required ones.
+- The vision engine (given): `web/agentjobs_upgrades/vision.py` — `build_request()`
+  (base64 `image_url`), `parse_verdict()` (last JSON object with a bool `pass`,
+  `think` tags stripped, python-ish quoting tolerated), `ask_once(retries=1)`,
+  `check(votes=2)` → pass only when both votes pass, disagreement / no JSON →
+  `inconclusive`, `to_check_result(name, verdict, mode, screenshots)` and
+  `http_call(url)` posting to `http://127.0.0.1:8080/v1/chat/completions`.
+  Already unit-tested in `web/tests/test_rest.py::Vision`.
+- The gate: `jobboard.run_gate()` (jobboard.py:453) builds `wrap =
+  upgrades.make_wrap(ctx.root, m["folder"], "agentcheck-<jid>")` and calls
+  `ck.run_all(ctx.root, ctx.checks_root / "checks" / "round-<r>", wrap,
+  checks=upgrades.job_checks(m))`. It only ever runs **after the agent process has
+  ended** (and after each fix round) — requirement 5 comes free. "Run checks again"
+  repeats the same call in `jobboard.u01_button()` (jobboard.py:2135).
+- Frozen checks (what has to change): `upgrades.freeze_checks()` keeps only
+  `c.type == "command"`, `upgrades.job_checks()` rebuilds `ck.Check(name, cmd,
+  timeout_s)` dropping `type`/`extra`, and `upgrades.checks_ok()` rejects an empty
+  `cmd`. A vision check has no `cmd`, so all three need a `type == "vision"` path.
+- Where results are shown: `upgrades.checks_card_html()` + `upgrades._res_rows()`
+  (the Checks card on the job page), `badges.badges()` (one badge per check →
+  `/api/check/<jid>?src=<round|recheck>&n=<i>`; its body comes from
+  `badges.check_text()`, which reads **only inside `JOBS/<id>/`** — the containment
+  pattern to copy for serving PNGs). Routes are the `if` chain in `H.do_GET`
+  (jobboard.py:1867). The review bundle is `reviewbundle.build_bundle(...)` with
+  `upgrades.bundle_section(m)` spliced in by `jobboard.bundle_md()`.
+- Jail (`# JAIL`): `upgrades.make_wrap(root, folder, prefix)` → `jail/run-local.sh
+  sandbox-run` → `jail/podman-local.sh`: `--network none`, only the project folder
+  mounted (rw) at `/work/<folder>`, `HOME=/home/agent`. A screenshot helper
+  therefore cannot be mounted as a file: the driver goes **inline**
+  (`python3 - <<HEREDOC`, its spec in a base64 env var) and the PNGs come back
+  **base64 on stdout** behind a marker line, so nothing is written inside the
+  project folder (a stray file would show up in the diff and in the guard).
+  `upgrades.stop_job_containers()` filters `name=^agent(check|ckpt|git)-` — the
+  browser container needs its own prefix added there.
+- Environment (checked, not assumed): **no Playwright anywhere** — `python3 -c
+  "import playwright"` → ModuleNotFoundError, `node -e "require.resolve('playwright')"`
+  → not found, no `playwright`/`chromium`/`google-chrome`/`firefox` on PATH, no
+  `~/.cache/ms-playwright`, and `Containerfile` installs neither Chromium nor
+  Playwright. No Pillow either, so image sizing must be stdlib (`zlib`/`struct`).
+  Nothing can be installed (no network), so screenshots cannot actually be taken in
+  this sandbox: the engine, pages, bundle and wiring are built and tested against a
+  mock capture and a fake model server, and the exact missing pieces go in the report.
+- Test command (`AGENT_CHECKS.json`): `cd web && PYTHONDONTWRITEBYTECODE=1 python3
+  -W ignore -m unittest discover -s tests`. Baseline before my changes: **550
+  tests, OK** (≈3 min).
+
+## Steps
+
+- [x] Commit job 09's leftover PLAN.md as residue first (it was left uncommitted in
+      the shared copy; it is not mine to rewrite).
+- [x] `web/visioncheck.py` (new, `# U06`): PNG size read + max-1280 px downscale
+      (stdlib zlib), check-spec parsing (`target`/`open`/`steps`/`size`/`mode`/`votes`),
+      backend detection, `capture()` (jail-aware, stdout envelope),
+      `run_vision_check()` → `vision.to_check_result()` plus a text log and PNG files
+      in the check dir, `runners()` for `ck.run_all(extra_runners=...)`, and
+      `shot_file()` for the route.
+- [x] `web/visionshot.py` / `web/visionshot.mjs`: the in-sandbox capture drivers
+      (temporary local http server for local files; steps click / type / key / wait /
+      wait_for / shot; final screenshot; JSON envelope on stdout).
+- [x] Tests `web/tests/test_u06a_vision.py`: canned model replies (pass / fail /
+      garbage / disagreeing pair) through a real in-process fake model server, JSON
+      parsing, image size handling, the capture envelope (real heredoc command: driver
+      present, Playwright absent → clean "no browser" outcome), the runner end-to-end
+      through `ck.run_all`, the checks-record round trip.
+- [x] `upgrades.py`: keep vision checks in `freeze_checks`/`job_checks`, accept them
+      in `checks_ok`, show verdict + issues + screenshot links in `_res_rows` /
+      `checks_card_html`, list screenshots + issues in `bundle_section`, add `shot`
+      to `stop_job_containers`.
+- [x] `jobboard.py`: pass `extra_runners` in the gate and in "Run checks again",
+      serve `GET /api/shot/<jid>?src=&n=&i=` (only inside `JOBS/<id>/`), emit a
+      timeline event per vision verdict.
+- [x] Page/bundle tests: the Checks card markup, the `/api/shot` route (200, 404s,
+      cookie guard), the bundle text.
+- [x] Full suite green; PLAN.md ticked; AGENT_REPORT.md section with the manual test
+      (`~/cline-test/index.html`, Orb Chase) and what must be installed for real
+      screenshots.
+
+---
+
 # Job 09 — Upgrade 10: the morning report
 
 ## Findings

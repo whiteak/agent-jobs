@@ -299,3 +299,209 @@ Nothing else was touched: `agentjobs_upgrades/*`, `planning.py`, `attempts.py`, 
   silently replaced — approving again replaces only a `finished`/`ready` one.
 - No network, no installs, stdlib only. `~/agent-sandbox` untouched: every test uses its own temp
   `HOME`/state folders, and the smoke run used its own folders under `/tmp` and port 8123.
+
+---
+
+## Job 10 — Upgrade 6a: vision check, part 1 (screenshots + the model's verdict)
+
+Branch: `agent/jobboard-next` (local only — **not pushed**; ready for Jason to review, push and
+merge). PLAN.md has the findings and the step list, all ticked.
+
+**The one thing that cannot work in this sandbox: there is no browser.** Checked, not assumed —
+`python3 -c "import playwright"` → ModuleNotFoundError, `node -e "require.resolve('playwright')"`
+→ not found, no `playwright` / `chromium` / `google-chrome` / `firefox` on PATH, no
+`~/.cache/ms-playwright`, and `Containerfile` installs neither. No Pillow either. With no network
+nothing can be installed, so **screenshots were never taken here**: the engine, the jail command,
+the pages, the bundle and the routes are built and tested against a mocked browser and a fake
+model server, and both drivers were *run* far enough to prove they fail cleanly. The model side is
+fine — `GET 127.0.0.1:8080/v1/models` here reports
+`"architecture": {"input_modalities": ["text", "image"]}`, so the local model can see pictures.
+What has to be installed is in "To make screenshots work" below.
+
+Commits in this job (on top of `a311abc`, job 08's last commit):
+
+- `37ebbf2` job 09 residue: the U10 (morning report) PLAN.md left uncommitted in the shared copy
+  — committed as found, not rewritten
+- `53072c6` U06a: the check itself — engine, jail capture, page, bundle, `/api/shot` (39 tests)
+- last commit: a screen check cannot stall the gate (its own time budget) + a plain message when
+  the model has no image input; PLAN.md ticks and this report (42 tests)
+
+### Files changed
+
+| File | What it is |
+| --- | --- |
+| `web/visioncheck.py` | **new** (544 lines, `# U06`) — the glue: the check-entry rules (`check_ok`/`frozen`), PNG width + the max-1280 px downscale (stdlib `zlib`, no Pillow), backend detection, the jail capture (driver in a here-doc, spec in a base64 env var, PNGs back as one base64 line on stdout), `run_check` → the `checks.run_all` result with its log file and saved shots, `runners()` for `extra_runners`, and `shot_file()` for the route. |
+| `web/visionshot.py` | **new** (140 lines) — the capture driver for a sandbox with **Python** Playwright: temporary local http server for local files, the steps (`click`/`type`/`key`/`wait`/`wait_for`/`shot`), the final screenshot, JSON envelope on stdout. |
+| `web/visionshot.mjs` | **new** (84 lines) — the same driver for a sandbox with **Node** Playwright. |
+| `web/upgrades.py` | `freeze_checks`/`job_checks`/`checks_ok` keep a vision check's `type` and fields (it has no `cmd`); the Checks card shows verdict + issues + the pictures; the review bundle lists the screenshot names and what the model saw wrong; `stop_job_containers` also stops the browser container (`agentshot-…`). |
+| `web/jobboard.py` | `run_gate` and "Run checks again" pass `extra_runners=visioncheck.runners(...)` (the screenshot runs in the same jail as the checks, the model is asked only after the agent stopped); `GET /api/shot/<jid>?src=&n=&i=`. |
+| `web/badges.py` | an unsure screen check badges as `looks right (not sure)` instead of looking like a hard fail. |
+| `web/tests/test_u06a_vision.py` | **new**, 42 tests. |
+| `PLAN.md` | findings + steps. |
+
+Nothing in `web/agentjobs_upgrades/` was changed: `vision.check` (two votes), `vision.check
+→ to_check_result`, `checks.run_all(extra_runners=…)` and `verify.build_fix_prompt`'s
+"Problems seen on screen" block are used exactly as they were written.
+
+### How each requirement is met
+
+1. **New check type** — `{"name":"looks right","type":"vision","target":"web",
+   "open":"index.html","steps":[…],"spec":"…","size":[1280,800],"mode":"advisory"}` is read by
+   `checks.load_checks` (extras land in `Check.extra`) and validated by `visioncheck.check_ok`
+   before it is frozen into the job record at job start (`freeze_checks` → `m["checks"]`), so the
+   agent cannot change what it will be checked with. `steps` understands
+   `{"click": sel}`, `{"type"/"fill": sel, "text": …}`, `{"key": k}`, `{"wait": ms}`,
+   `{"wait_for": sel}` and `{"shot": name}` (an extra picture at that point).
+2. **Web target, Playwright, temporary http server** — `visioncheck.backend()` picks Python or
+   Node Playwright, and says which piece is missing when neither is usable (module there but no
+   Chromium → "run `playwright install chromium`"). `open` is a file inside the project (served by
+   a throw-away `127.0.0.1` static server started by the driver, because ES modules do not work
+   over `file://`) or a URL; `<port>` in a URL means that server's port. The browser runs in the
+   **same jail as the checks** (`make_wrap` → `jail/run-local.sh sandbox-run`, `--network none`,
+   only the project mounted), and the driver and its PNGs travel over the command's stdin/stdout,
+   so nothing is written inside the project folder — no stray file in the diff or the guard.
+3. **Ask the model** — `vision.build_request` (PNG, `data:image/png;base64,…`) POSTs to
+   `http://127.0.0.1:8080/v1/chat/completions` (`JOBBOARD_MODEL_URL` overrides it); the strict
+   prompt that walks the spec point by point and answers with
+   `{"pass": …, "issues": […], "confidence": …}` is the one in `vision.PROMPT`. `vision.parse_verdict`
+   finds the last JSON object with a bool `pass` (think tags stripped, python-ish quoting
+   tolerated); no JSON after one retry → `inconclusive`. Width is held to 1280 px: the viewport is
+   clamped and `fit_width` rescales anything bigger (nearest pixel, 8-bit PNG) before it is sent.
+4. **Ask twice** — `vision.check(votes=2)`: pass only when both pass, disagreeing votes or no
+   answer → `not sure`. `votes` in the entry allows 1–5.
+5. **After the agent** — the only place the runner is registered is `run_gate` (round 0 and after
+   every fix round) and the manual "Run checks again" button, so a screenshot never competes with
+   a running agent for the model.
+6. **advisory / required** — `checks.summarize` ignores `mode: "advisory"` when it decides
+   pass/fail, so an advisory screen check is shown but never fails a job. With
+   `"mode": "required"` a fail makes the summary `failed`, the banner names the check, and
+   `verify.build_fix_prompt` puts the issues under "Problems seen on screen:".
+7. **Page and bundle** — the Checks card row shows `✓/✗/?` + the name, `vision: index.html ·
+   advisory · asked 2x · <page url>`, the verdict in words ("looks right" / "does not look right" /
+   "not sure"), the screenshots (thumbnails, click for full size, served by `/api/shot`, only from
+   inside `JOBS/<job id>/`, login cookie needed) and the issues underneath. The badge links to the
+   check's log, which holds the spec, the steps, both model answers and the verdict. The bundle gets
+   `- screen check \`looks right\`: fail (required)`, `- seen on screen: …` and
+   `- screenshot: vision-looks_right-1-final.png` per round (and for a re-check).
+
+### To make screenshots work (needs Jason, once)
+
+The image has `python3` and `node` but no browser and no Playwright. Either:
+
+```
+python3 -m pip install playwright && python3 -m playwright install --with-deps chromium
+```
+
+or
+
+```
+npm install -g playwright && npx playwright install --with-deps chromium   # plus NODE_PATH
+```
+
+The **browser must live in the image**: the sandbox mounts only `/work/<folder>`, `/home/agent`
+(the job's own `state/home-local`) and the SDK, so `~/.cache/ms-playwright` cannot be mounted in —
+unless you point `PLAYWRIGHT_BROWSERS_PATH` at a folder inside one of those mounts. `web/tests`
+stay green either way; nothing here calls the model server or a real browser.
+
+Until that is done every vision check answers **not sure** with the exact missing piece
+("no Playwright and no Chromium … this is not a problem with the code — do not try to install
+anything"). In `advisory` mode nothing else changes; in `required` mode it does fail the job, on
+purpose — a check you asked to be required that cannot run should be loud.
+
+### Verified
+
+- Gate command, as in `AGENT_CHECKS.json`:
+  `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests`
+  → **`Ran 592 tests in 184.461s` / `OK`** (baseline before this job: 550 tests, OK; +42).
+  Nothing deleted, skipped or weakened — `test_rest.py::Vision` and every earlier suite pass
+  untouched.
+- The new module alone: `python3 -W ignore -m unittest tests.test_u06a_vision` →
+  `Ran 42 tests in 6.794s / OK`. What it really runs, not mocks: the capture **command** built and
+  executed for real (`python3 - <<EOF` with the real `visionshot.py`, which on this machine
+  answers "Playwright for Python is not installed…" — that proves the here-doc quoting, the
+  envelope protocol and the honest failure path); `node --check` on `visionshot.mjs`; the model
+  behind a real in-process http server with canned answers (both pass, both fail, garbage → 4
+  requests because of the retry, a disagreeing pair, a server answering 500); the PNG path
+  (2400×1500 → the bytes the model is sent are ≤1280 wide, exact pixels on a small downscale,
+  an undecodable PNG passed through with a note, a non-PNG shot left out); AGENT_CHECKS.json →
+  frozen record → `checks.Check` keeping `type`/`spec`/`open`/`steps`; a required fail reaching
+  `build_fix_prompt`.
+- Served the real board once, **read-only**, on port **8123** with its own state folders
+  (`JOBBOARD_JOBS/WORK/PLANS/QUEUES/SETTINGS/NOTIFY` under `/tmp`, `~/agent-sandbox` untouched),
+  seeded a finished job whose checks were `python3 -m unittest` plus a `looks right` vision check,
+  and curled: the job page carries `screenshot of index.html`, `not sure`, `asked 2x`,
+  `The two looks disagreed.` and `src="/api/shot/20261111-120000-ab12?src=round0&amp;n=1&amp;i=0"`;
+  that URL answered `200`, `Content-Type: image/png`, `Content-Length: 1454` (a real 320×200 PNG),
+  without the cookie `403`, with a bad `i=7` `404`; `/api/bundle/…` printed
+  `screen check \`looks right\`: inconclusive (advisory)` with
+  `- seen on screen: The two looks disagreed.` and `- screenshot: vision-looks_right-1-final.png`.
+  Server stopped and the port verified closed.
+- One small probe of the model server (read-only): `GET /v1/models` reports
+  `input_modalities: ["text","image"]`; `POST /v1/chat/completions` returns 404 **from this
+  sandbox** (the harness only answers `/v1/models`), so a real screen-check conversation could not
+  be run here. The request shape is exactly `vision.build_request`'s, which the tests check.
+
+### Try it by hand (Orb Chase, `~/cline-test/index.html`)
+
+1. Install the browser (above). Then make the game a board project:
+   `cp -r ~/cline-test ~/agent-work/orb-chase` and open Projects → *orb-chase*.
+2. Put this in `~/agent-work/orb-chase/AGENT_CHECKS.json` (keep any tests you have alongside it):
+
+   ```json
+   {"checks": [
+     {"name": "the game looks right", "type": "vision", "target": "web", "open": "index.html",
+      "steps": [{"click": "#start"}, {"wait": 600}],
+      "spec": "a dark play field, one glowing red orb the player chases, the score in the top right and a Start button before the game begins",
+      "size": [1280, 800], "mode": "advisory"}]}
+   ```
+3. New job in that folder — "make the orb chase game look right". The check is frozen into the
+   record before the agent starts (the page says *Checks from AGENT_CHECKS.json at job start:
+   `python3 …`, `screenshot of index.html`*).
+4. When the agent finishes, the **Checks** card shows *After the agent finished*, then one row per
+   check. The screen row shows the verdict in words and, right next to it, the screenshot; click it
+   for full size. Under it are the problems the model listed. The badge
+   `the game looks right` in the banner opens the log: the spec, the steps the browser took, the
+   page URL, both model answers verbatim and the verdict.
+5. **Run checks again** re-screenshots and re-asks without running an agent (the model is free).
+6. Now make it matter: change `"mode"` to `"required"`, and break the screen on purpose (delete the
+   score). The job ends *Checks failed: the game looks right*, the agent gets a fix round whose
+   prompt contains *Problems seen on screen: no score…*, and the timeline shows
+   `Screen check "the game looks right": does not look right`.
+7. **Download .md** (review bundle) and look under `## Verify gate`: verdict, mode, each issue, and
+   the screenshot file names — the reviewer can ask for the picture by name.
+8. Take the browser away again (or start with none): the row reads `not sure`, the issue says no
+   Playwright/Chromium and that it is not a code problem, and an advisory check leaves the job alone.
+
+### Unfinished / assumed
+
+- **Screenshots have never actually been taken here** (no browser, see above). The drivers are
+  executed as far as this machine allows and syntax-checked, but the Playwright calls themselves —
+  `--no-sandbox`, `wait_until="load"` + a 400 ms settle, the 10 s per-step timeout,
+  `page.fill`/`waitForSelector` — are untested against a real Chromium and may need tuning for a
+  given app (an app that draws with WebGL or needs a pointer may want extra steps).
+- The **model was never asked about a real screenshot here** (this sandbox's proxy refuses
+  `/v1/chat/completions`). The prompt, the two-vote rule, the parsing and the sizing are all tested
+  against a fake server with that exact shape.
+- One judged screenshot per check: the final screen. `{"shot": "name"}` in `steps` adds pictures
+  for the page and the bundle; the last one is what the model is shown.
+- Vision checks come from **AGENT_CHECKS.json only**. The new-job form's Checks box stays
+  "one command per line" (it writes commands into the project). A UI for adding a screen check from
+  the board is a separate slice.
+- Checkpoints (`at_gate`) and best-of-N ranking do **not** take screenshots — no runner is
+  registered there, and those comparisons are about tests. A `required` screen check still decides
+  the job at the gate. Say the word if you want a picture per checkpoint instead.
+- `target` only accepts `"web"`; the `android-smoke` type in `checks.Check` is untouched (6b).
+- A check's `timeout_s` is its wall-clock budget: the browser gets ≤600 s, at most 5 votes, and no
+  new vote once the budget is spent (that is what keeps a hung page or a slow model from stalling
+  the whole gate).
+- `inconclusive` is not a pass: `advisory` → shown, job unaffected; `required` → fails the job. If
+  you would rather an unsure check never fail even when required, that is a small third mode.
+- The resizer is nearest-pixel and 8-bit RGB/RGBA only (what Playwright writes); anything else is
+  sent as it came, with a note in the log. The viewport is clamped ≤1280 wide first, so normally it
+  is only a safety net.
+- **No vision check was added to this repo's own `AGENT_CHECKS.json`**: it would try to screenshot
+  the board on every job here and answer "not sure" until Chromium is in the image. The exact entry
+  is documented above instead — say the word and I'll add it.
+- `~/agent-sandbox` untouched (its `state/web-token` only ever read); every test and the smoke run
+  used their own temp folders, port 8123, and `JOBBOARD_READONLY=1`. No installs, no network,
+  stdlib only.
