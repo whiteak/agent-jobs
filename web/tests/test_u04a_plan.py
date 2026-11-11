@@ -56,6 +56,7 @@ if "jobboard" not in sys.modules:      # standalone run: same isolated env as te
                        "JOBBOARD_WORK": os.path.join(_hb, "work"),
                        "JOBBOARD_PLANS": os.path.join(_hb, "plans"), "JOBBOARD_READONLY": "1"})
 import jobboard  # noqa: E402
+import phonelayout  # noqa: E402
 import planning  # noqa: E402
 import upgrades  # noqa: E402
 from agentjobs_upgrades import plan as pl  # noqa: E402
@@ -392,6 +393,17 @@ class State(unittest.TestCase):
         self.assertIn("after: t2", html)                # the "after:" line the spec asks for
         self.assertIn('name="approve"', html)
         self.assertEqual(html.count('name="move"'), 6)  # up and down on every card
+
+    def test_the_plan_buttons_stay_reachable_on_a_phone(self):
+        """The upgrade 9a sticky header owns the top of a phone screen, so the plan page's own
+        Save / Approve bar must not be stuck at top:0 under it - and it is repeated below the
+        tasks whatever the CSS does."""
+        parts = planning.CSS.split("@media (max-width:%dpx)" % phonelayout.PHONE_MAX, 1)
+        self.assertEqual(len(parts), 2, "planning.CSS styles nothing for phones")
+        self.assertIn(".pbar{position:static", parts[1])
+        write_plan(self.root, GOOD_PLAN)
+        html = planning.plan_body(self.rec, self.st(), GOOD_PLAN)
+        self.assertEqual(html.count('name="save"'), 2)   # one bar above, one below the tasks
 
 
 # ------------------------------------------------------------------ a planning job finished

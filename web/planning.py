@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import dashboard
+import phonelayout          # its phone width, so the plan page's own rules match it
 import upgrades
 from agentjobs_upgrades import plan as pl
 from agentjobs_upgrades.safegit import SafeGit
@@ -612,4 +613,9 @@ details.ms>summary b{font-size:15px}details.ms[open]>summary{border-bottom:1px s
 .pbar{position:sticky;top:0;z-index:2;background:var(--card);padding:10px 0;
  border-bottom:1px solid var(--line);margin-bottom:12px;align-items:center}
 .pbar button{margin-right:2px}
-</style>"""
+""" + ("""@media (max-width:%dpx){
+/* On a phone the sticky header (upgrade 9a) owns the top of the screen, so a bar stuck to
+   top:0 here would slide under it. plan_body repeats this bar under the tasks anyway. */
+.pbar{position:static;top:auto;border-bottom:0;padding:8px 0}
+}
+</style>""") % phonelayout.PHONE_MAX
