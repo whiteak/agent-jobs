@@ -29,6 +29,7 @@ import planning   # U04a: an outline -> a plan of milestones and tasks to check 
 import taskqueue  # U04b: an approved plan runs as a queue of tasks, one job at a time
 import visioncheck  # U06: screenshot the app and ask the model whether it looks right
 import androidcheck  # U06b: the same for an Android app - install it and start it on a device
+import decisions  # U08: Approve & merge / Ask for changes / Reject, for a person at the page only
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -714,6 +715,11 @@ def queue_ctx():
                 modes=MODES, settings=lambda: upgrades.load_settings(SETTINGS_FILE, write_defaults=False),
                 default_mode=next((k for k in MODES if k != upgrades.FAKE_MODE), "local-qwen"),
                 stop=lambda jid: threading.Thread(target=stop_job, args=(jid,), daemon=True).start())
+
+def decision_ctx():
+    """U08: what the decide actions may use (decisions.py never imports jobboard, so this is
+    the only place the two are tied together)."""
+    return dict(work=WORK, load=load_meta, update=update_meta, job_dir=job_dir, new_job=new_job)
 
 def build_review_md(m):
     """Build the review bundle right after an agent job ends and save it to
@@ -1521,7 +1527,7 @@ f.addEventListener('submit',()=>{{try{{localStorage.removeItem('jobdraft')}}catc
 </script>"""
     return render(body)
 
-def job_page(jid):
+def job_page(jid, decide_tok=""):
     m = load_meta(jid)
     if not m: return None
     report_p = safe_path(m["folder"], "AGENT_REPORT.md")
@@ -1584,7 +1590,7 @@ def job_page(jid):
 <div id="bsteps">{steps_html(s)}</div>
 <p class="mut meta">{meta_line}</p>
 <div id="bfoot"><button class="ghost2" id="alertbtn" hidden>Enable alerts</button></div></div>
-{bundle_html}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
+{bundle_html}{decisions.card_html(m, jid, can_act, decide_tok, WORK / m["folder"])}{decisions.CSS}{u01_cards}{u05_cards}{planning.job_card_html(m, PLANS)}{jailcfg.push_card_html(m, jid, in_sandbox, READONLY)}{jailcfg.fetch_card_html(m, jid, READONLY)}{jailcfg.BADGE_CSS}<div class="card"><h2>Job</h2>{job_html}</div>
 {follow_html}{dashboard.timeline_card(job_dir(jid))}{dashboard.log_card(jid)}{dashboard.CSS}
 <div class="card"><h2>Report</h2>{f'<pre>{esc(report)}</pre>' if report else '<span class="mut">No AGENT_REPORT.md yet.</span>'}</div>
 {diffcard.card_html(jid, active)}{diffcard.CSS}{badges.CSS}
@@ -1782,6 +1788,24 @@ class H(http.server.BaseHTTPRequestHandler):
     def redirect(self, to):
         self.send_response(303); self.send_header("Location", to); self.end_headers()
 
+    def decide(self, jid, get):
+        """U08: Approve & merge / Ask for changes / Reject / Undo. They only work from the job
+        page in Jason's browser: a POST carrying the aj= session cookie and that session's own
+        form token, both checked against a secret file no sandbox can read. Anything else is
+        refused before the job record or the project is touched."""
+        if not decisions.allowed(self.command, self.headers.get("Cookie"),
+                                 get(decisions.TOKEN_FIELD)):
+            return self.send_error(403, "That button only works from the job page in your browser")
+        m = load_meta(jid)
+        if (not m or m.get("kind") == "bench" or m.get("status") not in decisions.FINISHED
+                or check_record(jid, m) or folder_busy(m["folder"])):
+            return self.redirect(f"/job/{jid}")
+        try:
+            decisions.action(jid, get("act"), get, decision_ctx())
+        except Exception as ex:   # a repo that is not what the record said must not break the page
+            decisions.refuse(jid, decision_ctx(), str(ex))
+        return self.redirect(f"/job/{jid}")
+
     # ---------------------------------------------------------------- U04a: projects and plans
 
     def project_page(self, folder, q):
@@ -1923,7 +1947,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "job" and load_meta(parts[1]):
             jm = load_meta(parts[1])
             if jm.get("kind") == "bench": return self.redirect(f"/bench/run/{jm['id']}")
-            return self.send(job_page(parts[1]))
+            sid, hdrs = decisions.session_for(self.headers)   # U08: the browser's decision session
+            return self.send(job_page(parts[1], decisions.token_for(sid)), headers=hdrs)
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "events" and load_meta(parts[2]):
             return self.sse_job(parts[2], q)     # U07: live stream for the job page
         if len(parts) == 3 and parts[:2] == ["api", "raw"] and load_meta(parts[2]):   # U07: Show raw log
@@ -2049,6 +2074,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.plan_edit(parts[2], form)
         if len(parts) == 2 and parts[0] == "queue" and planning.load(PLANS, parts[1]):   # U04b
             return self.redirect(f"/project/{parts[1]}?note={taskqueue.action(parts[1], form, queue_ctx())}")
+        if len(parts) == 2 and parts[0] == "decide" and load_meta(parts[1]):   # U08
+            return self.decide(parts[1], get)
         if len(parts) == 2 and parts[0] == "followup" and load_meta(parts[1]):
             prev = load_meta(parts[1]); job = get("job")
             if not job or not prev.get("session") or prev["status"] in ("queued", "running", "stopping"):
