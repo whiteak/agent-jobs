@@ -294,10 +294,26 @@ class Start(unittest.TestCase):
         m = self.b.started[0]
         self.assertEqual((m["folder"], m["mode"], m["task_id"], m["task_try"]),
                          ("my-app", "local-qwen", "t1", 1))
+        self.assertIs(m["offline"], True)                      # U04b: never on the internet
         self.assertEqual(self.b.queue().state["status"], "running")
         t = taskqueue.entry(self.b.queue(), "t1")
         self.assertEqual((t["state"], t["job_id"]), ("running", m["id"]))
         self.assertTrue(any("Task 1 of 3" in e["text"] for e in timeline(self.b.jobs / m["id"])))
+
+    def test_a_task_job_is_offline_even_for_a_plan_that_uses_an_online_agent(self):
+        """# U04b review: jobboard.new_job only forces offline for the local modes, so the
+        queue has to ask for it: a task of an approved plan never reaches the internet."""
+        rec = rec_of(mode="supervised")               # not one of jailcfg.LOCAL_MODES
+        self.b.record(rec)
+        taskqueue.create(self.b.queues, rec)
+        ctx = self.b.ctx()
+        ctx["modes"] = dict(ctx["modes"], supervised="Supervised")
+        self.assertEqual(taskqueue.action("my-app", {"act": ["start"]}, ctx), "started")
+        m = self.b.started[0]
+        self.assertEqual(m["mode"], "supervised")     # the agent Jason chose for the plan is kept
+        self.assertIs(m["offline"], True)             # but the job is created offline
+        self.assertEqual(m["task_id"], "t1")
+        self.assertIsNone(jobboard.check_record(m["id"], m))   # a bool, as the record requires
 
     def test_pressing_start_again_queues_nothing_because_a_task_is_running(self):
         self.b.start()

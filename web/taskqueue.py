@@ -8,6 +8,8 @@ task before it left the folder, so each one builds on the previous one's final c
 task is an ordinary job: the watchdog, the checkpoints, the checks and the fix rounds all apply
 (`jobboard.process_job` is not bypassed anywhere here), and a big task - or one that failed
 before - is tried several times when the project has that switched on (upgrade 5's best-of-N).
+A task job is always created with the offline flag on (# U04b review): a plan's tasks never
+get the internet, whichever agent the plan is set to.
 The queue itself is `agentjobs_upgrades/plan.py`'s `Queue` (not rewritten here): dependency
 order, "stop the queue" or "skip the tasks that depend on it" when a task fails, the
 "don't start new tasks after" time, and recovery after a restart.
@@ -354,7 +356,10 @@ def start_next(folder, ctx):
         note = keep_branch(root, folder)
         base = head_sha(root, folder)
         mode = rec.get("mode") if rec.get("mode") in ctx["modes"] else ctx["default_mode"]
-        m = ctx["new_job"](mode, folder, task_prompt(rec, root, t, pos, len(tasks)), False,
+        # U04b review: a task job is created with the offline flag on - a plan's tasks never
+        # get the internet, whatever agent the plan is set to (jobboard.new_job only forces
+        # that for the local modes).
+        m = ctx["new_job"](mode, folder, task_prompt(rec, root, t, pos, len(tasks)), True,
                            resume=resume, parent=prev or own, extra=extra)
         t["tries"] = tries + 1
         if base:
