@@ -58,20 +58,66 @@ OFFLINE_FLAGS = ("--offline", "--no-index", "--prefer-offline")
 GIT_NET = {"push", "fetch", "pull", "clone", "ls-remote", "submodule"}
 # ~/.qwen is NOT here: in the job container it is Qwen Code's own state (no credentials) and Qwen
 # reads its background-shell files there. ~/.claude stays: a supervised job's home has real credentials.
+# ~/.local/state/agentjobs is the approve/merge secret (upgrade 8): it is never mounted into the
+# container anyway, so a job that goes looking for it is stopped rather than politely refused.
 SECRET_PATH_RE = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/home/[^/\s'\"]+|/root)/("
     r"\.ssh|\.gnupg|\.aws|\.netrc|\.git-credentials|\.password-store|\.docker|\.kube"
     r"|\.local/share/keyrings|\.mozilla|\.config/(google-chrome|chromium|BraveSoftware|"
     r"Code|gh|git|rclone|qwen)|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
-    r"basalt_config|agent-sandbox/(web|state/secrets))"
+    r"basalt_config|agent-sandbox/(web|state/secrets)|\.local/state/agentjobs)"
     r"|/etc/(shadow|sudoers)|/proc/\d+/environ")
 URL_RE = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]+", re.I)
 HOST_PORT_RE = re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(\d{2,5})\b")
 SEPARATORS = re.compile(r"\|\||&&|[;|&\n]|\$\(|`")
 
 
-def _segments(cmd: str):
-    for seg in SEPARATORS.split(cmd):
+def _split_quoted(cmd: str):
+    """Split a command line at ; | & && || newline, $( and ` like the shell does: nothing
+    splits inside single quotes, only $( and ` split inside double quotes."""
+    out, cur, i, q = [], [], 0, ""
+    while i < len(cmd):
+        c = cmd[i]
+        if q == "'":
+            if c == "'":
+                q = ""
+            cur.append(c)
+        elif c == "\\" and i + 1 < len(cmd):
+            cur.append(cmd[i:i + 2]); i += 2
+            continue
+        elif c == "`" or cmd.startswith("$(", i):
+            out.append("".join(cur)); cur = []
+            i += 1 if c == "`" else 2
+            continue
+        elif q == '"':
+            if c == '"':
+                q = ""
+            cur.append(c)
+        elif c in "'\"":
+            q = c
+            cur.append(c)
+        elif c in ";|&\n":
+            out.append("".join(cur)); cur = []
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
+CURL_LIKE = ("curl", "wget", "http", "xh")
+
+
+def _curl_urls_ok(cmd: str) -> bool:
+    """True when the command really runs curl/wget and every such call names a URL (the URL
+    check has already allowed those URLs). Used only when the simple splitter cut a curl
+    command in two at a ; | or & that was inside quotes, e.g. --data "a=1&b=2"."""
+    calls = [w for w in _segments(cmd, _split_quoted(cmd)) if os.path.basename(w[0]) in CURL_LIKE]
+    return bool(calls) and all(URL_RE.search(" ".join(w)) for w in calls)
+
+
+def _segments(cmd: str, parts=None):
+    for seg in (SEPARATORS.split(cmd) if parts is None else parts):
         seg = seg.strip().lstrip("({").strip()
         if not seg:
             continue
@@ -109,7 +155,7 @@ def safety_reason(cmd: str, settings: WatchdogSettings = WatchdogSettings()) -> 
         prog = os.path.basename(words[0])
         if prog in NET_PROGRAMS:
             # curl/wget to the model server only is fine (URL check above passed)
-            if prog in ("curl", "wget", "http", "xh") and URL_RE.search(" ".join(words)):
+            if prog in CURL_LIKE and (URL_RE.search(" ".join(words)) or _curl_urls_ok(cmd)):
                 continue
             return f"ran a network tool ({prog})"
         if prog in ("python", "python3") and len(words) > 2 and words[1] == "-m" and words[2] == "pip":

