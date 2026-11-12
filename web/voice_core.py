@@ -255,11 +255,16 @@ _CMDS = [
 
 def parse_command(heard: str) -> dict | None:
     """Return None if the phrase doesn't start with the wake word.
-    Otherwise {"cmd": name, "text": str} where name is one of the _CMDS names or "unknown"."""
+    Otherwise {"cmd": name, "text": str} where name is one of the _CMDS names, "wake" (the
+    wake word alone) or "unknown"."""
     m = _WAKE.match(heard or "")
     if not m:
         return None
     rest = heard[m.end():].strip()
+    if not rest.strip(" ,.!?:;-"):
+        # Just "agent" on its own: people pause after the wake word. The page answers "Yes?"
+        # and takes the next phrase as the command (it re-adds the wake word itself).
+        return {"cmd": "wake", "text": ""}
     for name, pat in _CMDS:
         cm = pat.match(rest)
         if cm:

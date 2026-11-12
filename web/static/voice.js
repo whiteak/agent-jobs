@@ -191,7 +191,7 @@
   }
 
   const handsFree = {
-    active: false, paused: false, ctx: null, stream: null, node: null, pending: null,
+    active: false, paused: false, ctx: null, stream: null, node: null, pending: null, awakeUntil: 0,
     async start() {
       try { this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
       catch (e) { say(micError(e), 8000); return; }
@@ -244,12 +244,17 @@
     },
     pause(p) { this.paused = p; },
     async phrase(wav) {
+      // After a bare "agent" the next phrase is the command, wake word or not. Checked when
+      // the phrase ends, before the (slow) transcription.
+      const awake = Date.now() < this.awakeUntil;
+      this.awakeUntil = 0;
       let heard;
       try { heard = await transcribe(wav); } catch (e) { say("Transcription: " + e.message, 6000); return; }
       if (!heard) return;
       let cmd;
       try {
-        const r = await fetch("/api/voice/command", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: heard }) });
+        const text = awake ? "agent " + heard : heard;
+        const r = await fetch("/api/voice/command", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
         cmd = (await r.json()).command;
       } catch (e) { return; }
       if (!cmd) return; // no wake word: ignore silently
@@ -296,7 +301,11 @@
       case "status": return speak(await getText("/api/voice/status"), true);
       case "read_report": return speak(await getText("/api/voice/report"), true);
       case "stop": return stopSpeaking();
-      default: return speak("Sorry, I didn't get that.", true);
+      case "wake":
+        await speak("Yes?", true);
+        handsFree.awakeUntil = Date.now() + 8000; // starts after "Yes?" has been said
+        return;
+      default: return speak("Sorry, I didn't get that. Try agent status, or agent new job, then the job.", true);
     }
   }
 
