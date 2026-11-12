@@ -208,7 +208,9 @@ def _send(path, event, msg, s, *, post=None, now=None, retries=3, sleep=time.sle
     except Exception as ex:
         errs.append(str(ex))
         ok = False
-    log_send(path, event, ok, errs[-1] if errs else "")
+    # A False with nothing said about it is notify.send holding the message back (quiet
+    # hours), not a phone that would not answer - the Recent sends row has to say which.
+    log_send(path, event, ok, errs[-1] if errs else ("" if ok else "not sent: quiet hours"))
     return ok
 
 
@@ -321,8 +323,10 @@ def model_check(path, ping, *, state=None, min_gap_s=MODEL_GAP_S, now=time.time,
         up = False
     was = st.get("down")
     st["down"] = not up
-    if up or was is False:
-        return None
+    if up:
+        return None                                  # it answers: nothing to say
+    if was is True:
+        return None                                  # already known to be down
     return push(path, "model_down", "Model server down",
                 ["The local model is not answering.", "Jobs wait until it is back."],
                 settings_obj=s, **kw)
@@ -345,10 +349,11 @@ def sample(event):
 
 def outside_quiet(s, now=None):
     """A test Jason pressed on purpose must not be swallowed by quiet hours, so it is
-    sent with a clock reading outside the window (same clock notify.send uses)."""
+    sent with a clock reading outside the window (same clock notify.send uses). Minutes,
+    not hours: a window like 00:00-23:59 has every hour's first minute inside it."""
     now = now or datetime.now()
-    for h in range(24):
-        t = now.replace(hour=h, minute=0)
+    for h in range(24 * 60):
+        t = now.replace(hour=h // 60, minute=h % 60)
         if not notify.in_quiet_hours(s, t):
             return t
     return now
@@ -426,7 +431,7 @@ def page_body(path, errors=(), note="", form=None, readonly=False, token_field="
            f'value="{html.escape(token, quote=True)}">' if token_field and token else "")
     return f"""<div class="card"><h2>Phone alerts</h2>
 <p><b>{html.escape(status_line(path))}</b> {"<span class=\"hint\">Quiet hours are running now.</span>" if quiet_now else ""}</p>
-{note_html}{ro}
+{note_html}{err_html}{ro}
 <p class="hint">The job board posts to <code>&lt;server&gt;/&lt;topic&gt;</code> with ntfy, and the ntfy app on
 your phone shows it. Only titles, status and counts are ever sent - never code, diffs or log text.</p>
 <form method="post" action="/notify">

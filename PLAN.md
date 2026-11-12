@@ -1089,7 +1089,7 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
 ## Steps
 
 - [x] PLAN.md "Finish job C" section committed before the code.
-- [ ] `web/tests/test_u09b_notify.py`: settings load/save/validation (empty server = off, broken
+- [x] `web/tests/test_u09b_notify.py`: settings load/save/validation (empty server = off, broken
       file = off, env seeds, a typo saves nothing, a blank token keeps the saved one, 0600);
       one message per event the spec names, counts/status only with log text, paths, code and the
       token kept out of what reaches the phone; quiet hours (a safety stop gets through);
@@ -1097,7 +1097,12 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
       (background queue, a full queue drops the send, `phone_notify` never raises); the send runs
       on a board thread and its settings live outside anything the sandbox mounts; the token is a
       secret (0600, never shown back, `watchdog.safety_reason` stops a job that reaches for it);
-      `/notify` and its POST need the U08 session + form token. Fake sender only — no socket.
+      `/notify` and its POST need the U08 session + form token. Fake sender only — no socket
+      (55 tests, green; `notify._post` is patched out for the whole module and
+      `tearDownModule` fails the run if any test reached it).
+- [x] `watchdog.SECRET_PATH_RE` names `agent-sandbox/state/notify-settings.json` next to
+      `access-settings`/`phone-sessions` (finding 4); 9b's `SandboxReach` tests pin all four ways
+      a job might spell it, and that a normal state file is still allowed.
 - [ ] `web/tests/test_u10_report.py`: facts only from job/bench/queue records (model-written text
       never copied, the model paragraph labelled and skipped when the model is busy/not loaded);
       the Needs-you list (waiting approvals, safety stops, a failure blocking its queue, each
@@ -1113,3 +1118,31 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
       test counts before/after, what is unfinished).
 
 ## What the tests found
+
+**9b (four failures in the carried-over module, all real):**
+
+1. `notify.send` slept after the **last** failed try too (`sleep(2 ** i)` inside the except), so a
+   dead ntfy server cost the board 1+2+4 = 7 s of thread time for nothing. The spec asks for three
+   tries, not three waits: the nap now happens only `if i + 1 < retries`. `test_rest.py` still
+   pins the three `post` calls, so the retry rule itself is unchanged.
+2. Three of the four send-outcome tests hung on the shared background queue because the board-hook
+   test called `jobboard.phone_notify` with an on-the-phone settings file and **no fake sender**:
+   the worker thread fell through to `notify._post` and spent ~7 s (3 tries + sleeps) trying to
+   reach `192.168.1.9:2586` — a real network attempt from the suite, which the module's own rules
+   forbid, and it queued the two background tests behind it. The hook test now patches
+   `notify._post` with the fake sender and asserts the send lands on the worker thread;
+   `setUpModule` patches the real sender for the whole module and `tearDownModule` fails if any
+   test touched it; `Failure.setUp` drains the leftover queue so no test waits behind another.
+3. The quiet-hours log row was asserted at a fixed clock (`03:00`) against a window derived from
+   the wall clock (`daylight()`), so it only held if the suite happened to run at the right hour
+   of the day. The test now writes its own `02:00–04:00` window and checks a safety stop still
+   gets through it.
+4. Already fixed by the stopped run and kept: `Recent sends` says `not sent: quiet hours` instead
+   of a blank failure (the page cannot otherwise tell a held-back alert from a phone that would not
+   answer); `model_check` buzzes on the down edge only (it used to push whenever `up or was is
+   False` was false, which alerted every minute while the server stayed down and then said nothing
+   when it went down again after coming back); `outside_quiet` scans minutes rather than the 24
+   top-of-hour instants, because a window like
+   `00:00–23:59` contains every hour's first minute and the test button would then say "sent" when
+   nothing was; `page_body` finally shows its `Not saved:` box (the errors were computed and
+   dropped), which is what the Phone page needs when a typo in the server field is refused.

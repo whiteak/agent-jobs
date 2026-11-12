@@ -61,13 +61,15 @@ GIT_NET = {"push", "fetch", "pull", "clone", "ls-remote", "submodule"}
 # ~/.local/state/agentjobs is the approve/merge secret (upgrade 8): it is never mounted into the
 # container anyway, so a job that goes looking for it is stopped rather than politely refused.
 # state/access-settings.json + state/phone-sessions.json (upgrade 9a) are the same kind of thing:
-# a password hash and the live phone session ids.
+# a password hash and the live phone session ids. state/notify-settings.json (upgrade 9b) holds the
+# ntfy access token, so a job that goes looking for it is stopped as well.
 SECRET_PATH_RE = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/home/[^/\s'\"]+|/root)/("
     r"\.ssh|\.gnupg|\.aws|\.netrc|\.git-credentials|\.password-store|\.docker|\.kube"
     r"|\.local/share/keyrings|\.mozilla|\.config/(google-chrome|chromium|BraveSoftware|"
     r"Code|gh|git|rclone|qwen)|\.claude(?![\w-])|\.cline|snap/(firefox|chromium)|"
-    r"basalt_config|agent-sandbox/(web|state/secrets|state/(access-settings|phone-sessions)\.json)"
+    r"basalt_config|agent-sandbox/(web|state/secrets|state/(access-settings|phone-sessions|"
+    r"notify-settings)\.json)"
     r"|\.local/state/agentjobs)"
     r"|/etc/(shadow|sudoers)|/proc/\d+/environ")
 URL_RE = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]+", re.I)

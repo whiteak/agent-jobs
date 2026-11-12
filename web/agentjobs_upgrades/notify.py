@@ -84,7 +84,8 @@ def send(s: NotifySettings, event: str, msg: dict, *, now: Optional[datetime] = 
             return True
         except Exception as e:                       # never block a job on this
             log(f"notify: send failed ({e}), try {i + 1}/{retries}")
-            sleep(2 ** i)
+            if i + 1 < retries:
+                sleep(2 ** i)                        # a wait between tries, not after the last
     return False
 
 
