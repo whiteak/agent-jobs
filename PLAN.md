@@ -1085,6 +1085,13 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
 6. Neither job's PLAN.md steps are ticked, and neither has an AGENT_REPORT.md section.
 7. Gate baseline before this job: **830 tests, OK (skipped=2)** — the two skips are the real
    whisper/piper tests in `test_jobvoice.py`.
+8. **Two interruptions, neither a code problem.** After the watchdog stop the run finished both
+   modules (`34c6a44` 9b, `014e86a` 10) but the PC crashed while it was writing this report, leaving
+   `AGENT_REPORT.md`, this section and one test (`SandboxReach.test_a_job_that_opens_the_token_file
+   _by_path_is_stopped_too`, finding 5 below "What the tests found") uncommitted. The re-run read
+   all three, confirmed the test fix is right and needed, re-ran the full gate (979, green), and
+   corrected the counts the report had carried from before those last edits (55 → 56 in
+   `test_u09b_notify.py`, and the `git diff --stat` figures in its file table).
 
 ## Steps
 
@@ -1098,7 +1105,7 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
       on a board thread and its settings live outside anything the sandbox mounts; the token is a
       secret (0600, never shown back, `watchdog.safety_reason` stops a job that reaches for it);
       `/notify` and its POST need the U08 session + form token. Fake sender only — no socket
-      (55 tests, green; `notify._post` is patched out for the whole module and
+      (56 tests, green; `notify._post` is patched out for the whole module and
       `tearDownModule` fails the run if any test reached it).
 - [x] `watchdog.SECRET_PATH_RE` names `agent-sandbox/state/notify-settings.json` next to
       `access-settings`/`phone-sessions` (finding 4); 9b's `SandboxReach` tests pin all four ways
@@ -1118,9 +1125,11 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
       file), `morningreport.py` (`report_name` loop, `report_status`, the model callback,
       `gather`/`record_stamp`, `qwen_summary`), `notifycfg.py` (four fixes the stopped run had
       already made). No other module touched; `report.py` and `notify.py`'s rules unchanged.
-- [ ] Full gate green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover
+- [x] Full gate green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover
       -s tests`; `test_jobvoice_merge.py` and every JAIL/U0x/VOICE block still passing.
-- [ ] PLAN.md steps ticked; AGENT_REPORT.md "Finish job C" section (files, click-by-click trial,
+      979 tests, `OK (skipped=2)` — 830 before this job plus 56 (`test_u09b_notify.py`) and 93
+      (`test_u10_report.py`).
+- [x] PLAN.md steps ticked; AGENT_REPORT.md "Finish job C" section (files, click-by-click trial,
       test counts before/after, what is unfinished).
 
 ## What the tests found
@@ -1152,6 +1161,12 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
    `00:00–23:59` contains every hour's first minute and the test button would then say "sent" when
    nothing was; `page_body` finally shows its `Not saved:` box (the errors were computed and
    dropped), which is what the Phone page needs when a typo in the server field is refused.
+5. Found only by the **full** gate, not by the module run: `path_reason` expands `~` with
+   `$HOME`, and `tests/test_jobweb_bench.py` rewrites `HOME` to a temp folder when it is imported
+   (pre-existing, never restored). The private-location test therefore passed alone and failed in
+   discovery order, because `~/agent-sandbox/state/notify-settings.json` expanded somewhere the
+   `SECRET_PATH_RE` does not cover. The test now pins `HOME` for its own assertions and checks the
+   absolute `/home/<user>/…` form too; `test_jobweb_bench.py` was left as it is.
 
 **10 (five real bugs, all found by the new module):**
 
@@ -1163,10 +1178,11 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
    `-2.md`, `-3.md`.
 2. **`report_status` ignored a re-run.** It read `verify["status"]` only, while `tests_passed` and
    `check_lines` read the standing summary (a `recheck` wins). A job whose upgrade-1 Recheck later
-   passed was counted `✗ failed` in a line that also said "17 tests passed". It now follows the
-   precedence the dashboard and the check badges use: `recheck.summary.status`, else the gate
-   verdict `verify["status"]`, else `unverified` — so a `needs_review`/`stuck` verdict still reads
-   as it was.
+   passed was counted in `N failed` and printed with `– export for review`, while the same record's
+   Recheck summary — what the dashboard and the check badges read — said the checks passed. It now
+   follows the precedence the dashboard and the check badges use: `recheck.summary.status`, else
+   the gate verdict `verify["status"]`, else `unverified` — so a `needs_review`/`stuck` verdict
+   still reads as it was.
 3. **A model that hung up cost Jason the whole report.** `make` builds the markdown inside
    `try: … except Exception: return None`, and `report.build` asks the model inside that build —
    so an exception from the summary callback threw away facts that were already gathered. The

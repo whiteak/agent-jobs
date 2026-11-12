@@ -699,8 +699,15 @@ class SandboxReach(unittest.TestCase):
         self.assertIsNone(watchdog.safety_reason("cat ~/agent-sandbox/state/agentjobs-settings.json"))
 
     def test_a_job_that_opens_the_token_file_by_path_is_stopped_too(self):
-        reason = watchdog.path_reason("~/agent-sandbox/state/notify-settings.json", "/tmp/proj")
-        self.assertIn("private location", reason or "")
+        # path_reason expands ~ through $HOME and tests/test_jobweb_bench.py rewrites HOME when
+        # it is imported, so pin it here instead of depending on the order modules run in.
+        with mock.patch.dict(os.environ, {"HOME": "/home/jason"}):
+            for path in ("~/agent-sandbox/state/notify-settings.json",
+                         "/home/jason/agent-sandbox/state/notify-settings.json"):
+                self.assertIn("private location",
+                              watchdog.path_reason(path, "/tmp/proj") or "", path)
+        self.assertIsNone(watchdog.path_reason("/tmp/proj/notes.md", "/tmp/proj"),
+                          "a job may still read its own project")
 
     def test_nothing_the_sandbox_runs_sends_or_writes_a_report(self):
         """9b rule 4: the tool notifies, never the agent. Every file the jail hands the agent

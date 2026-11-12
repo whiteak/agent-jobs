@@ -1807,3 +1807,273 @@ voice_core.py voice_worker.py` is clean, and `/static/voice.js` passes `node --c
 - No live board was touched: this only makes the swap safe in one direction (this copy keeps voice).
   The actual swap and release stay with Jason.
 - No build output: this is the web app (no APK). Run it with `python3 web/jobboard.py`.
+
+## Finish job C — upgrades 9b (phone alerts) and 10 (morning report), finished
+
+The board already had most of both features (9b: `agentjobs_upgrades/notify.py` + `notifycfg.py` +
+the Phone page; 10: `agentjobs_upgrades/report.py` + `morningreport.py` + the Reports tab), but
+neither had a test file, so nothing proved what actually reaches the phone or what a report is
+allowed to say. This job wrote both test files, fixed what they found, and added the one watchdog
+rule that was missing.
+
+The first run of this job was stopped by the safety watchdog (an ad-hoc `python3 - <<'PY'` heredoc
+held a URL). Its work was kept, not restarted: `web/tests/test_u09b_notify.py` and the four
+`notifycfg.py`/`watchdog.py` fixes it had already made are in the first commit here, with the four
+failing tests it left behind fixed. The two specs came into the copy as
+`docs/specs/09b-push-notifications.md` and `docs/specs/10-morning-report.md`, so every assertion
+below quotes a spec line rather than a remembered one.
+
+The second run finished both test modules (`34c6a44`, `014e86a`) but the PC crashed while it was
+writing this section, leaving the report, the PLAN.md ticks and one test fix uncommitted. The third
+run (this one) added nothing to the code: it read those three files, kept the test fix —
+`path_reason` expands `~` through `$HOME`, which `tests/test_jobweb_bench.py` rewrites at import —
+re-ran the whole gate to confirm the tree at HEAD is what the report describes, and corrected the
+counts the draft had carried from before the crash (55 → 56 in `test_u09b_notify.py`, and the line
+figures in the table below).
+
+### Files changed
+
+```
+ PLAN.md                              |  197 +++    (the "Finish job C" plan + findings)
+ AGENT_REPORT.md                      |  270 +++    (this section)
+ docs/specs/09b-push-notifications.md |   24 +     (the spec, committed as asked)
+ docs/specs/10-morning-report.md      |   23 +
+ web/agentjobs_upgrades/notify.py     |    3 +-    (sleep between tries, not after the last)
+ web/agentjobs_upgrades/watchdog.py   |    6 +-    (SECRET_PATH_RE names the ntfy token file)
+ web/morningreport.py                 |   50 +-    (five bugs, below)
+ web/notifycfg.py                     |   19 +-    (four fixes the stopped run had made)
+ web/tests/test_u09b_notify.py        |  873 +++   (new, 56 tests)
+ web/tests/test_u10_report.py         | 1280 +++   (new, 93 tests)
+```
+
+(the line figures are `git diff --stat ee3aeb3` — the last commit before this job — against the
+working tree, including the two commits and the post-crash edits.)
+
+`jobboard.py` was not touched: its `# U09b` and `# U10` hooks already call the right things, and
+the tests drive them through `jobboard.phone_notify`, `phone_model_check`, `report_tick`,
+`make_report` and `report_queue_finished` so the wiring itself is what is asserted.
+
+### 9b — what `test_u09b_notify.py` proves (56 tests)
+
+Classes `Settings`, `Messages`, `QuietHours`, `Failure`, `BoardHooks`, `SandboxReach`,
+`PhonePage`, all against a `FakePost` sender; `setUpModule` patches `notify._post` for the whole
+module and `tearDownModule` **fails the run** if any test reached the real sender, so the suite can
+never dial an ntfy server.
+
+- **Off means off.** An empty server field switches everything off; a missing or broken settings
+  file reads as off rather than raising; `NTFY_SERVER`/`NTFY_TOPIC` only seed a first file, they do
+  not override what was saved; a typo in the server (`http://`, a space, a bad port) saves nothing
+  and is said out loud; a blank token field keeps the saved token; the file is written 0600.
+- **One message per spec event** — job finished, waiting for you, safety stop, bench verdict,
+  morning report, model server down. Each is asserted field by field: the title is the status word
+  (`Job finished ✓`, `Job failed ✗`, `Waiting for you`, `Safety stop`, `Bench run finished ✓`), the
+  two body lines are the job title and the checks counts (`Checks passed - 42 tests`,
+  `1 of 2 checks failed - 3 tests failing`), with the ntfy `priority` and `tags` pinned per event
+  (a safety stop is priority 5, `no_entry`). The "nothing but status and counts" tests put a
+  traceback, an assertion, a `/home/jason/...` path, a secret-looking token and a shell command
+  into the record and assert none of them appears in what would be posted.
+- **Quiet hours** hold every event and let only a safety stop through; a held-back alert still gets
+  a `Recent sends` row saying `not sent: quiet hours`, so the page can tell "held back" from "the
+  phone would not answer".
+- **A failed send is retried three times and holds up nothing.** Three `post` calls with backoff,
+  the last outcome in `state/notify-log.jsonl`; the send runs on the board's own thread, so a phone
+  that never answers costs the job nothing (`jobboard.phone_notify` on a dead server returns
+  immediately); a queue that fills up drops alerts instead of growing.
+- **The token is a secret.** 0600, never shown back in the page, and
+  `watchdog.SECRET_PATH_RE` now names `state/notify-settings.json` beside
+  `access-settings.json`/`phone-sessions.json`, so a job that runs
+  `cat ~/agent-sandbox/state/notify-settings.json` — or opens it by path — is stopped for
+  "touched a private location". `SandboxReach` also greps every file the jail hands the agent
+  (shims, broker, fake agent) for `notifycfg`/`ntfy`/`morningreport`: nothing the sandbox runs may
+  send or write a report.
+- **The page is gated.** `/notify` and `POST /notify` need the upgrade 8/9a session and the form
+  token (`ajtok`); a POST without it is 403, and a read-only board renders no Save button.
+
+### 10 — what `test_u10_report.py` proves (93 tests)
+
+Classes `Settings`, `Facts`, `Report`, `Queues`, `Schedule`, `QueueFinished`, `ModelParagraph`,
+`ReportPush`, `ReportHtml`, `ReportsPage`. `setUpModule` patches out `vision.http_call` and
+`notify._post` and fails the run if either is reached, so no test can phone the model or the phone.
+
+- **Facts come only from the records.** A job record is read for its own fields (id, folder, title,
+  kind, status, timings, rounds, rollbacks, attempts, branch, approval) and for the check summary;
+  a bench set only for its label, verdict, counts, duration and rounds; a queue file only for its
+  status and its tasks' title/milestone/state/job_id.
+  `test_no_model_written_text_is_copied_as_a_fact` gives a job whose `attempt_log` and
+  `decision_log` entries are model-written sentences and shows that none of them reaches the
+  report; `test_a_job_the_agent_left_notes_about_still_reports_the_board_s_words` pins the same
+  rule for a job the agent left notes on.
+- **Needs you** lists what is actually waiting for Jason — a job whose approval is pending
+  (`… is waiting for your approval`), a `needs_review` verdict (`- needs_review: …`, with the issue
+  that needed a look), a safety stop with what it refused, and the job that halted a queue
+  (`blocking its queue`) — and every such line carries a link to the job page. A failure that did
+  not halt its queue is *not* in Needs you but is still counted in its project.
+- **Per project** the line is `N done, N failed, N other · 40 min · 5 fix rounds · 0 rollbacks ·
+  0 extra attempts`, each job on its own line, and a failed line carries the spec's failure-reason
+  order (`failed_verify_item`): the required check that failed first, `first_error` with the
+  `TRACE` tail cut and one line kept; an advisory check is used only when it is the only failure;
+  a safety-stop line names the command or the path it refused. Tasks the queue never reached are
+  reported against the project, and tasks skipped after a failure read as skipped.
+- **One report per trigger.** `report_tick` writes exactly one when local time passes the saved
+  time (`test_the_clock_trigger_makes_one_report_and_then_waits_for_tomorrow`) and none at other
+  times; the next report starts where the last one ended, and the very first looks back a day. A
+  missed report comes out as soon as the worker is free. A queue going `stopped` or `finished`
+  makes exactly one report (`test_the_queue_hook_reports_a_finished_queue_once`); a running or
+  cancelled queue makes none, a queue file that is not there makes none, and an automatic report
+  with nothing to say writes nothing (the button always writes one). The halted-queue report names
+  the job that blocked it and the reason.
+- **The settings file** (`~/agent-sandbox/state/report-settings.json`): defaults 07:00 and
+  "ask the model when it is free", a broken file reads as defaults, 0600, a time that is not a
+  time refused with nothing saved, a blank time keeping the saved one.
+  `test_the_report_and_its_settings_are_outside_the_sandbox` imports `jobboard` in a subprocess
+  and asserts `REPORTS`/`REPORT_SETTINGS` sit outside `WORK`, so a job can neither write its own
+  report nor move its own window. `test_only_a_saved_date_file_can_be_read_back` pins the
+  `YYYY-MM-DD[-n].md` rule.
+- **The `/reports` page** (a real board on 127.0.0.1, its own tmp state and a free port): the tab
+  lists what is saved and offers the button, "Make report now" makes one and shows it, a saved
+  report is readable and `?raw=1` gives the markdown, a strange report name is a 404 and never a
+  path, the model's text and a project name containing HTML come back escaped, the report's links
+  only go somewhere this board can answer, both forms need the session's own token (403 without
+  it; on a read-only copy no button and no form at all), and a failed line's Export-for-review
+  link is fetched and answers 200.
+
+### Bugs the tests found, and the fixes
+
+9b (details in `PLAN.md`, "What the tests found"): `notify.send` slept after the **last** failed
+try too, so a dead ntfy server cost 7 s of thread time for nothing (the spec asks for three tries,
+not three waits) — the nap is now only `if i + 1 < retries`. Three send-outcome tests hung because
+the hook test had queued a real sender; that was a forbidden network attempt from the suite
+(~7 s dialling `192.168.1.9`), now impossible by construction. One quiet-hours test only held at
+one hour of the day. The fifth only showed in the full gate: `path_reason` expands `~` through
+`$HOME`, and `tests/test_jobweb_bench.py` rewrites `HOME` at import and never restores it, so the
+private-location test passed alone and failed in discovery order — the test now pins `HOME` and
+also checks the absolute form.
+
+10, all five in `morningreport.py`:
+
+1. `report_name` never did `n += 1`, so the **second report of a day looped forever** and hung the
+   worker thread (or the request) writing nothing. This is the one that would have bitten first:
+   07:00 report, then an overnight queue finishing the same day.
+2. `report_status` read `verify["status"]` only, so a job whose upgrade-1 Recheck later passed was
+   counted in `N failed` and printed with `– export for review`, while its Recheck summary — what
+   the dashboard and the check badges read — said the checks passed. It now follows the precedence
+   the dashboard uses: `recheck.summary.status` → `verify["status"]` → `unverified`.
+3. A model that raised or answered blank cost Jason the **whole** report, because `report.build`
+   asks for the paragraph inside `make`'s try. The callback is wrapped: a bad answer means no
+   paragraph, never no report (a blank answer used to leave an empty `## Qwen's summary` heading).
+4. `gather` raised `TypeError` on a record with a string in `started`/`finished` or a non-dict
+   entry — one junk record silently lost that day's report. Non-dicts and non-numeric stamps are
+   skipped now (`record_stamp`).
+5. `qwen_summary` did `str(text or "")`, so a non-prose answer (a dict, a number) would have been
+   pasted into the report as its Python repr.
+
+### Trying it by hand, click by click
+
+**Phone alerts (9b)**
+
+1. Start the board: `python3 web/jobboard.py`. On first start it writes
+   `~/agent-sandbox/state/notify-settings.json` with an empty server, so alerts are off. The top
+   nav has **Phone**.
+2. Open `http://127.0.0.1:8090/notify` **in a browser on the PC** (the page needs the upgrade 9a
+   session; opening it there is what gives its forms their own token). The first line reads
+   `Off - no ntfy server is set, so nothing is ever sent.`
+3. Fill in **ntfy server** (`http://192.168.1.20:2586`), **Topic** (the secret one from the app),
+   **Access token** if the server needs one, **Quiet hours** `22:00` to `07:00`, and **Link to the
+   board** only if the phone can reach the PC. Tick **Which events**, press **Save** → `Saved.`,
+   and the status line becomes `On.` Type nonsense in the server field instead and press Save → a
+   red `Not saved:` box lists what is wrong and nothing changed.
+4. Pick **A job finished** in *Test which one* and press **Send test notification** → `The test is
+   on its way - its result appears under Recent sends.` A second later **Recent sends** shows
+   `When / What / sent or failed / Why`. On the phone the alert reads e.g. title
+   `Job finished ✓`, line 1 `tea o'clock`, line 2 `Checks passed - 17 tests` — status words and
+   counts, never a word of output.
+5. Let a job finish (or stop one, or run a bench set) and watch the matching alert arrive. To see
+   quiet hours work: set a window that covers the current hour and Save — the status line becomes
+   `On, but quiet until 07:00 (only a safety stop gets through).` Let a job finish and its
+   **Recent sends** row reads `failed` / `not sent: quiet hours`, while a real safety stop still
+   arrives (`sent`, and on the phone with `priority 5`). The **Send test notification** button is
+   deliberately exempt: `outside_quiet` sends it with a clock reading outside the window, because
+   Jason pressed it on purpose.
+6. From a terminal: `python3 web/jobboard.py --test-phone` prints `Phone alert sent - look at the
+   ntfy app.` or `Not sent: …` and exits.
+7. To see the secret rule: start a job and have it run `cat ~/agent-sandbox/state/notify-settings.json`
+   — the watchdog stops it with "touched a private location".
+
+**Morning report (10)**
+
+1. Open `/reports` (top nav **Reports**). First thing: `No reports yet. The next one comes at
+   07:00, or press Make report now.`
+2. Press **Make report now** → the report opens. Read top to bottom: **Needs you** (waiting jobs,
+   failed jobs with the required test that failed, or `Nothing. 🎉`), one `## <project>` section
+   per project (`2 done, 1 failed, 0 other · 40 min · 5 fix rounds · 2 rollbacks · 1 extra
+   attempts`) with each job on its own line (`- ✓ tea o'clock (17 tests)`), a **Bench** section
+   with each set's verdict, then *Qwen's summary* under the line
+   `_Written by the local model; the facts above come from the job records._` Every job name links
+   to its job page; a failed item ends with `– export for review: /api/jobs/<id>/bundle`, which the
+   page renders as an **Export for review** link pointing at the board's own bundle route.
+3. Under **When to make one**, change *Make the report at* to `06:30`, untick *End with "Qwen's
+   summary"…*, press **Save** → `Saved.` The card at the top now says
+   `The next one comes at 06:30.` While a job is running the report waits for the worker instead of
+   being lost.
+4. Run an approved plan as a queue (**Run as queue**) and press **Stop** on it — as soon as the
+   queue comes to an end, the report for that window is made straight away, with the stopped job
+   under Needs you and the reason next to it.
+5. Re-run the board and press **Make report now** twice in one day: the second is
+   `2026-11-12-2.md` (before this job it hung the worker thread).
+6. Click a row under **Reports** to reopen a saved one; add `?raw=1` for the markdown. On disk they
+   are `~/agent-sandbox/state/reports/YYYY-MM-DD.md` with `index.json`.
+7. From a terminal: `python3 web/jobboard.py --report-now` prints
+   `Wrote /home/jason/agent-sandbox/state/reports/2026-11-12.md`.
+
+### Verification (this run)
+
+The gate below was run on the finished tree at `014e86a` plus the post-crash edits (one test, the
+PLAN.md ticks and this section) — it is the confirming run, and it is what the verify gate
+(`AGENT_CHECKS.json`) will run.
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+Ran 979 tests in 296.846s
+OK (skipped=2)
+```
+
+**979 tests, up from 830** before this job: +56 (`test_u09b_notify.py`) and +93
+(`test_u10_report.py`). Nothing was deleted, skipped or weakened; the only skips are the two real
+whisper/piper tests in `test_jobvoice.py`, which skip themselves when the models are missing.
+The new modules individually:
+
+```
+python3 -W ignore -m unittest tests.test_u09b_notify    -> Ran 56 tests, OK
+python3 -W ignore -m unittest tests.test_u10_report     -> Ran 93 tests, OK
+python3 -W ignore -m unittest tests.test_jobvoice_merge -> Ran 5 tests, OK
+```
+
+The blocks that must keep working were run together as well as in the full gate:
+`python3 -W ignore -m unittest tests.test_jobvoice_merge tests.test_watchdog tests.test_u09a_phone
+tests.test_rest` → `Ran 92 tests`, `OK`. No network: both
+new modules patch out `notify._post` and `vision.http_call` at module scope and fail the run if a
+test reaches them; the live-page tests use their own tmp state and a free 127.0.0.1 port, and
+`jobboard.basalt_status` is patched so nothing asks the model server. Port 8090 was never touched.
+
+### Unfinished / uncertain here
+
+- No phone and no ntfy server here, so "the phone buzzes" is proven through the fake sender only —
+  what would be posted (server + topic + Bearer + title/body) is asserted, the round trip is not.
+  Step 4 above is the first real end-to-end check; the topic and token have to be Jason's.
+- The alert itself is ntfy **JSON publishing**: `notify._post` does
+  `POST <server>` with `Content-Type: application/json` and a body of
+  `{topic, title, message, priority, tags, click?}`, plus `Authorization: Bearer <token>` when a
+  token is saved. That is the shape ntfy documents, but it was never sent to a real ntfy server
+  here, so the JSON shape is the most likely thing to need a tweak on the first real try (the
+  fake-sender tests pin what is built, and `agentjobs_upgrades/notify.py::_post` is the one place
+  to change it).
+- The report's *Qwen's summary* paragraph needs the local model. The one test that exercises the
+  real call path runs a throwaway HTTP server on 127.0.0.1 that answers like the model does; a real
+  paragraph from the real model has not been produced here.
+- The daily report depends on the board running at the saved time. The worker tick is tested with a
+  shifted clock; nobody has watched the real 07:00 fire.
+- `tests/test_jobweb_bench.py` rewrites `os.environ["HOME"]` at import and never restores it
+  (pre-existing). This job worked around it inside its own test instead of touching another job's
+  test; the next person to write a test that expands `~` will hit the same trap.
+- Nothing was pushed, merged or released: the work is on `agent/jobboard-next`. No build output —
+  this is the web app; run it with `python3 web/jobboard.py`.
