@@ -1500,6 +1500,7 @@ def header(extra=""):
     return (f'<header><h1><a href="/" style="color:inherit;text-decoration:none">Agent jobs</a></h1>'
             f'<span class="topst" id="topst"></span>'   # U09a: the sticky bar shows the running job
             f'<nav class="nav">'
+            f'<a href="/"><b>Home</b></a> '   # Jason: a clear way back to the main page
             f'<a href="/projects">Projects</a> <a href="/project/new">New project</a> '   # U04a
             f'<a href="/chat">Chat</a> '   # CHAT (job D): talk to the agent in the page
             f'<a href="/bench">Bench</a> <a href="/reports">Reports</a> '   # U10: the morning report
@@ -1907,6 +1908,8 @@ class H(http.server.BaseHTTPRequestHandler):
         """U09a: the address the request came from, which decides whether it has to log in.
         Tests stand in for a phone by patching this one method - this sandbox has no second
         network interface to connect through."""
+        if phoneaccess.proxied(self.headers):   # came through tailscale serve: a phone, not this PC
+            return "proxy:" + (self.headers.get("X-Forwarded-For") or "?").split(",")[0].strip()[:64]
         return self.client_address[0] if self.client_address else ""
 
     def host_ok(self, acc=None):

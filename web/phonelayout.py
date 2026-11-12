@@ -44,7 +44,7 @@ td.st,th.st,td.now,th.now{min-width:0;white-space:normal}
 header{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);
 margin:-10px -8px 12px;padding:6px 8px;gap:6px 10px}
 header h1{font-size:17px}
-header .nav{order:3;flex:1 1 100%%;display:flex;gap:14px;overflow-x:auto;white-space:nowrap;
+header .nav{order:3;flex:1 1 100%%;display:flex;flex-wrap:wrap;gap:6px 14px;white-space:nowrap;
 font-size:14px;padding:2px 0}
 .topst{margin-left:auto;font-size:13px}
 .topst:empty{display:none}

@@ -51,6 +51,24 @@ class Access:
     phone_access: bool = False
     listen: str = PLACEHOLDER
     password: str = ""
+    https_name: str = ""     # e.g. pc.tailnet.ts.net - `tailscale serve` puts https in front of the board
+
+
+HTTPS_NAME_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+# Headers a reverse proxy (tailscale serve) adds. A request that carries one came in through the
+# proxy, so it is NOT from this PC even though its socket address is 127.0.0.1.
+PROXY_HEADERS = ("X-Forwarded-For", "Tailscale-User-Login", "Forwarded", "X-Real-IP")
+
+
+def https_name(acc):
+    """The checked https name, or '' when unset or not a plain DNS name."""
+    n = (acc.https_name or "").strip().lower()
+    return n if HTTPS_NAME_RE.match(n) else ""
+
+
+def proxied(headers):
+    """True when a proxy in front of the board forwarded this request."""
+    return any(headers.get(h) for h in PROXY_HEADERS)
 
 
 # ------------------------------------------------------------------ the settings file
@@ -68,7 +86,8 @@ def load(path, write_defaults=False):
         raw = {}
     acc = Access(phone_access=bool(raw.get("phone_access")),
                  listen=str(raw.get("listen") or PLACEHOLDER).strip(),
-                 password=str(raw.get("password") or ""))
+                 password=str(raw.get("password") or ""),
+                 https_name=str(raw.get("https_name") or "").strip())
     if write_defaults:
         save(path, acc)
     return acc
@@ -79,6 +98,8 @@ def save(path, acc):
     path = Path(path)
     data = {"phone_access": bool(acc.phone_access), "listen": acc.listen.strip(),
             "password": acc.password}
+    if acc.https_name:
+        data["https_name"] = acc.https_name.strip()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
@@ -152,12 +173,16 @@ def hosts(port, acc):
     addr = listen_addr(acc)
     if acc.phone_access and addr and addr != "0.0.0.0":
         out.add(addr)
-    return {f"{h}:{port}" for h in out}
+    out = {f"{h}:{port}" for h in out}
+    if acc.phone_access and https_name(acc):
+        out.add(https_name(acc))            # https on 443 through the proxy: no port in Host
+    return out
 
 
 def origins(port, acc):
     """Same list for the Origin of a POST."""
-    return {f"http://{h}" for h in hosts(port, acc)}
+    name = https_name(acc) if acc.phone_access else ""
+    return {(f"https://{h}" if h == name else f"http://{h}") for h in hosts(port, acc)}
 
 
 # ------------------------------------------------------------------ sessions and login
