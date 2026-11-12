@@ -1037,11 +1037,22 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
 
 ## Findings
 
-1. **The spec files are not in this sandbox.** `/work` holds only `jobboard-next`;
-   `/work/agent-jobs-repo/upgrades/specs/` does not exist (no network to fetch it). What the
-   specs ask for is preserved verbatim in this file — the "Plan left by the previous job
-   (Upgrade 9b, phone alerts)" findings/steps and "# Job 09 — Upgrade 10" — so this job works
-   from those, and the report says so.
+1. **Both specs are now in the copy**: `docs/specs/09b-push-notifications.md` and
+   `docs/specs/10-morning-report.md` (committed by this job). The earlier run of this job had to
+   work from the specs' text as preserved in this file; now the wording is here to check against —
+   in particular 9b's "Server default: empty (= off)", "retried 3 times", "quiet hours … except
+   safety stops", "never put code, diffs, log text or file paths in a notification", and 10's
+   "facts come only from job and bench records", the reason rule ("first failing check line,
+   watchdog reason, or `Safety stop: <command>`") and "each failed item links to Export for
+   review". Their "Ground rules" sections about folder names, port 8091 and `agent-jail.sh` are
+   superseded by this copy's own rules (shared folder, no network, no jail runs here).
+1b. **Work already carried over from the run the safety watchdog stopped** (it tripped on an
+   ad-hoc python heredoc containing a URL, not on anything in the tree): `d427e2e` is this
+   section, and the tree also held a 792-line `web/tests/test_u09b_notify.py` (55 tests, 4 failing)
+   plus uncommitted fixes to `notifycfg.py` (a quiet-hours row in Recent sends says why,
+   `model_check` only buzzes on the edge down→down, `outside_quiet` scans minutes not hours, the
+   settings page shows its "Not saved" box) and `watchdog.py` (`notify-settings.json` added to
+   `SECRET_PATH_RE`). Kept: all of it, after running the module and fixing what failed.
 2. **9b is complete code.** `web/notifycfg.py` (settings 0600 + `NTFY_SERVER`/`NTFY_TOPIC` seeds +
    a random topic, `save_form` validating before saving, `job_message`/`job_done`/`checks_line`,
    `report_ready`, edge-triggered `model_check`, `send_test`/`outside_quiet`, `log_send`/`recent`,
@@ -1050,13 +1061,17 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
    worker loop, `GET /notify` + `POST /notify` behind `secret_form_only`, the "Phone" nav link,
    defaults written in `main()`, `--test-phone`. The engine `agentjobs_upgrades/notify.py` is used
    as it is (its own tests live in `test_rest.py`).
-3. **9b's missing piece is its tests.** `web/tests/test_u09b_notify.py` does not exist. The only
-   9b coverage anywhere is `test_u09a_phone.py::test_the_phone_alerts_page_needs_the_same_secret`.
-4. **The watchdog's private-location rule does not cover the ntfy token.**
-   `agentjobs_upgrades/watchdog.py:SECRET_PATH_RE` lists
+3. **9b's missing piece is its tests.** `web/tests/test_u09b_notify.py` came in with the stopped
+   run (55 tests: settings, one message per event, quiet hours, retries + the send log, the board
+   hooks, the sandbox-reach rules, the live Phone page). Four of it failed, for reasons in
+   "What the tests found"; the only 9b coverage before that was
+   `test_u09a_phone.py::test_the_phone_alerts_page_needs_the_same_secret`.
+4. **The watchdog's private-location rule did not cover the ntfy token.**
+   `agentjobs_upgrades/watchdog.py:SECRET_PATH_RE` listed
    `agent-sandbox/state/(access-settings|phone-sessions)\.json` but not `notify-settings.json`,
    which is where the Bearer token lives. A job that goes looking for it is stopped rather than
-   politely refused for the other two, so this rule is missing and gets added.
+   politely refused for the other two, so that rule was missing. It is added (with 9b's tests
+   naming all four forms a job might type).
 5. **10 is complete code.** `web/morningreport.py` (settings, `index.json` + `since_for` window,
    `slot`/`due`, `report_name` with `-2`, `read_report` behind `DAY_RE`, the record→fact mapping
    `report_status`/`tests_passed`/`attempts_count`/`check_lines`/`watchdog_stop_reason`/
