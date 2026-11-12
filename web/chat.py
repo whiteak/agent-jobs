@@ -40,6 +40,7 @@ CHAT_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
 FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SESSION_RE = re.compile(r"[A-Za-z0-9-]{8,80}")
 
+GENERAL_FOLDER = "chat"            # ~/agent-work/chat: where a chat goes when no project is picked
 CHAT_MODE = "local-qwen"          # the chat agent named in the spec; MODES-checked per turn
 ACTIVE = ("waiting", "running", "stopping")
 LABELS = {"waiting": "Waiting for the model", "running": "The agent is answering",
@@ -522,13 +523,16 @@ nothing is committed for a chat turn.</p>
 
 
 def new_chat_body(ctx, form=None, error=""):
-    fopts = "".join(f'<option value="{esc(f)}"{" selected" if form and (form.get("folder") or [""])[0] == f else ""}>{esc(f)}</option>'
-                    for f in ctx["folders"]())
+    picked = ((form.get("folder") or [""])[0] if form else "") or GENERAL_FOLDER
+    fopts = (f'<option value="{GENERAL_FOLDER}"{" selected" if picked == GENERAL_FOLDER else ""}>'
+             'General chat (no project)</option>') + "".join(
+        f'<option value="{esc(f)}"{" selected" if picked == f else ""}>{esc(f)}</option>'
+        for f in ctx["folders"]() if f != GENERAL_FOLDER)
     said = esc((form.get("text") or [""])[0]) if form else ""
     return f"""
 <div class="card"><h2>New chat</h2><form method="post" action="/chat/new">
 <label>Project folder (in ~/agent-work)</label>
-<select name="folder"><option value="">Pick a folder...</option>{fopts}</select>
+<select name="folder">{fopts}</select>
 <label>Say</label>
 <textarea name="text" data-voice="chat" maxlength="{MSG_MAX}" required
  placeholder="Ask the agent something about that project. You can hold the mic button and talk instead."></textarea>

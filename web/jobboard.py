@@ -2457,7 +2457,7 @@ class H(http.server.BaseHTTPRequestHandler):
                         parent=prev["id"], extra=carry or None)
             return self.redirect(f"/job/{m['id']}")
         if parts == ["chat", "new"]:   # CHAT (job D): start a conversation in one project folder
-            folder, text = get("folder"), get("text")
+            folder, text = get("folder") or chat.GENERAL_FOLDER, get("text")   # no project: the general chat folder
             if not FOLDER_RE.fullmatch(folder or "") or folder == "eval" or not text:
                 return self.send(chat_page(error="Pick a project folder and say something to the agent.",
                                            form=form), code=400)
