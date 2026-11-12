@@ -571,13 +571,15 @@ class Pages(unittest.TestCase):
         cls.modes = mock.patch.dict(jobboard.MODES, {upgrades.FAKE_MODE: "Fake agent (tests only)"})
         cls.modes.start()
         cls.mode = mock.patch.object(chat, "CHAT_MODE", upgrades.FAKE_MODE); cls.mode.start()
+        # header() asks the model server what it thinks; these tests never want that round trip
+        cls.basalt = mock.patch.object(jobboard, "basalt_status", lambda: "loaded"); cls.basalt.start()
         cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", cls.port), jobboard.H)
         cls.thr = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.thr.start()
 
     @classmethod
     def tearDownClass(cls):
-        for patch in (cls.mode, cls.modes, cls.host):
+        for patch in (cls.basalt, cls.mode, cls.modes, cls.host):
             patch.stop()
         cls.srv.shutdown(); cls.srv.server_close(); cls.thr.join(timeout=5)
         (jobboard.JOBS, jobboard.WORK, jobboard.CHATS, jobboard.PORT, jobboard.READONLY,

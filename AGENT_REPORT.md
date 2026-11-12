@@ -2077,3 +2077,166 @@ test reaches them; the live-page tests use their own tmp state and a free 127.0.
   test; the next person to write a test that expands `~` will hit the same trap.
 - Nothing was pushed, merged or released: the work is on `agent/jobboard-next`. No build output —
   this is the web app; run it with `python3 web/jobboard.py`.
+
+## Job D — a Chat page with voice (talk to the agent in the browser)
+
+Commits on `agent/jobboard-next`: `8e1d0f9` (the PLAN.md section, written before the code),
+`6a0f2d1` (the page, the hooks and its 50 tests), and the PLAN/report ticks here.
+
+The terminal Agent Chat is untouched: this is a second, browser-side way in. The menu now has
+**Chat**, and `/chat` is a conversation with the agent in one project folder. Each message runs
+the agent **once**, through exactly the path a job runs — `check_record` re-check, then
+`jobboard.launch_agent` (`agent_argv`: `local-qwen --offline --stream --name agentjob-<turn id>
+--in <folder>`), the jail self-test and the same runaway watchdog — with `--resume <session>` on
+every message after the first, so it is one continuing conversation. There is **no verify gate,
+no checkpoints and no job record**, so a chat turn can never queue behind a job or be mistaken
+for one.
+
+### Files
+
+| file | what changed |
+| --- | --- |
+| `web/chat.py` | **new, 646 lines.** The record (`load`/`save`/`list_chats`/`new_chat`, ids and folders and session ids re-checked every time a chat file is read), `TurnCtx` (the `JobCtx` shape `launch_agent` needs, `mgr=None` so there are no checkpoints), `run_turn`/`start_turn`/`stop_turn`, `turn_status` (incl. "waiting for the model"), `answer_text`/`speech_text`, the live `stream()` (U07's `dashboard.job_stream`), the page and its `CSS`. It never imports `jobboard`. |
+| `web/jobboard.py` | +113 lines of small `# CHAT` hooks: `import chat`, `CHATS`, `chat_ctx()`, the Chat link in `header()`, `chat_page()`, `H.chat_stream`, GET `/chat`, `/chat/<id>`, `/api/chat/<id>/events`, `/api/chat/<id>/speech`, POST `/chat/new`, `/chat/<id>/send`, `/chat/<id>/stop`, and `chat.mark_interrupted(CHATS)` at start-up. Three seams so a non-job can use the agent path: `JobCtx.events_path`, and `events()`/`session_of()` split into `events_at(path)`/`session_at(path)` — job behaviour unchanged. |
+| `web/voice_core.py` | +23 lines: `chat_command()` (hands-free on the Chat page). `parse_command` is byte-for-byte unchanged. |
+| `web/static/voice.js` | the message box hook (`textarea[data-voice="chat"]`), hands-free phrases go to `/api/voice/chat` when a chat box is on the page, `AgentVoice.say()` (talk-back that obeys "Talk-back off") |
+| `web/tests/test_chat.py` | **new, 971 lines, 50 tests** — 26 turn tests (fake agent as a real child process), 5 voice, 19 page/route/guard/phone tests |
+| `PLAN.md` | the Job D findings + steps |
+
+### How a turn runs, and what is deliberately not reused
+
+- `POST /chat/<id>/send` saves your words and starts a **thread**, then answers with a 303 — so
+  the page is free to stream and a chat turn runs while a job is running. One turn at a time per
+  chat (it is one conversation); a second message while one is running is refused with a note on
+  the page.
+- The turn id has the job-id shape, so the board's own Stop path finds it:
+  `stop_agent_process(turn_id)` (`jobboard.running`, or `podman stop agentjob-<id>`) plus
+  `upgrades.stop_job_containers(turn_id)`.
+- The live view is U07's: `dashboard.job_stream()` over `chat.turn_items()` →
+  `jobboard.events_at(turn_log)`, resumed by byte offset (`?log=`). The page renders assistant
+  text as bubbles, a tool call as one line (`ran: pytest -q`, `edited: app.py`) and **never** a
+  tool's output, the agent's thinking or raw log lines. Everything goes in with `textContent`.
+- Watchdog actions end the turn the way they end a job: a forbidden command is `safety_stop`, the
+  process is killed, and the reason is said in the chat and in the turn record.
+- State: `~/agent-sandbox/state/chats/<id>.json` (folder, mode, session id, messages with time,
+  the current turn) and `state/chats/<id>/<turn id>.jsonl` per turn. Like jobs/plans/queues, that
+  is outside everything the sandbox mounts, so an agent cannot forge its own conversation. A chat
+  file that is not the shape this module writes is not used, and an id in a URL has to match
+  `JOB_ID_RE` before it becomes a path.
+- Two races the tests found and fixed: a Stop pressed in the same millisecond a turn finished used
+  to write `"stopping"` back over the finished state (the page then waited for nothing) — the read,
+  mark and save now happen under one lock and a finished turn is left alone; and a Stop pressed a
+  moment after Send, before the agent process existed, killed nothing — `_kill_turn` now asks the
+  board's stop helper again while the turn is still live, and `run_turn` ends the turn without
+  running the agent at all if Stop arrived first.
+
+### Tests: 988 → 1038, nothing deleted, skipped or weakened
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+  before this job:  Ran 988 tests in 294.197s   OK (skipped=2)
+  after  this job:  Ran 1038 tests in 328.117s  OK (skipped=2)      (+50, all in test_chat.py)
+```
+
+Single modules (run while working, because the PC is short on memory):
+
+```
+-p test_chat.py            -> Ran 50 tests,   OK
+-p test_jobvoice_merge.py  -> Ran 5 tests,    OK      (the pinned "# VOICE" lines)
+-p test_jobvoice.py        -> Ran 11 tests,   OK (skipped=2)   (the two real whisper/piper tests)
+-p test_voice_wake.py      -> Ran 4 tests,    OK      (parse_command's exact dicts)
+-p test_u07_dashboard.py   -> Ran 33 tests,   OK      (events/session split, job_stream)
+-p test_jobstatus.py       -> Ran 71 tests,   OK      (the job pages, header nav, node --check)
+```
+
+What `test_chat.py` pins, in short: the argv is the job argv (`local-qwen`, `--offline`,
+`--stream`, `--in <folder>`, `agentjob-<turn id>`, prompt last, `--resume` from the stored
+session); the first message starts a session and the second resumes it — proved by the fake
+agent echoing back the same `session_id` in every event of the second turn; the turn passes
+`check_record` and is `refused` for a bad folder, a mode that is not on the board, or a failing
+jail self-test (and then the agent never starts); a forbidden command is safety-stopped in under
+35 s and its steps after it never run; ordinary commands are not; Stop ends a turn (`stopped`,
+`how=user_stop`, "Stopped by you") and a stopped turn that never spoke saves no answer; a chat
+turn is **not** a job record (`load_meta(turn_id) is None`, no job folder, no `.git` in the
+project, and an AST check that `chat.py` never calls `run_gate`/`CheckpointManager`/`new_job`/
+`run_agent_job`/…); one agent run per message; the transcript is written and reloads; tool
+output is in the raw log but never in the answer, the speech or the page; talk-back strips code
+and tool calls and cuts at 600 chars with "The rest is on screen."; hands-free routing on
+`/chat` (`say`/`wake`/`stop`/`cancel`, `None` without the wake word) while `/api/voice/command`
+still gives the board commands; the page escapes `<script>`, titles and `&`; logged-out phone →
+303 for GET and 403 for every chat POST with nothing changed; a POST from another Origin → 403
+(the SSE GET still 200); no token → 403; a read-only board 403s all three POSTs but still shows
+the page; the Chat link is in the menu on `/`, `/chat`, `/projects`, `/bench`; the page script
+passes `node --check`; the phone CSS block exists (`@media (max-width:700px)`, the chats table
+labelled per column, `#chattext{min-height:110px}`, 44 px buttons); a signed-in phone can open a
+chat, send to it and stop it. The agent is always the fake agent — no model, no podman — and
+`jobboard.basalt_status` is patched so not even a page render asks the model server. Each test
+board binds a free 127.0.0.1 port; **port 8090 was never contacted.**
+
+### Try it by hand — PC
+
+1. Start the board as usual: `cd jobboard-next && python3 web/jobboard.py`. To try it beside a
+   live board, use another port: `JOBBOARD_PORT=8093 python3 web/jobboard.py`. Open the link it
+   prints (`http://127.0.0.1:8093/?t=…`).
+2. The top menu now reads … Projects, New project, **Chat**, Bench, Reports, Phone, Access.
+   Click **Chat**.
+3. You get a "New chat" card: a **Project folder** dropdown (the same list the new-job form
+   offers — no `eval`, no attempt folders) and a message box. Type "what changed today?" and
+   press **Start chat**.
+4. The page is now `/chat/<id>`. Your message is a bubble on the left, and under it
+   **"Waiting for the model - a job may be using it."** Until the first output arrives. Then the
+   agent's reply streams into bubbles, each tool call is one small grey line
+   (`ran: pytest -q`, `edited: app.py`), and a safety stop or an error appears as a line of its
+   own. The state line under the box says "The agent is answering - 12s".
+5. Press **Stop** mid-answer → the state becomes "Stopped by you" and the Stop button disappears
+   (nothing left to stop). The chat is usable again straight away.
+6. Send a second message. It is the same conversation: the turn record carries the session id, and
+   the next agent process is started with `--resume <that session>`.
+7. Reload the page, or go back to `/chat` and click the chat in the list — the conversation
+   reloads from `~/agent-sandbox/state/chats/<id>.json`. The button at the right of the "Chat"
+   heading starts a **New chat** (a fresh conversation, fresh session).
+8. Start a **job** as well, then send a chat message: the chat keeps its own thread, and the page
+   says "waiting for the model" until that model answers. Nothing about the job queue changed.
+9. Voice: click **Hands-free: on** in the corner bar and say **"agent what did I change
+   yesterday"** — it fills the box, presses Send and says "Sending that to the agent." Say bare
+   **"agent"** → it answers "Yes?" and takes the next phrase. **"agent stop"** stops the talking,
+   **"agent cancel"** stops the turn. With **Talk-back on**, when a turn ends it reads the
+   agent's reply out loud — the words only, never a code block or a tool line — and for a long
+   answer it reads the start and says "The rest is on screen." Hold-to-talk works in the box too
+   (the 🎤 button under it).
+
+### Try it by hand — phone
+
+1. Turn phone access on (Access page: address + password), restart the board so it binds that
+   address, and on the phone open `http://<PC address>:8090`. Log in with the password.
+2. Tap **Chat** in the menu. At 700 px and narrower the whole page is one column: the chats list
+   is cards with the labels above each value (Started / Project / About / Messages / State), the
+   message box is at least 110 px tall and Send/Stop are 44 px tall.
+3. Tap the 🎤 button under the box, talk, release → the words appear; press **Start chat**. Or
+   turn on Hands-free and use "agent …" exactly as on the PC.
+4. A phone that has **not** logged in gets the login page for `/chat` and a 403 for a chat POST —
+   the same guard and Origin checks as every other page. A read-only board refuses the POSTs and
+   still shows the page.
+
+### Unfinished / uncertain
+
+- **The real model was never asked.** Every test runs the hidden fake agent, so the argv, the
+  offline/jail rules, the watchdog and Stop are proven, but no answer from `agent local-qwen`
+  was produced here. The first real try is step 3 above; if `~/agent-sandbox/agent local-qwen`
+  prints anything other than `--format stream-json`-shaped JSON, the bubbles will be empty and
+  only the tool lines will show.
+- **Speech in/out is wired, not exercised.** The two real whisper/piper tests remain the suite's
+  only skips (no models in this sandbox), so transcription and TTS round trips were not run here.
+  What is pinned is the routing (which endpoint a phrase goes to, what the page reads aloud) and
+  `chat_command`'s decisions.
+- **`SPEECH_MAX = 600` is a guess at what is pleasant to listen to.** It is one constant in
+  `chat.py`, and the test that pins it asserts the cut plus the "The rest is on screen." tail.
+- "Waiting for the model" is inferred from the turn's log still being empty. It does not know
+  where a chat stands behind other model users — with one model server a chat turn and a job can
+  overlap, and the model decides which answers first. The board's job queue is untouched.
+- No delete/rename/search for past chats (the job did not ask for it); the list shows the newest
+  50. `mark_interrupted()` marks a turn that was running when the board died as `interrupted`, and
+  `main()` prints how many — but nothing resumes one.
+- Nothing was pushed, merged or released; the work is on `agent/jobboard-next`. No build output —
+  this is the web app.
+

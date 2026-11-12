@@ -1278,28 +1278,34 @@ bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture s
 
 ## Steps
 
-- [ ] PLAN.md (this section) committed before the code.
-- [ ] jobboard.py seams, no behaviour change for jobs: `events_at(path, since)` /
+- [x] PLAN.md (this section) committed before the code.
+- [x] jobboard.py seams, no behaviour change for jobs: `events_at(path, since)` /
       `events(jid, since)`; `session_at(path)` / `session_of(jid)`; `JobCtx.events_path`;
       `launch_agent` uses `ctx.events_path` and its parent for `prompts/`.
-- [ ] `web/chat.py`: the record (`load`/`save`/`list_chats`/`new_chat`, id + folder + session
+- [x] `web/chat.py`: the record (`load`/`save`/`list_chats`/`new_chat`, id + folder + session
       validation), `TurnCtx` (JobCtx-shaped, no gate, no checkpoints), `run_turn` (one
       `launch_agent`, watchdog actions → turn state), `start_turn` (its own thread),
       `stop_turn`, `turn_status` (incl. "waiting for the model"), `speech_text` (assistant text
       only, code stripped, ~600 chars + "the rest is on screen"), the page, `CSS`, `stream`.
-- [ ] jobboard.py glue: `import chat`, `CHATS` (JOBBOARD_CHATS), `chat_ctx()`, the Chat link in
+      (Two races the tests found: a Stop landing the moment a turn finished used to write
+      "stopping" back over a finished turn, and a Stop landing before the agent process existed
+      killed nothing - both fixed in `stop_turn`/`_kill_turn`/`run_turn`.)
+- [x] jobboard.py glue: `import chat`, `CHATS` (JOBBOARD_CHATS), `chat_ctx()`, the Chat link in
       `header()`, GET `/chat`, `/chat/<id>`, `/api/chat/<id>/events` (SSE), `/api/chat/<id>/speech`,
       POST `/chat/new`, `/chat/<id>/send`, `/chat/<id>/stop`, and `chat.mark_interrupted(CHATS)` in
       `main()`.
-- [ ] voice: `voice_core.chat_command`; `POST /api/voice/chat` (the pinned VOICE line untouched);
+- [x] voice: `voice_core.chat_command`; `POST /api/voice/chat` (the pinned VOICE line untouched);
       voice.js hands-free on /chat (`say`/`stop`/`cancel`/`wake`) + `AgentVoice.say`.
-- [ ] `web/tests/test_chat.py`: first turn starts a session, second resumes with `--resume`; the
+- [x] `web/tests/test_chat.py`: first turn starts a session, second resumes with `--resume`; the
       argv is the job argv and passes `check_record`; a forbidden command is safety-stopped by the
       watchdog; the transcript file is written and reloads; Stop ends a turn; tool output is
       collapsed; talk-back strips code/tool output and is capped; hands-free routing on /chat; the
       page escapes everything; logged-out phone POST = 403; wrong Origin = 403; the Chat link is in
-      the menu; page script passes `node --check`; the phone CSS block exists.
-- [ ] Chat page CSS at 700 px and narrower, using `phonelayout.PHONE_MAX`/`TAP`.
-- [ ] Full gate green; nothing deleted, skipped or weakened.
-- [ ] AGENT_REPORT.md section: files, click-by-click by hand (PC and phone), test counts before and
+      the menu; page script passes `node --check`; the phone CSS block exists. (50 tests: 26 turn,
+      5 voice, 19 page.)
+- [x] Chat page CSS at 700 px and narrower, using `phonelayout.PHONE_MAX`/`TAP`.
+- [x] Full gate green; nothing deleted, skipped or weakened.
+      (`cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests` →
+      Ran 1038 tests in 328.117s, OK (skipped=2); 988 before. Single modules while working.)
+- [x] AGENT_REPORT.md section: files, click-by-click by hand (PC and phone), test counts before and
       after, what is unfinished.
