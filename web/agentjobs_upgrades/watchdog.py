@@ -113,6 +113,44 @@ def _split_quoted(cmd: str):
 CURL_LIKE = ("curl", "wget", "http", "xh")
 
 
+# Code that really opens a connection. Importing http.client or urllib.request, or reading their
+# source, does not; calling them does. A URL that only sits inside a heredoc (a test file being
+# written, a smoke script with a fake server name) counts only when that heredoc also connects.
+CONNECT_RE = re.compile(
+    r"\b(urlopen\s*\(|HTTPS?Connection\s*\(|create_connection\s*\(|socket\.connect|"
+    r"\.connect(_ex)?\s*\(\s*\(|requests\.(get|post|put|patch|delete|head|request|Session)\b|"
+    r"httpx\.|aiohttp\.|fetch\s*\(|XMLHttpRequest|WebSocket\s*\(|subprocess\.|os\.(system|popen)\s*\(|"
+    r"(curl|wget|ncat|netcat|ssh|scp|socat|telnet|gh)\b)")
+# The narrower list for "ran code that opens network connections" (no URL in sight): calls only.
+NET_CALL_RE = re.compile(
+    r"\b(urlopen\s*\(|HTTPS?Connection\s*\(|create_connection\s*\(|socket\.connect|"
+    r"requests\.(get|post|put|patch|delete|head|request)\s*\(|fetch\s*\(|XMLHttpRequest)")
+# socket.connect(("host", port)) with a literal host: loopback is the job's own test server.
+CONNECT_TUPLE_RE = re.compile(r"\.connect(?:_ex)?\s*\(\s*\(\s*['\"]([^'\"]+)['\"]")
+DEV_TCP_RE = re.compile(r"/dev/(?:tcp|udp)/([^/\s'\"]+)/(\d+)")
+LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][\w-]*)\2")
+
+
+def _heredocs(cmd: str):
+    """Split a command into (the text outside heredoc bodies, [heredoc bodies])."""
+    lines, outside, bodies, i = cmd.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        outside.append(line)
+        i += 1
+        for dash, _q, tag in HEREDOC_RE.findall(line):
+            body = []
+            while i < len(lines) and (lines[i].lstrip("\t") if dash else lines[i]) != tag:
+                body.append(lines[i])
+                i += 1
+            if i < len(lines):
+                outside.append(lines[i])  # the closing tag line
+                i += 1
+            bodies.append("\n".join(body))
+    return "\n".join(outside), bodies
+
+
 def _curl_urls_ok(cmd: str) -> bool:
     """True when the command really runs curl/wget and every such call names a URL (the URL
     check has already allowed those URLs). Used only when the simple splitter cut a curl
@@ -143,7 +181,11 @@ def _segments(cmd: str, parts=None):
 
 def safety_reason(cmd: str, settings: WatchdogSettings = WatchdogSettings()) -> Optional[str]:
     """Why this command must stop the job, or None if it looks fine."""
+    outside, bodies = _heredocs(cmd)
+    body_connects = any(CONNECT_RE.search(b) for b in bodies) or bool(CONNECT_RE.search(outside))
     for url in URL_RE.findall(cmd):
+        if url not in outside and not body_connects:
+            continue                     # only text inside a heredoc script/file that never connects
         if any(url.lower().startswith(a) for a in settings.allowed_urls):
             continue
         m = re.match(r"^\w+://(127\.0\.0\.1|localhost|\[::1\])(?::(\d+))?", url, re.I)
@@ -177,8 +219,12 @@ def safety_reason(cmd: str, settings: WatchdogSettings = WatchdogSettings()) -> 
                 return f"tried to use git over the network (git {sub})"
             if sub == "remote" and any(w in ("add", "set-url") for w in words):
                 return "tried to add a git remote"
-    if re.search(r"\b(socket\.connect|urllib\.request|requests\.(get|post)|http\.client|"
-                 r"fetch\(|XMLHttpRequest)|/dev/(tcp|udp)/", cmd) and not URL_RE.search(cmd):
+    for host, port in DEV_TCP_RE.findall(cmd):
+        if host.lower() not in LOOPBACK or int(port) in settings.blocked_ports:
+            return "ran code that opens network connections"
+    if any(h.lower() not in LOOPBACK for h in CONNECT_TUPLE_RE.findall(cmd)):
+        return "ran code that opens network connections"
+    if NET_CALL_RE.search(cmd) and not URL_RE.search(cmd):
         return "ran code that opens network connections"
     return None
 
