@@ -6,6 +6,7 @@ Framework-agnostic: jobboard.py only needs to call
     speak_to_file(text) -> Path   (WAV)
     spoken_summary(status, title, report_md) -> str
     parse_command(text) -> dict | None
+    chat_command(text) -> dict | None   (job D: hands-free on the Chat page)
 Everything is local. Nothing here touches the GPU or the network.
 """
 from __future__ import annotations
@@ -273,3 +274,25 @@ def parse_command(heard: str) -> dict | None:
                 return {"cmd": "unknown", "text": rest}
             return {"cmd": name, "text": text}
     return {"cmd": "unknown", "text": rest}
+
+
+# Job D: on the Chat page the wake word means "say this to the agent", so everything else is the
+# message. Only the two phrases that need the board itself stay commands there.
+_HOLD_ON_CHAT = ("stop", "cancel")
+
+
+def chat_command(heard: str) -> dict | None:
+    """Hands-free on the Chat page. None if the phrase does not start with the wake word;
+    otherwise {"cmd": "say"|"stop"|"cancel"|"wake", "text": what was said after "agent"} -
+    "stop" stops the talking, "cancel" stops the current turn, anything else is the message.
+    The wake word comes off here because the phrase rules live in this file, not in the page."""
+    m = _WAKE.match(heard or "")
+    if not m:
+        return None
+    rest = heard[m.end():].strip()
+    if not rest.strip(" ,.!?:;-"):
+        return {"cmd": "wake", "text": ""}
+    for name, pat in _CMDS:
+        if name in _HOLD_ON_CHAT and pat.match(rest):
+            return {"cmd": name, "text": ""}
+    return {"cmd": "say", "text": rest}

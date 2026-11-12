@@ -4,10 +4,15 @@
  * Page hooks (data attributes):
  *   <textarea data-voice="new-job">                 new-job prompt box (gets a mic button)
  *   <textarea data-voice="follow-up" data-job="ID">  follow-up box(es) (get mic buttons)
+ *   <textarea data-voice="chat">                     job D: the Chat page's message box
  *   The form around each textarea is submitted for "run it" (its submit button is clicked).
  *   <div data-voice-read>report</div>               gets a "Read aloud" button
  * Server endpoints: POST /api/transcribe, POST /api/speak, GET /api/voice/status,
- *   GET /api/voice/report, POST /api/voice/command
+ *   GET /api/voice/report, POST /api/voice/command, POST /api/voice/chat
+ * On the Chat page hands-free means "say this to the agent": only "agent stop" (stop talking) and
+ * "agent cancel" (stop the current turn) are board commands; every other phrase is the message.
+ * A page that streams an agent turn can read the answer aloud with AgentVoice.say(text) - that
+ * obeys "Talk-back off", AgentVoice.speak() does not.
  */
 (function () {
   "use strict";
@@ -254,7 +259,10 @@
       let cmd;
       try {
         const text = awake ? "agent " + heard : heard;
-        const r = await fetch("/api/voice/command", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+        // On the Chat page the wake word means "say this to the agent", so the phrase goes to
+        // the chat parser (only stop/cancel are commands there); elsewhere it is a board command.
+        const url = chatBox() ? "/api/voice/chat" : "/api/voice/command";
+        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
         cmd = (await r.json()).command;
       } catch (e) { return; }
       if (!cmd) return; // no wake word: ignore silently
@@ -267,6 +275,7 @@
     const all = [...document.querySelectorAll(`textarea[data-voice="${kind}"]`)];
     return all.length ? all[all.length - 1] : null;
   }
+  function chatBox() { return document.querySelector('textarea[data-voice="chat"]'); }
   function submitBox(ta) {
     const form = ta.closest("form");
     if (!form) return false;
@@ -281,14 +290,31 @@
 
   async function runCommand(c, heard) {
     const p = handsFree.pending;
+    // Job D, the Chat page: "agent <anything>" is the message; only "agent stop" (stop talking)
+    // and "agent cancel" (stop this turn) are commands here.
+    const ta = chatBox();
+    if (ta && c.cmd === "cancel") {
+      const sf = document.getElementById("chatstop");
+      const btn = sf && sf.querySelector("button");
+      if (!btn) return speak("Nothing is running in this chat.", true);
+      btn.click();
+      return speak("Stopping that turn.", true);
+    }
+    if (ta && c.cmd !== "stop" && c.cmd !== "wake") {
+      const msg = (c.text || "").trim();
+      if (!msg) return speak("Say something after agent.", true);
+      ta.value = msg;
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      return submitBox(ta) ? speak("Sending that to the agent.", true) : speak("I couldn't press Send.", true);
+    }
     switch (c.cmd) {
       case "new_job":
       case "follow_up": {
-        const ta = box(c.cmd === "new_job" ? "new-job" : "follow-up");
-        if (!ta) return speak(c.cmd === "new_job" ? "I can't find the new job box." : "There's no job to follow up.", true);
-        ta.value = c.text;
-        ta.dispatchEvent(new Event("input", { bubbles: true }));
-        handsFree.pending = { ta };
+        const fld = box(c.cmd === "new_job" ? "new-job" : "follow-up");
+        if (!fld) return speak(c.cmd === "new_job" ? "I can't find the new job box." : "There's no job to follow up.", true);
+        fld.value = c.text;
+        fld.dispatchEvent(new Event("input", { bubbles: true }));
+        handsFree.pending = { ta: fld };
         return speak((c.cmd === "new_job" ? "New job: " : "Follow up: ") + c.text + ". Say agent run it, or agent cancel.", true);
       }
       case "run":
@@ -305,6 +331,7 @@
         await speak("Yes?", true);
         handsFree.awakeUntil = Date.now() + 8000; // starts after "Yes?" has been said
         return;
+      case "say": return speak("I can't find the chat box here.", true);
       default: return speak("Sorry, I didn't get that. Try agent status, or agent new job, then the job.", true);
     }
   }
@@ -336,5 +363,5 @@
   }
   document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", init) : init();
 
-  window.AgentVoice = { speak: (t) => speak(t, true), stopSpeaking, handsFree, scan };
+  window.AgentVoice = { speak: (t) => speak(t, true), say: (t) => speak(t, false), stopSpeaking, handsFree, scan };
 })();

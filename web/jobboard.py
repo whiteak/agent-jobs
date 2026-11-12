@@ -36,6 +36,7 @@ import decisions  # U08: Approve & merge / Ask for changes / Reject, for a perso
 import phoneaccess  # U09a: phone access (off by default), the password login, the Access page
 import phonelayout  # U09a: the phone layout, the home-screen manifest and its icons
 import morningreport  # U10: the morning report - what ran overnight, and what needs Jason
+import chat           # CHAT (job D): the Chat page - one continuing conversation, one agent run per message
 from agentjobs_upgrades import checks as ck, verify as vf, watchdog as wdm
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("JOBBOARD_PORT", "8090"))
@@ -88,6 +89,11 @@ QUEUES = Path(os.environ.get("JOBBOARD_QUEUES") or (SANDBOX / "state" / "queues"
 REPORTS = Path(os.environ.get("JOBBOARD_REPORTS") or (SANDBOX / "state" / "reports"))
 REPORT_SETTINGS = Path(os.environ.get("JOBBOARD_REPORT_SETTINGS")
                        or (SANDBOX / "state" / "report-settings.json"))
+# CHAT (job D): the chats and their turn logs. Same rule as every other record - outside
+# everything the sandbox mounts, so an agent cannot write its own conversation or move a chat
+# onto another folder. state/chats/<id>.json is the conversation; state/chats/<id>/<turn>.jsonl
+# is one turn's raw agent stream (what the live log reads).
+CHATS = Path(os.environ.get("JOBBOARD_CHATS") or (SANDBOX / "state" / "chats"))
 if upgrades.FAKE_ON:   # U01: hidden fake-agent mode, only when JOBBOARD_FAKE=1 (tests, the 8091 copy)
     MODES[upgrades.FAKE_MODE] = "Fake agent (tests only: the job text is a scenario)"
 # U07: what the job's timeline calls the agent that ran it. The MODES values are new-job-form
@@ -376,7 +382,10 @@ class JobCtx:
         self.root = WORK / m["folder"]
         sub = str(m.get("attempt_sub") or "")   # U05: an attempt's check logs stay apart
         self.checks_root = job_dir(name) / sub if attempts.SUB_RE.fullmatch(sub) else job_dir(name)
-        self.ev = upgrades.EventLog(job_dir(name) / "events.jsonl")
+        # CHAT: launch_agent takes the agent's stream from here, so a chat turn (which has no job
+        # folder of its own) can run through it too with its turn log in place.
+        self.events_path = job_dir(name) / "events.jsonl"
+        self.ev = upgrades.EventLog(self.events_path)
         proj = str(self.root) if upgrades.HOST_MODE else f"/work/{m['folder']}"
         self.wd = wdm.Watchdog(upgrades.watchdog_settings(cfg), proj)
         self.ping = None if (upgrades.HOST_MODE or m["mode"] == upgrades.FAKE_MODE) else wdm.model_server_ok
@@ -430,12 +439,12 @@ def stop_agent_process(jid, p=None):
 def launch_agent(ctx, prompt, resume, rnd, fresh_log=False):
     """Run ONE agent process with the watchdog. Returns (rc, finished_ok, action)."""
     m, name, jid = ctx.m, ctx.name, ctx.m["id"]
-    evp = job_dir(name) / "events.jsonl"
+    evp = ctx.events_path
     if fresh_log:
         evp.write_bytes(b"")
     ctx.ev.release()                     # board lines written before the agent starts
     if rnd or ctx.runs:                  # keep every fix / restart prompt with the job
-        pd = job_dir(name) / "prompts"
+        pd = evp.parent / "prompts"
         pd.mkdir(exist_ok=True)
         (pd / f"run-{ctx.runs + 1}-round-{rnd}.txt").write_text(prompt, encoding="utf-8")
     ctx.runs += 1
@@ -797,6 +806,19 @@ def decision_ctx():
     the only place the two are tied together)."""
     return dict(work=WORK, load=load_meta, update=update_meta, job_dir=job_dir, new_job=new_job)
 
+
+def chat_ctx():
+    """CHAT (job D): what chat.py may use - and it is deliberately the same agent path a job
+    uses: check_record re-runs the safety check on the turn record right before it runs, launch_agent
+    runs the one agent process under the watchdog, and the stop pair is the board's own Stop path.
+    chat.py never imports jobboard, so this is the only place the two are tied together."""
+    return dict(chats=CHATS, work=WORK, settings=SETTINGS_FILE, modes=MODES,
+                check=check_record, launch=launch_agent, argv=agent_argv,
+                stop_process=stop_agent_process, stop_containers=upgrades.stop_job_containers,
+                is_local=jailcfg.is_local, selftest=jailcfg.selftest,
+                events_at=events_at, session_at=session_at, folders=folders,
+                readonly=READONLY, mode=chat.CHAT_MODE)
+
 def build_review_md(m):
     """Build the review bundle right after an agent job ends and save it to
     JOBS/<id>/review.md, so Copy for Claude / Download serve instantly without
@@ -845,9 +867,14 @@ def status_for(m):
 
 def session_of(jid):
     """The agent's session id from its event stream, so a follow-up can continue the same conversation."""
+    return session_at(job_dir(jid) / "events.jsonl")
+
+def session_at(path):
+    """The same for any agent stream (CHAT: a chat turn's log gives the session the next turn
+    resumes). SESSION_RE, so an id a stream made up can never become part of an argv."""
     sid = None
     try:
-        for line in open(job_dir(jid) / "events.jsonl", encoding="utf-8", errors="replace"):
+        for line in open(path, encoding="utf-8", errors="replace"):
             if '"session_id"' in line:
                 try: sid = json.loads(line).get("session_id") or sid
                 except ValueError: pass
@@ -1290,8 +1317,12 @@ def bench_compare_page(a_id, b_id):
 # ---------------------------------------------------------------- what a job produced
 
 def events(jid, since=0):
-    """Turn the agent's stream-json lines into display items."""
-    p = job_dir(jid) / "events.jsonl"
+    """Turn the agent's stream-json lines of a job into display items."""
+    return events_at(job_dir(jid) / "events.jsonl", since)
+
+def events_at(path, since=0):
+    """The same items for any agent stream (a job's, or CHAT: one chat turn's log)."""
+    p = Path(path)
     if not p.exists(): return [], 0
     with open(p, "rb") as f:
         f.seek(since); data = f.read()
@@ -1470,6 +1501,7 @@ def header(extra=""):
             f'<span class="topst" id="topst"></span>'   # U09a: the sticky bar shows the running job
             f'<nav class="nav">'
             f'<a href="/projects">Projects</a> <a href="/project/new">New project</a> '   # U04a
+            f'<a href="/chat">Chat</a> '   # CHAT (job D): talk to the agent in the page
             f'<a href="/bench">Bench</a> <a href="/reports">Reports</a> '   # U10: the morning report
             f'<a href="/notify">Phone</a> '   # U09b
             f'<a href="/access">Access</a> '   # U09a: phone access and its password
@@ -1807,9 +1839,21 @@ def notify_page(errors=(), note="", form=None, token_field="", token=""):
                                                  token_field, token))
 
 
+def chat_page(cid=None, note="", error="", form=None):
+    """CHAT (job D): the Chat page. One conversation (with its past chats listed under it), or the
+    New chat form when none is open. The page needs the same login as every other page; its POSTs
+    go through guard(post=True) like the rest of the board."""
+    ctx = chat_ctx()
+    rec = chat.load(CHATS, cid) if cid else None
+    body = (chat.open_chat_body(ctx, rec, note) if rec
+            else chat.new_chat_body(ctx, form, error))
+    return render(header() + body + chat.chats_body(CHATS, cid) + chat.CSS)
+
+
 # ---------------------------------------------------------------- voice (VOICE)
 # Routes: POST /api/transcribe, POST /api/speak, GET /api/voice/status,
-# GET /api/voice/report, POST /api/voice/command, GET /static/voice.js.
+# GET /api/voice/report, POST /api/voice/command, POST /api/voice/chat (job D: hands-free on the
+# Chat page), GET /static/voice.js.
 # All local: whisper runs in a CPU-only child process (voice_core.WhisperWorker),
 # unloaded after 10 idle minutes; piper writes WAVs to a small temp cache.
 VOICE_JS = Path(__file__).with_name("static") / "voice.js"
@@ -1926,6 +1970,8 @@ class H(http.server.BaseHTTPRequestHandler):
             if not isinstance(text, str): text = ""
             if path == "/api/speak":
                 return self.send(voice_core.speak_to_file(text).read_bytes(), "audio/wav")
+            if path == "/api/voice/chat":   # CHAT (job D): hands-free on the Chat page
+                return self.send(json.dumps({"command": voice_core.chat_command(text)}), "application/json")
             return self.send(json.dumps({"command": voice_core.parse_command(text)}), "application/json")
         except voice_core.VoiceError as e:
             return self.send(json.dumps({"error": str(e)}), "application/json", code=400)
@@ -1946,6 +1992,25 @@ class H(http.server.BaseHTTPRequestHandler):
         try:
             for chunk in dashboard.job_stream(jid, last, off, get_meta=load_meta, get_status=status_for,
                                               get_log=events, job_dir=job_dir(jid)):
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def chat_stream(self, cid, q):
+        """CHAT (job D): U07's SSE loop over one chat turn - the turn's live log rows and its
+        status. There is no timeline card on a chat page, so the byte offset is the only resume
+        point (?log=)."""
+        try: off = max(0, int((q.get("log") or ["0"])[0]))
+        except (TypeError, ValueError): off = 0
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for chunk in chat.stream(chat_ctx(), cid, off):
                 self.wfile.write(chunk.encode("utf-8"))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2156,6 +2221,20 @@ class H(http.server.BaseHTTPRequestHandler):
             except OSError: return self.send_error(404)
         if u.path == "/api/voice/status": return self.send(json.dumps(voice_status()), "application/json")   # VOICE
         if u.path == "/api/voice/report": return self.send(json.dumps(voice_report()), "application/json")   # VOICE
+        if u.path == "/chat": return self.send(chat_page())   # CHAT (job D): the Chat page
+        if len(parts) == 2 and parts[0] == "chat" and chat.CHAT_ID_RE.fullmatch(parts[1]):
+            if not chat.load(CHATS, parts[1]): return self.send_error(404)
+            return self.send(chat_page(parts[1], (q.get("note") or [""])[0][:200]))
+        if len(parts) == 4 and parts[:2] == ["api", "chat"] and parts[3] == "events":
+            if not chat.load(CHATS, parts[2]): return self.send_error(404)
+            return self.chat_stream(parts[2], q)     # CHAT: live turn (U07's SSE)
+        if len(parts) == 4 and parts[:2] == ["api", "chat"] and parts[3] == "speech":
+            # CHAT + VOICE: what the page reads aloud when a turn ends (the agent's own words,
+            # with code and tool output already taken out and a long answer cut).
+            if not chat.load(CHATS, parts[2]): return self.send_error(404)
+            items, _ = chat.turn_items(chat_ctx(), CHATS, parts[2], 0)
+            return self.send(json.dumps({"text": chat.speech_text(chat.answer_text(items))}),
+                             "application/json")
         if u.path == "/": return self.send(home_page())
         if u.path == "/api/rows": return self.send(job_rows())
         if u.path == "/bench": return self.send(bench_page())
@@ -2308,6 +2387,8 @@ class H(http.server.BaseHTTPRequestHandler):
         vpath = urllib.parse.urlparse(self.path).path
         if vpath in ("/api/transcribe", "/api/speak", "/api/voice/command"):   # VOICE
             return self.voice_post(vpath)
+        if vpath == "/api/voice/chat":   # CHAT (job D): hands-free on the Chat page
+            return self.voice_post(vpath)
         if READONLY:
             return self.send_error(403, "This job board runs read-only: starting or stopping jobs is disabled")
         parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
@@ -2372,6 +2453,21 @@ class H(http.server.BaseHTTPRequestHandler):
             m = new_job(prev["mode"], prev["folder"], job, prev.get("offline", False), resume=prev["session"],
                         parent=prev["id"], extra=carry or None)
             return self.redirect(f"/job/{m['id']}")
+        if parts == ["chat", "new"]:   # CHAT (job D): start a conversation in one project folder
+            folder, text = get("folder"), get("text")
+            if not FOLDER_RE.fullmatch(folder or "") or folder == "eval" or not text:
+                return self.send(chat_page(error="Pick a project folder and say something to the agent.",
+                                           form=form), code=400)
+            (WORK / folder).mkdir(parents=True, exist_ok=True)   # like new_job: it exists before the agent runs in it
+            rec = chat.new_chat(CHATS, folder, chat_ctx()["mode"])
+            chat.start_turn(chat_ctx(), rec["id"], text)
+            return self.redirect(f"/chat/{rec['id']}")
+        if len(parts) == 3 and parts[0] == "chat" and parts[2] == "send" and chat.CHAT_ID_RE.fullmatch(parts[1]):
+            _tid, note = chat.start_turn(chat_ctx(), parts[1], get("text"))
+            return self.redirect(f"/chat/{parts[1]}" + ("?note=" + urllib.parse.quote(note) if note else ""))
+        if len(parts) == 3 and parts[0] == "chat" and parts[2] == "stop" and chat.CHAT_ID_RE.fullmatch(parts[1]):
+            chat.stop_turn(chat_ctx(), parts[1])   # the record changes at once; the kill runs on its own thread
+            return self.redirect(f"/chat/{parts[1]}")
         if parts == ["access"]:   # U09a: the settings still need the U08 secret, not just a login
             if not self.secret_form_only(get(decisions.TOKEN_FIELD)):
                 return self.send_error(403, "Open the Access page in your browser first - "
@@ -2588,6 +2684,9 @@ def main():
     if READONLY:
         print("Read-only mode: no worker thread, jobs are never changed.", flush=True)
     else:
+        n_chat = chat.mark_interrupted(CHATS)   # CHAT: a turn left running by a dead board is over
+        if n_chat:
+            print(f"{n_chat} chat turn(s) were running when the board stopped - the page says so.", flush=True)
         threading.Thread(target=worker, daemon=True).start()
     # U09a: where to listen. Phone access off (the default) = 127.0.0.1 only, so a phone cannot
     # reach the board at all. The address from the Access page is taken up here, at start-up
