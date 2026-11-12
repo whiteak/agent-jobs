@@ -1002,3 +1002,99 @@ No whisper/piper models and no voice venv in this sandbox (`~/agent-sandbox/voic
 exist), so the two real-model tests in `tests/test_jobvoice.py` skip exactly as they do on the
 live board — they are copied verbatim, not edited. There is no microphone either, so
 `static/voice.js` is only checked as served bytes plus `node --check`.
+
+---
+
+# Finish job C — finish upgrades 9b (phone alerts) and 10 (morning report)
+
+Both features are built and wired into `web/jobboard.py`; each stopped before its test file.
+This job adds the two missing test modules, fixes what they find in the U09b/U10 glue, and keeps
+every other block (JAIL, U01, U04, U05, U06, U07, U07b, U08, U09a, U10, VOICE) working.
+
+## What the two specs ask for
+
+**9b — phone alerts (ntfy).** A Phone page that sets an ntfy server + topic (+ optional Bearer
+token) and ticks which events arrive; a message per event — job finished (✓/✗ with the checks
+counts), a job waiting for approval, a safety stop (louder, and it arrives in quiet hours too), a
+bench verdict, the morning report, the model server down. Counts and status words only: never log
+text, code, paths or secrets. Quiet hours suppress everything except a safety stop. Off by default
+(empty server = nothing is ever sent). A send that fails is logged and retried 3 times, on the
+board's own thread, and must never hold up or fail a job. Settings are a secret: 0600, the token
+never shown back, and out of reach of the agent sandbox. The page and its POST need the upgrade 8
+session + form token like every other dangerous form.
+
+**10 — the morning report.** One report a day covering everything since the report before it,
+built only from records the board wrote (job `meta.json`, queue files, bench runs) — never from
+anything the model wrote, except one clearly-labelled "Qwen's summary" paragraph that is skipped
+whenever the model is loaded-but-busy or not loaded. `Needs you` at the top (waiting approvals,
+safety stops, a failure that halted a queue), then per project: done/failed/other with the reason
+for each failure taken from the record (first failing required check line, watchdog words,
+`Safety stop: <command>`), plus the queue tasks that never ran (skipped/blocked). Made by the
+clock (07:00, one per day, a missed one as soon as the worker is free), when a project queue
+finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY-MM-DD.md` +
+`index.json`, settings in `state/report-settings.json`, shown on a Reports tab with working links
+(`/jobs/<id>`) and correct escaping.
+
+## Findings
+
+1. **The spec files are not in this sandbox.** `/work` holds only `jobboard-next`;
+   `/work/agent-jobs-repo/upgrades/specs/` does not exist (no network to fetch it). What the
+   specs ask for is preserved verbatim in this file — the "Plan left by the previous job
+   (Upgrade 9b, phone alerts)" findings/steps and "# Job 09 — Upgrade 10" — so this job works
+   from those, and the report says so.
+2. **9b is complete code.** `web/notifycfg.py` (settings 0600 + `NTFY_SERVER`/`NTFY_TOPIC` seeds +
+   a random topic, `save_form` validating before saving, `job_message`/`job_done`/`checks_line`,
+   `report_ready`, edge-triggered `model_check`, `send_test`/`outside_quiet`, `log_send`/`recent`,
+   a `queue.Queue` + daemon thread behind `push(background=True)`, `page_body`). `jobboard.py`
+   hooks: `NOTIFY_FILE`, `phone_notify(m)` at the three finish sites, `phone_model_check()` in the
+   worker loop, `GET /notify` + `POST /notify` behind `secret_form_only`, the "Phone" nav link,
+   defaults written in `main()`, `--test-phone`. The engine `agentjobs_upgrades/notify.py` is used
+   as it is (its own tests live in `test_rest.py`).
+3. **9b's missing piece is its tests.** `web/tests/test_u09b_notify.py` does not exist. The only
+   9b coverage anywhere is `test_u09a_phone.py::test_the_phone_alerts_page_needs_the_same_secret`.
+4. **The watchdog's private-location rule does not cover the ntfy token.**
+   `agentjobs_upgrades/watchdog.py:SECRET_PATH_RE` lists
+   `agent-sandbox/state/(access-settings|phone-sessions)\.json` but not `notify-settings.json`,
+   which is where the Bearer token lives. A job that goes looking for it is stopped rather than
+   politely refused for the other two, so this rule is missing and gets added.
+5. **10 is complete code.** `web/morningreport.py` (settings, `index.json` + `since_for` window,
+   `slot`/`due`, `report_name` with `-2`, `read_report` behind `DAY_RE`, the record→fact mapping
+   `report_status`/`tests_passed`/`attempts_count`/`check_lines`/`watchdog_stop_reason`/
+   `safety_command`/`approval` (U08 `decisions.state`), `gather`/`queue_facts`/`blocked_job_ids`,
+   `qwen_summary` behind the loaded+idle rule, `make`, `tick`, `queue_finished`, `md_inline`/
+   `md_html`, `page_body`/`report_body`). `jobboard.py` hooks: `REPORTS`/`REPORT_SETTINGS`, the
+   "Reports" nav link, `GET /reports`, `GET /reports/<name>` (+ `?raw=1`), `POST /report/now`,
+   `POST /report/settings`, `report_tick()` in the worker, `report_queue_finished(folder)` after
+   `taskqueue.job_finished`, and the `/jobs/<name>` + `/api/jobs/<id>/bundle` aliases that the
+   report lines and the phone click links point at. Only `test_rest.py::Report` tests the engine.
+6. Neither job's PLAN.md steps are ticked, and neither has an AGENT_REPORT.md section.
+7. Gate baseline before this job: **830 tests, OK (skipped=2)** — the two skips are the real
+   whisper/piper tests in `test_jobvoice.py`.
+
+## Steps
+
+- [x] PLAN.md "Finish job C" section committed before the code.
+- [ ] `web/tests/test_u09b_notify.py`: settings load/save/validation (empty server = off, broken
+      file = off, env seeds, a typo saves nothing, a blank token keeps the saved one, 0600);
+      one message per event the spec names, counts/status only with log text, paths, code and the
+      token kept out of what reaches the phone; quiet hours (a safety stop gets through);
+      a failed send → 3 tries + one log line, and a hung send never holds up or fails a job
+      (background queue, a full queue drops the send, `phone_notify` never raises); the send runs
+      on a board thread and its settings live outside anything the sandbox mounts; the token is a
+      secret (0600, never shown back, `watchdog.safety_reason` stops a job that reaches for it);
+      `/notify` and its POST need the U08 session + form token. Fake sender only — no socket.
+- [ ] `web/tests/test_u10_report.py`: facts only from job/bench/queue records (model-written text
+      never copied, the model paragraph labelled and skipped when the model is busy/not loaded);
+      the Needs-you list (waiting approvals, safety stops, a failure blocking its queue, each
+      linked); per-project done/failed/other/skipped with the failure-reason rule (required check
+      before advisory, first line only, watchdog words, `Safety stop: <command>`); the clock
+      trigger and the queue-finished trigger, one report each (and the second report covers only
+      what came after); the settings file; `reports/YYYY-MM-DD.md` + `index.json`; `/reports`,
+      `/reports/<name>` and their escaping, `/jobs/<name>`, and the two POSTs behind the U08 token.
+- [ ] Fix what the tests find, in the U09b/U10 code only (see "What the tests found" below).
+- [ ] Full gate green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover
+      -s tests`; `test_jobvoice_merge.py` and every JAIL/U0x/VOICE block still passing.
+- [ ] PLAN.md steps ticked; AGENT_REPORT.md "Finish job C" section (files, click-by-click trial,
+      test counts before/after, what is unfinished).
+
+## What the tests found
