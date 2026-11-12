@@ -405,8 +405,10 @@ def page_body(path, errors=(), note="", form=None, readonly=False, token_field="
         boxes += (f'<label style="font-weight:400;margin:4px 0"><input type="checkbox" name="{key}" '
                   f'{"checked" if ticked(key) else ""}> {html.escape(label)}'
                   + (f' <span class="hint">{html.escape(hint)}</span>' if hint else "") + "</label>")
-    opts = "".join(f'<option value="{k}"{" selected" if ticked(k) else ""}>{html.escape(l)}</option>'
-                   for k, l, _ in EVENTS)
+    # One plain test message first and selected; the event samples after it. (Marking every
+    # ticked event "selected" made a single <select> fall on the last one, "Model server down".)
+    opts = '<option value="test" selected>Plain test</option>' + "".join(
+        f'<option value="{k}">{html.escape(l)}</option>' for k, l, _ in EVENTS)
     rows = ""
     for rec in recent(path):
         when = time.strftime("%d %b %H:%M", time.localtime(rec.get("time", 0)))
