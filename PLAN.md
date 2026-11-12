@@ -1103,15 +1103,21 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
 - [x] `watchdog.SECRET_PATH_RE` names `agent-sandbox/state/notify-settings.json` next to
       `access-settings`/`phone-sessions` (finding 4); 9b's `SandboxReach` tests pin all four ways
       a job might spell it, and that a normal state file is still allowed.
-- [ ] `web/tests/test_u10_report.py`: facts only from job/bench/queue records (model-written text
+- [x] `web/tests/test_u10_report.py`: facts only from job/bench/queue records (model-written text
       never copied, the model paragraph labelled and skipped when the model is busy/not loaded);
       the Needs-you list (waiting approvals, safety stops, a failure blocking its queue, each
       linked); per-project done/failed/other/skipped with the failure-reason rule (required check
       before advisory, first line only, watchdog words, `Safety stop: <command>`); the clock
       trigger and the queue-finished trigger, one report each (and the second report covers only
       what came after); the settings file; `reports/YYYY-MM-DD.md` + `index.json`; `/reports`,
-      `/reports/<name>` and their escaping, `/jobs/<name>`, and the two POSTs behind the U08 token.
-- [ ] Fix what the tests find, in the U09b/U10 code only (see "What the tests found" below).
+      `/reports/<name>` and their escaping, `/jobs/<name>`, and the two POSTs behind the U08 token
+      (93 tests, green; `vision.http_call` and `notify._post` are patched out for the whole module,
+      so a report that tried to ask the model or buzz the phone fails the run).
+- [x] Fix what the tests find, in the U09b/U10 code only (see "What the tests found" below):
+      `notify.py` (one sleep between tries, not after the last), `watchdog.py` (the ntfy token
+      file), `morningreport.py` (`report_name` loop, `report_status`, the model callback,
+      `gather`/`record_stamp`, `qwen_summary`), `notifycfg.py` (four fixes the stopped run had
+      already made). No other module touched; `report.py` and `notify.py`'s rules unchanged.
 - [ ] Full gate green: `cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover
       -s tests`; `test_jobvoice_merge.py` and every JAIL/U0x/VOICE block still passing.
 - [ ] PLAN.md steps ticked; AGENT_REPORT.md "Finish job C" section (files, click-by-click trial,
@@ -1146,3 +1152,34 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
    `00:00–23:59` contains every hour's first minute and the test button would then say "sent" when
    nothing was; `page_body` finally shows its `Not saved:` box (the errors were computed and
    dropped), which is what the Phone page needs when a typo in the server field is refused.
+
+**10 (five real bugs, all found by the new module):**
+
+1. **`report_name` never incremented `n`.** Its `while True` loop returned only when a name was
+   free; with `2026-11-12.md` taken it recomputed the same name forever. The second report of a
+   day — the 07:00 report and then an overnight queue that finishes that evening, or two "Make
+   report now" presses — hung the calling thread (the worker loop, or the request) and wrote
+   nothing. `n += 1` added; `test_two_reports_the_same_day_are_named_2_and_3` pins `.md`,
+   `-2.md`, `-3.md`.
+2. **`report_status` ignored a re-run.** It read `verify["status"]` only, while `tests_passed` and
+   `check_lines` read the standing summary (a `recheck` wins). A job whose upgrade-1 Recheck later
+   passed was counted `✗ failed` in a line that also said "17 tests passed". It now follows the
+   precedence the dashboard and the check badges use: `recheck.summary.status`, else the gate
+   verdict `verify["status"]`, else `unverified` — so a `needs_review`/`stuck` verdict still reads
+   as it was.
+3. **A model that hung up cost Jason the whole report.** `make` builds the markdown inside
+   `try: … except Exception: return None`, and `report.build` asks the model inside that build —
+   so an exception from the summary callback threw away facts that were already gathered. The
+   callback is wrapped now: an error, or a blank answer (which used to leave an empty
+   `## Qwen's summary` heading with nothing under it), means no paragraph, never no report.
+4. **`gather` broke its own "never raises" promise.** A record with a string in `started` or
+   `finished` raised `TypeError` out of `make`/`tick`/`queue_finished` (jobboard catches it, but
+   that report is simply lost), and a non-dict entry raised on `.get`. Non-dict records and
+   non-numeric stamps are skipped (`record_stamp`).
+5. **`qwen_summary` printed whatever the transport returned.** It did `str(text or "")`, so an
+   answer that is not prose — a dict, a number — would have been pasted into the report as its
+   Python repr. A non-string answer is no paragraph.
+
+For the next job: `verify["rounds"]` entries are records (`{"round": n, "summary": {…}}`), not
+bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture shaped like
+`verify.py`'s *input* (`[[], []]`) crashes the home page.

@@ -184,6 +184,7 @@ def report_name(reports, entries, until) -> str:
         name = f"{day}.md" if n == 1 else f"{day}-{n}.md"
         if name not in used and not (Path(reports) / name).exists():
             return name
+        n += 1                               # without this the loop never ends on a second report
 
 
 def read_report(reports, name) -> Optional[str]:
@@ -213,19 +214,17 @@ def final_summary(m):
 
 
 def report_status(m) -> str:
-    """The board's status in report.py's words. A finished job is only as good as its checks."""
+    """The board's status in report.py's words. A finished job is only as good as its checks, and
+    a re-run (upgrade 1's Recheck button) is the standing result - the same precedence the
+    dashboard and the check badges use - so the report never writes "failed" over a re-run that
+    passed, while a gate verdict of needs_review or stuck still reads as what it was."""
     st = m.get("status")
     if st != "done":
         return st or "?"
-    vst = (m.get("verify") or {}).get("status")
-    if vst == "needs_review":
-        return "needs_review"
-    if vst == "stuck":
-        return "stuck"
-    if vst == "failed":
-        return "failed"
-    if vst == "passed":
-        return "passed"
+    vst = (((m.get("recheck") or {}).get("summary") or {}).get("status")
+           or (m.get("verify") or {}).get("status"))
+    if vst in ("needs_review", "stuck", "failed", "passed"):
+        return vst
     return "unverified"
 
 
@@ -402,17 +401,27 @@ def queue_facts(queues, since, until, blocked=None) -> list[dict]:
     return out
 
 
+def record_stamp(m):
+    """When a record counts for: when it ended, else when it started. None when the record holds
+    something that is not a time - a strange record is left out of the window, not fatal."""
+    for key in ("finished", "started"):
+        v = m.get(key)
+        if isinstance(v, (int, float)) and v:
+            return float(v)
+    return None
+
+
 def gather(jobs, queues=None, since=None, until=None, bench_verdict=None) -> tuple:
     """Everything in the window: job facts, bench sets and the queue tasks that never ran."""
     facts, bench = [], []
     blocked = blocked_job_ids(queues) if queues else set()
     ids = set()
     for m in jobs or []:
-        if not m:
-            continue
+        if not isinstance(m, dict):
+            continue                              # not a record at all: skip it, keep the report
         ids.add(str(m.get("id") or ""))
-        stamp = m.get("finished") or m.get("started") or 0
-        if not (since <= stamp < until):
+        stamp = record_stamp(m)
+        if stamp is None or not (since <= stamp < until):
             continue
         if m.get("kind") == "bench":
             bench.append(bench_fact(m, bench_verdict(m) if bench_verdict else ""))
@@ -445,7 +454,9 @@ def qwen_summary(facts_md, *, status="loaded", busy=False, call=None, url=CHAT_U
         text = (call or vision.http_call(url, timeout=timeout))(body)
     except Exception:
         return None
-    text = " ".join(str(text or "").replace("\u2018", "'").replace("\u2019", "'").split())
+    if not isinstance(text, str):
+        return None      # an answer that is not prose (a dict, a number) is no paragraph
+    text = " ".join(text.replace("\u2018", "'").replace("\u2019", "'").split())
     if not text:
         return None
     return text[:SUMMARY_MAX]
@@ -466,7 +477,14 @@ def make(*, reports, settings_path, jobs, queues=None, notify_path=None, base_ur
     s = settings(settings_path)
     summary_fn = None
     if model and s.ask_model:
-        summary_fn = lambda f: model(f)
+        def summary_fn(f):
+            # The facts are already written: a model that hangs up must not cost Jason the
+            # report. And an answer that is blank is no paragraph - no empty heading either.
+            try:
+                out = model(f)
+            except Exception:
+                return None
+            return out if out and str(out).strip() else None
     try:
         md = rp.build(facts, bench, since=since, until=now, base_url=base_url,
                       qwen_summary=summary_fn)
