@@ -2605,6 +2605,12 @@ def main():
         want = HOST
         srv = http.server.ThreadingHTTPServer((want, PORT), H)
     BOUND = want
+    for extra in phoneaccess.listen_list(want, HOST)[1:]:   # U09a: 127.0.0.1 keeps working too
+        try:
+            local = http.server.ThreadingHTTPServer((extra, PORT), H)
+            threading.Thread(target=local.serve_forever, daemon=True).start()
+        except OSError as ex:
+            print(f"Could not also listen on {extra} ({str(ex)[:140]})", flush=True)
     print(f"Job board running. Open: http://127.0.0.1:{PORT}/?t={TOKEN}", flush=True)
     print(f"Phone alerts: {notifycfg.status_line(NOTIFY_FILE)}", flush=True)   # U09b
     print(f"Phone access: {phoneaccess.status_line(acc, PORT, BOUND)}", flush=True)   # U09a

@@ -108,6 +108,15 @@ def bind_host(acc, default="127.0.0.1"):
     return listen_addr(acc) or default
 
 
+def listen_list(want, default="127.0.0.1"):
+    """Every address to serve on. A LAN or Tailscale address is served IN ADDITION to
+    127.0.0.1, so the board, its token link and the tools on this PC keep working there.
+    0.0.0.0 already covers 127.0.0.1."""
+    if want in (default, "0.0.0.0"):
+        return [want]
+    return [want, default]
+
+
 def phone_url(acc, port, bound=""):
     """The address Jason types into his phone, or '' when there is none to show."""
     addr = (bound or "").strip() or listen_addr(acc)
