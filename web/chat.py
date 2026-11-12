@@ -595,6 +595,22 @@ function start(){
    if(fails<3&&ACTIVE.indexOf(prev)>=0)setTimeout(start,2000);
    else if(fails>=3&&ACTIVE.indexOf(prev)>=0){const b=el("button","ghost2","Reload to catch up");b.onclick=function(){location.reload()};feed.appendChild(b)}};
 }
+// Send without leaving the page: a reload would drop the browser's permission to play the spoken
+// reply (autoplay needs a tap on THIS page), so hands-free answers would stay silent.
+const form=document.getElementById("chatform");
+if(form&&window.fetch){form.addEventListener("submit",function(e){
+ const ta=form.querySelector("textarea"), msg=((ta&&ta.value)||"").trim();
+ if(!msg) return;
+ e.preventDefault();
+ fetch(form.action,{method:"POST",body:new URLSearchParams(new FormData(form))}).then(function(r){
+  if(!r.ok||r.url.indexOf("note=")>=0){location.href=r.ok?r.url:location.href;return}
+  const b=el("div","bub you");b.appendChild(el("div","btext",msg));feed.appendChild(b);
+  bubble=null;ta.value="";said=false;off=0;stick=true;scroll();
+  apply({state:"waiting",label:"Waiting for the model"});
+  if(es){es.close();es=null}
+  start();
+ }).catch(function(){form.submit()});
+})}
 apply({state:start0});
 if(ACTIVE.indexOf(start0)>=0)start();
 })();

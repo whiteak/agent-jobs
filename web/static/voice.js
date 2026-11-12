@@ -85,7 +85,10 @@
         audio = new Audio(url);
         stopBtn.hidden = false;
         handsFree.pause(true);
-        await new Promise((res) => { audio.onended = audio.onerror = res; audio.play().catch(res); });
+        await new Promise((res) => { audio.onended = audio.onerror = res; audio.play().catch((e) => {
+          if (e && e.name === "NotAllowedError") say("The browser blocked the spoken reply. Allow sound/autoplay for this site, or tap the page once.", 10000);
+          res();
+        }); });
         URL.revokeObjectURL(url);
       } catch (e) { say("Talk-back failed", 6000); }
       audio = null;
