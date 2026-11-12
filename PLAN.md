@@ -1199,3 +1199,107 @@ finishes or halts (once), and by "Make report now". Saved as `state/reports/YYYY
 For the next job: `verify["rounds"]` entries are records (`{"round": n, "summary": {…}}`), not
 bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture shaped like
 `verify.py`'s *input* (`[[], []]`) crashes the home page.
+
+# Job D — a Chat page with voice (talk to the agent in the browser)
+
+## Findings
+
+- **What a job actually does with the agent.** `new_job` writes a record → `worker()` picks it up →
+  `process_job` (safety re-check `check_record`, jail self-test, timeline) → `run_agent_job` →
+  `run_agent_loop` → `launch_agent(ctx, prompt, resume, rnd, fresh_log)` → `agent_argv(m, prompt,
+  resume, rnd)`. Only the last three matter for a chat turn: the queue, the verify gate
+  (`run_gate`) and the checkpoints (`ctx.mgr`) are what the job D spec says chat must not have.
+- **The chat must not go through the job queue.** `worker()` runs one job at a time and
+  `process_job` always ends with the gate; spec 4 wants a chat turn to run *while a job runs*
+  ("waiting for the model" only because Basalt may be busy). So a turn runs in its own thread and
+  calls `launch_agent` directly.
+- **`launch_agent` is hard-wired to a job folder**: `evp = job_dir(name) / "events.jsonl"` and
+  `job_dir(name) / "prompts"`. To reuse it instead of copying 40 lines, the log path has to come
+  from the ctx: `JobCtx` gains `self.events_path`, `launch_agent` uses `ctx.events_path` and
+  `ctx.events_path.parent / "prompts"`. For jobs that is the same path as before.
+- **`agent_argv` only reads `id`/`mode`/`offline`/`folder`/`job`** of the record, so a chat turn can
+  carry a job-shaped record: `agent local-qwen --offline --stream --name agentjob-<turn id> --in
+  <folder> [--resume <session>] <message>`, or the fake agent (`upgrades.fake_cmd`, JOBBOARD_FAKE=1)
+  unchanged. It also means `check_record` — the same re-check the worker does before running a job —
+  validates a chat turn (`mode in MODES`, `FOLDER_RE`, folder ≠ eval, `SESSION_RE` for the resume id).
+- **Stop and the watchdog key everything by `ctx.m["id"]`**: `launch_agent` registers `running[jid]`
+  and `monitors[jid]`, `wait_with_watchdog(jid, p)` reads `monitors`, `stop_agent_process(jid, p)`
+  does `podman stop agentjob-<jid>` (real) or `killpg` (host test mode, the child is its own session
+  because of `start_new_session=True`), and a safety stop calls `upgrades.kill_now(p,
+  "agentjob-"+jid)`. So each turn gets its own turn id (job-id shape) and Stop is one call.
+- **`run_agent_loop` is not reusable**: it detects a user Stop with
+  `load_meta(name)["status"] == "stopping"`, i.e. a job record. A chat turn has none, so
+  `chat.run_turn` does the same mapping from the chat record's own turn state
+  (`user_stop` / `safety_stop` / `stop`) and does not restart with a handover.
+- **U07's live log and SSE are reusable with seams.** `events(jid, since)` parses
+  `job_dir(jid)/events.jsonl`; splitting the parse out as `events_at(path, since)` lets a turn log
+  parse identically (assistant text / tool_use / tool_result / result → items).
+  `dashboard.job_stream(jid, last_id, log_off, *, get_meta, get_status, get_log, job_dir)` needs
+  only chat versions of those three callables — `JobEvents.list` returns `[]` when there is no
+  `timeline.jsonl`, so a chat with no timeline streams fine. `session_of(jid)` gets the same seam
+  (`session_at(path)`): the session id for `--resume` comes from the last turn's log.
+- **Voice routes have two hard constraints.** `tests/test_jobvoice.py::test_command` compares the
+  `/api/voice/command` response *exactly* to `{"command": {...}}`, so no extra key can be added
+  there; and `tests/test_jobvoice_merge.py` pins 13 `# VOICE` lines of jobboard.py verbatim
+  (including `if vpath in ("/api/transcribe", "/api/speak", "/api/voice/command"):   # VOICE`).
+  Hands-free on /chat therefore gets its own parse (`voice_core.chat_command`) and its own route
+  (`POST /api/voice/chat`), and the pinned line stays byte-for-byte.
+- **On the Chat page only `stop` and `cancel` are board commands** (spec 5); everything else the
+  user says is a message to the agent. `parse_command` gives `text` only for new_job/follow_up, so
+  the wake word has to come off server-side (the `_WAKE` regex lives in voice_core, not in JS) —
+  `chat_command` returns `{"cmd": "say"|"stop"|"cancel"|"wake", "text": <after the wake word>}`.
+- **voice.js needs almost nothing for hold-to-talk**: `scan()` gives a mic button to every
+  `textarea[data-voice]`, so `data-voice="chat"` is enough. Talk-back at the end of a turn belongs
+  server-side (it has the parsed log): the page asks `/api/chat/<id>/speech` when a turn ends and
+  calls `AgentVoice.say(text)` — a new non-forcing wrapper, because `speak()` forces speech past
+  the "Talk-back off" switch.
+- **Security is already in one place**: `H.guard(post=True)` = Host check + (PC token cookie or the
+  U09a phone login) + the Origin check, and `do_POST` refuses everything on a READONLY board. A
+  logged-out phone POST gets 403 before the body is read. The chat routes need exactly that.
+- **Phone layout**: `render()` injects `phonelayout.CSS`; every module styles its own classes in its
+  own `@media (max-width:700px)` block (`dashboard.CSS`), so `chat.CSS` does the same and uses
+  `phonelayout.PHONE_MAX`/`TAP` instead of a second hard-coded 700.
+- **Page scripts are checked with `node --check`** by tests (test_jobstatus.py:722,
+  test_jobweb_bench.py:494) and must stay inside an IIFE (the PAGE comment explains why: two
+  top-level `let live` on one page kill both scripts).
+- **Test harness patterns to copy**: an in-process `jobboard.H` on a free port with `jobboard.PORT`
+  patched (test_u07_dashboard.Pages), temp `JOBS`/`WORK`/`SETTINGS` + `mock.patch.object(upgrades,
+  "HOST_MODE", True)` + `mock.patch.dict(jobboard.MODES, {"fake": ...})` so the fake agent runs as a
+  child process, and `mock.patch.object(jobboard.H, "remote", ...)` to stand in for a phone
+  (test_u09a_phone.py). Never the real model.
+- `folders()` is the new-job folder list (no dot dirs, no `eval`, no attempt folders) — the Chat
+  page uses the same list. `jailcfg.is_local(m)` is why `process_job` runs `jailcfg.selftest()`
+  before a local job; a local chat turn gets the same gate.
+- **Where state goes**: like jobs/plans/queues/reports, chats live outside everything the sandbox
+  mounts — `~/agent-sandbox/state/chats/<id>.json` for the conversation (folder, session id,
+  messages with time) and `state/chats/<id>/<turn id>.jsonl` for each turn's raw agent stream.
+  Chat ids get the job-id shape and every id in a route is matched against it before it becomes a
+  path. `main()` already calls `mark_interrupted()` for jobs; chat turns need the same on restart.
+
+## Steps
+
+- [ ] PLAN.md (this section) committed before the code.
+- [ ] jobboard.py seams, no behaviour change for jobs: `events_at(path, since)` /
+      `events(jid, since)`; `session_at(path)` / `session_of(jid)`; `JobCtx.events_path`;
+      `launch_agent` uses `ctx.events_path` and its parent for `prompts/`.
+- [ ] `web/chat.py`: the record (`load`/`save`/`list_chats`/`new_chat`, id + folder + session
+      validation), `TurnCtx` (JobCtx-shaped, no gate, no checkpoints), `run_turn` (one
+      `launch_agent`, watchdog actions → turn state), `start_turn` (its own thread),
+      `stop_turn`, `turn_status` (incl. "waiting for the model"), `speech_text` (assistant text
+      only, code stripped, ~600 chars + "the rest is on screen"), the page, `CSS`, `stream`.
+- [ ] jobboard.py glue: `import chat`, `CHATS` (JOBBOARD_CHATS), `chat_ctx()`, the Chat link in
+      `header()`, GET `/chat`, `/chat/<id>`, `/api/chat/<id>/events` (SSE), `/api/chat/<id>/speech`,
+      POST `/chat/new`, `/chat/<id>/send`, `/chat/<id>/stop`, and `chat.mark_interrupted(CHATS)` in
+      `main()`.
+- [ ] voice: `voice_core.chat_command`; `POST /api/voice/chat` (the pinned VOICE line untouched);
+      voice.js hands-free on /chat (`say`/`stop`/`cancel`/`wake`) + `AgentVoice.say`.
+- [ ] `web/tests/test_chat.py`: first turn starts a session, second resumes with `--resume`; the
+      argv is the job argv and passes `check_record`; a forbidden command is safety-stopped by the
+      watchdog; the transcript file is written and reloads; Stop ends a turn; tool output is
+      collapsed; talk-back strips code/tool output and is capped; hands-free routing on /chat; the
+      page escapes everything; logged-out phone POST = 403; wrong Origin = 403; the Chat link is in
+      the menu; page script passes `node --check`; the phone CSS block exists.
+- [ ] Chat page CSS at 700 px and narrower, using `phonelayout.PHONE_MAX`/`TAP`.
+- [ ] Full gate green; nothing deleted, skipped or weakened.
+- [ ] AGENT_REPORT.md section: files, click-by-click by hand (PC and phone), test counts before and
+      after, what is unfinished.
