@@ -696,3 +696,26 @@ class Page(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealModelId(unittest.TestCase):
+    """Basalt refuses an unknown model name with 404, so the board asks /v1/models for the id."""
+    def test_the_id_comes_from_the_models_list_and_falls_back(self):
+        import json, threading, http.server
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = json.dumps({"data": [{"id": "Real Model X"}]}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers()
+                self.wfile.write(b)
+            def log_message(self, *a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_port}/v1/chat/completions"
+            chat._MODEL_IDS.pop(url, None)
+            self.assertEqual(chat.talk_model(url), "Real Model X")
+        finally:
+            srv.shutdown()
+        dead = "http://127.0.0.1:9/v1/chat/completions"
+        chat._MODEL_IDS.pop(dead, None)
+        self.assertEqual(chat.talk_model(dead), chat.TALK_MODEL)

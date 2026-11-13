@@ -395,6 +395,24 @@ def talk_messages(rec, text, jobs=None, now=None):
     return [{"role": "system", "content": system}] + history + [{"role": "user", "content": text}]
 
 
+_MODEL_IDS = {}
+
+
+def talk_model(url):
+    """The model id the server really serves (Basalt answers 404 to any other name, "local"
+    included). Asked once per server URL from its /v1/models; TALK_MODEL if that cannot be read."""
+    if url not in _MODEL_IDS:
+        mid = TALK_MODEL
+        try:
+            murl = url.rsplit("/chat/completions", 1)[0] + "/models"
+            with urllib.request.urlopen(murl, timeout=3) as r:
+                mid = json.load(r)["data"][0]["id"] or TALK_MODEL
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            pass
+        _MODEL_IDS[url] = mid
+    return _MODEL_IDS[url]
+
+
 def talk_stream(messages, on_text, stopped=lambda: False, *, url=None, timeout=None,
                 opener=urllib.request.urlopen):
     """Ask the local model server for an answer (OpenAI format, "stream": true) and hand every
@@ -405,7 +423,7 @@ def talk_stream(messages, on_text, stopped=lambda: False, *, url=None, timeout=N
     is never passed to on_text, so it stays out of the bubble and out of the spoken reply.
     stopped() ends the answer where it got to - the connection is closed, which is how Stop works
     when there is no agent process to kill."""
-    body = {"model": TALK_MODEL, "stream": True, "temperature": TALK_TEMP,
+    body = {"model": talk_model(url or TALK_URL), "stream": True, "temperature": TALK_TEMP,
             "max_tokens": TALK_TOKENS, "messages": messages}
     req = urllib.request.Request(url or TALK_URL, data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
