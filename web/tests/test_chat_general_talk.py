@@ -719,3 +719,12 @@ class RealModelId(unittest.TestCase):
         dead = "http://127.0.0.1:9/v1/chat/completions"
         chat._MODEL_IDS.pop(dead, None)
         self.assertEqual(chat.talk_model(dead), chat.TALK_MODEL)
+
+
+class WaitingIsRecent(unittest.TestCase):
+    def test_only_recent_undecided_jobs_count_as_waiting(self):
+        now = 1_800_000_000.0
+        old = {"id": "a", "status": "done", "job": "old", "folder": "p", "finished": now - 10 * 86400}
+        new = {"id": "b", "status": "done", "job": "new", "folder": "p", "finished": now - 3600}
+        block = chat.board_block([old, new], now=now)
+        self.assertIn("1 waiting for your OK", block)

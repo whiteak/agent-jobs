@@ -70,6 +70,7 @@ TALK_TOKENS = 700                     # an answer to talk about, not a report
 TALK_TIMEOUT = 180                    # the model may be busy with a job: waiting is normal
 TALK_HISTORY_MSGS = 30                # how much of the conversation goes back to the model...
 TALK_HISTORY_CHARS = 20000            # ... and what it is cut to (the oldest messages go first)
+TALK_WAITING_DAYS = 3                 # "waiting for your OK" counts finished jobs this recent only
 TALK_BOARD_MAX = 1500                 # the "Board right now" block inside the system prompt
 TALK_HINT = "Just talk - this chat can't change files"
 
@@ -338,7 +339,9 @@ def board_block(jobs, now=None, max_chars=TALK_BOARD_MAX):
     live = [m for m in recs if m["status"] in JOB_LIVE]
     over = sorted((m for m in recs if m["status"] not in JOB_OPEN),
                   key=lambda m: m.get("finished") or m.get("created") or 0, reverse=True)
-    waiting = sum(1 for m in over if m["status"] == "done" and approval_of(m) == "waiting")
+    recent = now - TALK_WAITING_DAYS * 86400   # older undecided jobs were dealt with by hand, not "waiting"
+    waiting = sum(1 for m in over if m["status"] == "done" and approval_of(m) == "waiting"
+                  and float(m.get("finished") or m.get("created") or 0) >= recent)
     safety = sum(1 for m in over if m["status"] == "safety_stop")
     lines = ["Board right now, copied out of the board's own job records at "
              + time.strftime("%A %d %B %Y, %H:%M", time.localtime(now)) + ":"]
