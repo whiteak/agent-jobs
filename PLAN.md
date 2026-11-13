@@ -1347,8 +1347,8 @@ bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture s
 
 ## Steps
 
-- [ ] PLAN.md (this section) committed before the code.
-- [ ] `web/chat.py`, general-chat path:
+- [x] PLAN.md (this section) committed before the code.
+- [x] `web/chat.py`, general-chat path:
       `TALK_URL`/`TALK_SYSTEM`/caps as module constants; `history_messages` (last 30 messages,
       ~20 000 chars, oldest dropped first); `board_block` (running job, last 5 finished with ✓/✗
       and when, approvals waiting, today's date/time — record fields only, under ~1500 chars);
@@ -1358,15 +1358,31 @@ bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture s
       turn log path, the answer saved as one agent message); `turn_items` branches to `talk_items`;
       `answer_text` concatenates deltas; `stop_turn` skips the process-kill for a talk turn;
       `run_turn` hands a GENERAL_FOLDER chat to `run_talk_turn`.
-- [ ] Page wording: General chat says "Just talk — this chat can't change files"; project chats keep
+- [x] Page wording: General chat says "Just talk — this chat can't change files"; project chats keep
       the agent hint. The script renders `delta` rows into the open bubble.
-- [ ] jobboard.py: `chat_ctx()` gains `jobs=all_jobs` (the board facts are record-only, and
+- [x] jobboard.py: `chat_ctx()` gains `jobs=all_jobs` (the board facts are record-only, and
       `chat.py` still never imports jobboard).
-- [ ] `web/tests/test_chat_general_talk.py`: the model endpoint is asked, the agent argv is not;
+- [x] `web/tests/test_chat_general_talk.py`: the model endpoint is asked, the agent argv is not;
       system prompt + history + message in the body; history cap; board block = record facts and
       capped; streamed chunks → bubble text + `done`; a model error → `failed` with a readable note;
       Stop cancels the stream; reasoning stays out of text and speech; a project chat still runs the
       agent (fake agent answers, the fake model server is never called). No test touches 8080/8090.
+      (33 tests: 28 turns, 5 page.)
 - [ ] Full gate green; nothing deleted, skipped or weakened. Test counts before and after in
       AGENT_REPORT.md.
 - [ ] AGENT_REPORT.md section: files, how to try it by hand, counts, what is unfinished.
+
+## What the tests found
+
+- **The message was asked twice.** `start_turn` writes the new message into the conversation before
+  the turn thread runs (so the page shows it at once), so `history_messages(rec)` already ended with
+  it and `talk_messages` added it again — the model saw `… user, user`. `talk_messages` now drops
+  that trailing copy when it is the turn's own message.
+- **The saved answer and the streamed one disagreed.** `answer_text` strips its blocks, the streamed
+  text was saved raw, so a stopped turn kept `"chunk0 "` in the record while the log read back
+  `"chunk0"`. The saved answer is `text.strip()` now.
+- **A chat could hang on the board's own records.** Building the prompt read `ctx["jobs"]()` outside
+  the try, so one unreadable job record left the turn in `running` forever. It is inside the try now:
+  the turn ends `failed` with a note instead.
+- `check_record` demands JSON job text in the fake agent's mode, which is why the General-chat tests
+  use the board's real chat mode (`local-qwen`) — a General chat is plain prose by definition.

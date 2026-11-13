@@ -505,6 +505,37 @@ class Talk(unittest.TestCase):
         self.assertIn("safety check (mode)", out["turn"]["note"])
         self.assertEqual(srv.requests, [], "the model was never asked")
 
+    def test_job_records_the_board_cannot_read_fail_the_turn_instead_of_hanging_it(self):
+        srv = self.serve()
+        self.job("20261113-090000-bbbb", "done", "add dark mode", finished=time.time() - 60,
+                 decision_log=["merged"])      # a record left in a shape nothing expects
+        rec = self.new()
+        out = self.send(rec["id"], "what finished?")
+        self.assertEqual(out["turn"]["state"], "failed")
+        self.assertIn("model", out["turn"]["note"].lower())
+        self.assertEqual(srv.requests, [], "a broken board block never reaches the model")
+
+    def test_a_connection_that_breaks_mid_answer_says_the_server_stopped_answering(self):
+        class Half:
+            """Answers with one chunk, then the connection dies."""
+
+            def __iter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"Part"}}]}\n\n'
+                raise ConnectionResetError("the server went away")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        got = []
+        with self.assertRaises(chat.TalkError) as cm:
+            chat.talk_stream([{"role": "user", "content": "hi"}], got.append,
+                             opener=lambda req, timeout: Half())
+        self.assertIn("stopped answering in the middle", str(cm.exception))
+        self.assertEqual(got, ["Part"], "what got through was still handed to the page")
+
     def test_a_tampered_general_chat_record_is_never_turned_into_a_model_call(self):
         srv = self.serve()
         rec = self.new()

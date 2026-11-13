@@ -416,25 +416,29 @@ def talk_stream(messages, on_text, stopped=lambda: False, *, url=None, timeout=N
     except OSError as ex:
         raise TalkError(f"The model server did not answer ({str(ex) or type(ex).__name__})") from ex
     said = []
-    with resp:
-        for raw in resp:
-            if stopped():
-                break                               # Stop pressed: keep what already got through
-            raw = raw.decode("utf-8", "replace").strip()
-            if not raw.startswith("data:"):
-                continue                            # "event:", a comment, a keepalive
-            part = raw[5:].strip()
-            if part == "[DONE]":
-                break
-            try:
-                part = json.loads(part)
-            except ValueError:
-                continue                            # a heartbeat, or a line cut in half
-            for choice in part.get("choices") or []:
-                bit = (choice.get("delta") or {}).get("content")
-                if isinstance(bit, str) and bit:
-                    said.append(bit)
-                    on_text(bit)
+    try:
+        with resp:
+            for raw in resp:
+                if stopped():
+                    break                           # Stop pressed: keep what already got through
+                raw = raw.decode("utf-8", "replace").strip()
+                if not raw.startswith("data:"):
+                    continue                        # "event:", a comment, a keepalive
+                part = raw[5:].strip()
+                if part == "[DONE]":
+                    break
+                try:
+                    part = json.loads(part)
+                except ValueError:
+                    continue                        # a heartbeat, or a line cut in half
+                for choice in part.get("choices") or []:
+                    bit = (choice.get("delta") or {}).get("content")
+                    if isinstance(bit, str) and bit:
+                        said.append(bit)
+                        on_text(bit)
+    except OSError as ex:
+        raise TalkError("The model server stopped answering in the middle"
+                        f" ({str(ex) or type(ex).__name__})") from ex
     return "".join(said)
 
 
@@ -480,7 +484,6 @@ def run_talk_turn(ctx, cid, turn_id):
     log = turn_log(chats, cid, turn_id)
     if log is None:
         return patch_turn(chats, cid, turn_id, state="refused", note="Refused: bad turn log path")
-    msgs = talk_messages(rec, turn.get("text") or "", ctx["jobs"]())
     patch_turn(chats, cid, turn_id, state="running")
     if stop_pressed(turn_id):       # Stop landed before the request even went out
         return patch_turn(chats, cid, turn_id, state="stopped", note="Stopped by you",
@@ -488,6 +491,7 @@ def run_talk_turn(ctx, cid, turn_id):
     started = time.time()
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
+        msgs = talk_messages(rec, turn.get("text") or "", ctx["jobs"]())
         with log.open("w", encoding="utf-8") as fh:
             def got(bit):
                 fh.write(json.dumps({"type": "talk", "k": "delta", "t": bit}, ensure_ascii=False)
