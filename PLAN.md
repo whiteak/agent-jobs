@@ -1309,3 +1309,64 @@ bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture s
       Ran 1038 tests in 328.117s, OK (skipped=2); 988 before. Single modules while working.)
 - [x] AGENT_REPORT.md section: files, click-by-click by hand (PC and phone), test counts before and
       after, what is unfinished.
+
+# Job E — "General chat" is a real conversation, not a coding task
+
+## Findings
+
+- **Every chat message runs the coding agent.** `run_turn` builds `turn_meta` and calls
+  `ctx["launch"]` (`jobboard.launch_agent` → `agent_argv` → `~/agent-sandbox/agent local-qwen`).
+  In the General chat folder (`chat.GENERAL_FOLDER`, folder name `chat`) that is wrong: the agent's
+  own system prompt makes it answer like a coding task in an empty folder.
+- **The board already talks to the model host-side, without the agent.** `morningreport.qwen_summary`
+  and `agentjobs_upgrades.vision.http_call` POST `http://127.0.0.1:8080/v1/chat/completions` straight
+  from the board process (no jail, no tools, no watchdog). `tests/fakeserver.py` and
+  `tests/test_u06a_vision.py` show the local fake-server pattern the new tests will copy: bind
+  `("127.0.0.1", 0)`, hand back `…/v1/chat/completions`, never 8080.
+- **The live bubbles come from the turn's log file, not from a socket.** `chat.stream` →
+  `dashboard.job_stream` → `chat.turn_items` → `ctx["events_at"]` (the agent's stream-json parser),
+  and `turn_status` calls a running turn "waiting for the model" while that log is still 0 bytes.
+  So a general turn needs a log file of its own that `turn_items` can read: `chat.py` owns
+  `turn_items`, so it can parse its own lines without touching `jobboard.events_at` (which every
+  job page shares). Whole-line-only, byte-offset resume, exactly like `events_at`.
+- **`answer_text` joins its blocks with "\n\n"**, which is right for an agent's separate assistant
+  messages and wrong for pieces of one streamed sentence. The talk log therefore uses its own item
+  kind (`delta`) that `answer_text` concatenates, and `CHAT_SCRIPT.add` appends it to the open
+  bubble with no separator. `answer_text` is also what `/api/chat/<id>/speech` reads, so talk-back
+  follows the same rule for free.
+- **`stop_turn` kills a process that does not exist for a talk turn** (`_kill_turn` →
+  `stop_agent_process`/`stop_job_containers` on `agentjob-<turn id>`, retried 20 times). A talk turn
+  has no process: the record's stop event is enough, and the stream loop checks it between chunks
+  and closes the connection.
+- **The board facts have to come from records only.** `jobboard.all_jobs()` is the meta list
+  (newest first, by record directory name). "Waiting for you" is what U08 left undecided —
+  `morningreport.approval` calls `decisions.state(m)`; `decisions` never imports `jobboard`, so
+  `chat.py` may import it the way it already imports `dashboard`/`jailcfg`/`upgrades`.
+- **A general chat is still a chat record**: same ids, same `ok_record` re-check, same turn states,
+  same SSE, same talk-back, same Stop. Only the thing that answers changes.
+
+## Steps
+
+- [ ] PLAN.md (this section) committed before the code.
+- [ ] `web/chat.py`, general-chat path:
+      `TALK_URL`/`TALK_SYSTEM`/caps as module constants; `history_messages` (last 30 messages,
+      ~20 000 chars, oldest dropped first); `board_block` (running job, last 5 finished with ✓/✗
+      and when, approvals waiting, today's date/time — record fields only, under ~1500 chars);
+      `talk_messages` (system + history + the new message); `talk_stream` (OpenAI SSE with
+      `"stream": true`, `delta.content` only, `delta.reasoning*` dropped, Stop closes it);
+      `run_talk_turn` (same record check, same waiting/running/done/failed/stopped states, the same
+      turn log path, the answer saved as one agent message); `turn_items` branches to `talk_items`;
+      `answer_text` concatenates deltas; `stop_turn` skips the process-kill for a talk turn;
+      `run_turn` hands a GENERAL_FOLDER chat to `run_talk_turn`.
+- [ ] Page wording: General chat says "Just talk — this chat can't change files"; project chats keep
+      the agent hint. The script renders `delta` rows into the open bubble.
+- [ ] jobboard.py: `chat_ctx()` gains `jobs=all_jobs` (the board facts are record-only, and
+      `chat.py` still never imports jobboard).
+- [ ] `web/tests/test_chat_general_talk.py`: the model endpoint is asked, the agent argv is not;
+      system prompt + history + message in the body; history cap; board block = record facts and
+      capped; streamed chunks → bubble text + `done`; a model error → `failed` with a readable note;
+      Stop cancels the stream; reasoning stays out of text and speech; a project chat still runs the
+      agent (fake agent answers, the fake model server is never called). No test touches 8080/8090.
+- [ ] Full gate green; nothing deleted, skipped or weakened. Test counts before and after in
+      AGENT_REPORT.md.
+- [ ] AGENT_REPORT.md section: files, how to try it by hand, counts, what is unfinished.
