@@ -2240,3 +2240,148 @@ board binds a free 127.0.0.1 port; **port 8090 was never contacted.**
 - Nothing was pushed, merged or released; the work is on `agent/jobboard-next`. No build output —
   this is the web app.
 
+## Job E — "General chat" is a real conversation, not a coding task
+
+Chat's General folder (`chat.GENERAL_FOLDER`, the folder `chat`) used to run the **coding agent**
+like every other chat, so its system prompt answered "the folder is empty, tell me what to build".
+A General chat now asks the **model server itself** — host side, one OpenAI-style streaming
+request, no tools — with a prompt that makes it talk like an assistant and tells it what is really
+happening on the board. Project chats are untouched.
+
+Commits on `agent/jobboard-next`: `d136e09` (the PLAN.md section, written before the code),
+`f9648ba` (the chat path, the hook and 31 tests), `77d7771` (mid-stream break note, the stuck-turn
+fix, 2 more tests) and the PLAN/report ticks here.
+
+### Files
+
+| file | what changed |
+| --- | --- |
+| `web/chat.py` | +328 lines (now 966). New section "general chat (job E)": `TALK_URL`, `TALK_MODEL`, `TALK_TEMP`, `TALK_TOKENS`, `TALK_TIMEOUT`, `TALK_HISTORY_MSGS`, `TALK_HISTORY_CHARS`, `TALK_BOARD_MAX`, `TALK_HINT` and the editable **`TALK_SYSTEM`** prompt; `is_general`, `brief`, `approval_of`, `board_block`, `history_messages`, `talk_messages`, `talk_stream`, `talk_items`, `TalkError` and **`run_talk_turn`**. `run_turn` hands a `GENERAL_FOLDER` record to it; `turn_items` reads a talk turn's own log (`talk_items`) instead of the agent-stream parser; `answer_text` joins streamed `delta` rows; `stop_turn` starts no kill thread for a talk turn; `open_chat_body`/`new_chat_body`/`chats_body` say which kind of chat it is; `CHAT_SCRIPT.add` draws `delta` rows into the open bubble. Now imports `urllib` and `decisions` (never `jobboard`). |
+| `web/jobboard.py` | 1 line: `chat_ctx()` gains `jobs=all_jobs`, so the board block is built from job records; the docstring says so. No route, guard or job behaviour changed. |
+| `web/tests/test_chat_general_talk.py` | **new, 698 lines, 33 tests** — 28 turn tests against a fake OpenAI-style server on a free 127.0.0.1 port, 5 page/script-wording tests. |
+| `PLAN.md`, `AGENT_REPORT.md` | the Job E findings + steps; this section |
+
+### How a General-chat turn runs
+
+- `POST /chat/new` (no folder picked) or `/chat/<id>/send` → `start_turn` → its own thread →
+  `run_turn` sees `folder == GENERAL_FOLDER` → `run_talk_turn`. The record is still re-checked with
+  `jobboard.check_record` first, and `refused` still means nothing was asked.
+- One `POST http://127.0.0.1:8080/v1/chat/completions` (`chat.TALK_URL`) with
+  `{"model": "local", "stream": true, "temperature": 0.4, "max_tokens": 700, "messages": […]}`.
+  `messages` is: **system** (`TALK_SYSTEM` + the board block) + the conversation so far
+  (`you`→user, `agent`→assistant) + the new message. **No tools, no session, no jail self-test and
+  no watchdog** — nothing runs, so there is nothing to jail or watch.
+- **History cap:** the last 30 messages, then the oldest dropped until the whole history fits in
+  20 000 characters. The message being answered is never dropped, and the copy `start_turn` already
+  wrote into the conversation is not counted twice.
+- **"Board right now"** (`board_block`) is built only from job metas: the running job (title,
+  folder, minutes so far, `(stopping)` if it is), the last five finished jobs
+  (`13 Nov 09:30 ✓ add dark mode; … ✗ fix the parser`), `Waiting for you: N waiting for your OK`
+  (a finished `done` job with nothing decided by U08 — `decisions.state` — plus a safety-stop count),
+  and `time.strftime("%A %d %B %Y, %H:%M")`. Every field goes through `brief()`, the finished list
+  stops where the block stops fitting, and the whole block is capped at `TALK_BOARD_MAX = 1500`.
+  Nothing a model wrote can get in.
+- **Streaming:** each `delta.content` is appended to the turn's own log
+  (`state/chats/<id>/<turn id>.jsonl`, one `{"type":"talk","k":"delta","t":…}` line per piece,
+  flushed at once) and read by the same `turn_items` → `dashboard.job_stream` SSE path with the same
+  byte-offset resume, so the page paints the answer as it arrives. `turn_status` still says
+  "Waiting for the model" while that file is empty. `answer_text` concatenates the pieces (agent
+  turns still join their blocks with blank lines), so the bubble, the saved message and the
+  talk-back text are the same string.
+- **States are the same ones:** `waiting` → `running` → `done` / `failed` / `stopped` (plus
+  `refused`, and `mark_interrupted` still catches a turn the board died in). Errors read
+  "The model server answered HTTP 503", "The model server did not answer (…)", "The model server
+  stopped answering in the middle (…)" or "The model server sent no answer"; the turn is `failed`
+  with `how=model_error` and no answer is saved.
+- **Stop** sets the turn's event and marks the record `stopping`; because there is no agent process,
+  `stop_turn` does **not** start `_kill_turn` (`stop_agent_process`/`stop_job_containers` are never
+  asked). `talk_stream` checks the event between chunks, closes the connection and returns what got
+  through, which is saved as the answer (`stopped`, `how=user_stop`, "Stopped by you").
+- **Thinking stays out:** a thinking model's `delta.reasoning_content` is never handed to the page,
+  never written to the log, never saved and never spoken. Only `delta.content` is.
+
+### Tests: 1050 → 1083, nothing deleted, skipped or weakened
+
+```
+cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests
+  before this job:  Ran 1050 tests in 330.543s   OK (skipped=2)
+  after  this job:  Ran 1083 tests in 337.896s   OK (skipped=2)      (+33, all in the new file)
+```
+
+Single modules (run while working, because the PC is short on memory):
+
+```
+-p test_chat_general_talk.py  -> Ran 33 tests,  OK   (run three times: no timing flakes)
+-p test_chat.py               -> Ran 50 tests,  OK   (project chats, the argv, the guard, the SSE)
+-p test_chat_general.py       -> Ran 3 tests,   OK
+-p test_chat_send_inplace.py  -> Ran 2 tests,   OK
+```
+
+What `test_chat_general_talk.py` pins, in short: a General turn asks `/v1/chat/completions` exactly
+once with `stream: true` and no `tools`, and `launch_agent`/`agent_argv`/`stop_agent_process` are
+patched to raise, so the agent path can not have run (no session, no job record either); the system
+message is `TALK_SYSTEM` plus the board block, and a second message comes back as
+`system, user, assistant, user` — the history is in the messages, not a session id; the block holds
+the running job's title/folder/minutes, the last five finished with ✓/✗ and their times, the
+approvals count (a merged job is decided, plain `done` ones are not) and today's date, and never the
+chat's own words — with 40 long records it stays under 1500 chars and shows exactly 5 marks, and an
+empty board says "Running: nothing / Waiting for you: nothing"; the history keeps the last 30 and
+then drops the oldest to fit 20 000 chars, never the new message; the first streamed piece is in the
+live rows while the turn is still `running`, the whole answer is one saved `agent` message, the SSE
+carries the `delta` rows and ends, and the log is resumed by byte offset (a half-written line shows
+on the next poll); a 503 / a refused connection / an answer of nothing / a connection that dies
+mid-stream each end the turn `failed` with a note that says so, and a record that fails
+`check_record` never reaches the model; Stop cuts the stream (answer is a strict prefix, the server
+sees the socket close, no `stop_agent_process` call, under 10 s) and a Stop pressed before the
+request went out asks nothing; `reasoning_content` appears in no row, answer, speech or raw log; a
+project chat still runs the fake agent (tool row + `the agent answered`, a session, the model
+endpoint never called); and the page/`new chat`/list wording says "Just talk — this chat can't
+change files" for General and keeps "runs the agent once in this folder" for a project, with the
+script still free of `innerHTML` and `node --check` clean.
+
+### Try it by hand
+
+1. Start the board as usual — `cd web && python3 jobboard.py` (port 8090). Nothing to reconfigure:
+   it asks the same Basalt on 127.0.0.1:8080 the morning report and the vision check already use.
+2. Open `http://127.0.0.1:8090/chat`, leave **General chat (no project)** picked, and ask
+   "what is running on my board?" or "what finished today?". The words should appear in the bubble
+   as they stream, the state line should read *Answered*, and the hint under the box reads
+   "Just talk — this chat can't change files". With Talk-back on it reads the answer aloud.
+3. Start a job first and ask the same question: the running job's title, folder and minutes should
+   be in the answer, because the board block was built from the records. Ask "add a test to my app"
+   and it should tell you to pick a project folder or start a job instead of pretending to do it.
+4. Press **Stop** while it is answering: the bubble keeps the first part, the state reads
+   *Stopped by you*, and a second message works straight away.
+5. Stop the model server (or use a PC where it is not running) and send a message: the turn turns
+   red with "The model server did not answer (…)" instead of sitting there.
+6. Pick a project folder in **New chat**: that chat behaves exactly as before (the agent, the
+   sandbox, the watchdog, `--resume`), and its hint still says each message runs the agent.
+7. On a phone (logged in, `http://<PC>:8090/chat`) the same General chat works with the mic button
+   and hands-free "agent …".
+
+### Unfinished / uncertain
+
+- **The real model was never asked.** The tests use a fake OpenAI-style server on a free
+  127.0.0.1 port; 8080 and 8090 are never contacted from a test. So the streaming parse, the caps,
+  the states, Stop and the prompt are proven against a spec-shaped server, not against Basalt's
+  exact JSON. Two things to watch on the first real try: if Basalt puts its answer somewhere other
+  than `choices[].delta.content` (or streams *everything* as reasoning), the bubble stays empty and
+  the turn ends "The model server sent no answer"; and `TALK_TOKENS = 700` may cut a long answer.
+- **The wording is a guess at what Jason likes.** `TALK_SYSTEM`, `TALK_TEMP = 0.4`,
+  `TALK_TOKENS = 700` and the board-block wording are constants at the top of `chat.py`, and only
+  their presence in the request is pinned by tests, not the model's behaviour.
+- **The board block only knows job records.** No bench verdicts, no queue detail, no decisions
+  waiting beyond "N waiting for your OK", and the running job is whichever record says `running`.
+  It is capped at 1500 characters, so with very many records the finished list can be shorter than
+  five (the running line and the counts always stay).
+- **No route-level test for a General chat.** The POST routes are unchanged and `start_turn` is what
+  they call, which the turn tests call too; the HTTP harness in `test_chat.py` only ever makes
+  project chats, so a General chat through a real `H` handler is not pinned here.
+- **A truncated stream that ends cleanly looks like a finished answer.** If the server sends some
+  content and closes without `[DONE]`, the turn is `done` with what arrived; only a reset
+  (`OSError`) is reported as a mid-stream break.
+- **`TALK_URL` is not configurable by env** (like `morningreport.CHAT_URL`, unlike
+  `visioncheck.MODEL_URL`); the board's own model server on this PC is assumed.
+- Nothing was pushed, merged or released; the work is on `agent/jobboard-next`. No build output —
+  this is the web app.
+

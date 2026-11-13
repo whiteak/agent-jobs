@@ -1368,9 +1368,12 @@ bare lists — `badges.py:source` does `rounds[-1].get("round")`, so a fixture s
       Stop cancels the stream; reasoning stays out of text and speech; a project chat still runs the
       agent (fake agent answers, the fake model server is never called). No test touches 8080/8090.
       (33 tests: 28 turns, 5 page.)
-- [ ] Full gate green; nothing deleted, skipped or weakened. Test counts before and after in
+- [x] Full gate green; nothing deleted, skipped or weakened. Test counts before and after in
       AGENT_REPORT.md.
-- [ ] AGENT_REPORT.md section: files, how to try it by hand, counts, what is unfinished.
+      (`cd web && PYTHONDONTWRITEBYTECODE=1 python3 -W ignore -m unittest discover -s tests` →
+      Ran 1083 tests in 337.896s, OK (skipped=2); 1050 before this job, measured on the branch
+      before any of its code. Single modules while working.)
+- [x] AGENT_REPORT.md section: files, how to try it by hand, counts, what is unfinished.
 
 ## What the tests found
 
