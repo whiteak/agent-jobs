@@ -20,14 +20,22 @@ State, outside everything the sandbox mounts (like the job/plan/queue/report rec
     state/chats/<id>.json             the conversation: folder, mode, session id, messages (with time)
     state/chats/<id>/<turn id>.jsonl  that turn's raw agent stream - what the live log reads
 
+Job E: "General chat (no project)" (folder chat.GENERAL_FOLDER) is not a coding task, so it does
+NOT run the agent. A turn there asks the local model server itself - host side, no tools, so no jail
+and no watchdog - and streams the answer into the same bubbles, the same turn record and the same
+states. run_turn hands that folder to run_talk_turn; every other folder runs the agent exactly as
+above. See "general chat" below.
+
 Standard library only.
 """
 from __future__ import annotations
 
 import html, json, re, secrets, threading, time
+import urllib.error, urllib.request
 from pathlib import Path
 
 import dashboard      # U07: the SSE loop and the live-log parser a chat page reuses
+import decisions      # U08: whether a finished job is still waiting for Jason (the board facts)
 import jailcfg        # JAIL: a local mode never gets the internet, chat turns included
 import phonelayout    # U09a: the phone rules (700 px, thumb-sized taps) this page follows
 import upgrades       # U01: EventLog + the watchdog settings a turn runs with
@@ -52,6 +60,37 @@ ANSWER_MAX = 20000                # the agent's reply as saved in the conversati
 SPEECH_MAX = 600                  # VOICE: longer than this, say the start and point at the screen
 SPEECH_TAIL = "The rest is on screen."
 CHAT_COLS = ("Started", "Project", "About", "Messages", "State")   # the chats table, in order
+
+# ---- General chat (job E): no project folder means no agent. The board asks the model server
+# itself - the same one the morning report asks - so there is nothing to jail and nothing to watch.
+TALK_URL = "http://127.0.0.1:8080/v1/chat/completions"
+TALK_MODEL = "local"                  # the server serves one model; the id is not a choice here
+TALK_TEMP = 0.4
+TALK_TOKENS = 700                     # an answer to talk about, not a report
+TALK_TIMEOUT = 180                    # the model may be busy with a job: waiting is normal
+TALK_HISTORY_MSGS = 30                # how much of the conversation goes back to the model...
+TALK_HISTORY_CHARS = 20000            # ... and what it is cut to (the oldest messages go first)
+TALK_BOARD_MAX = 1500                 # the "Board right now" block inside the system prompt
+TALK_HINT = "Just talk - this chat can't change files"
+
+# Edit this to change how a General chat sounds. It stays one plain-text prompt: the board facts
+# are appended to it by board_block(), never written by the model.
+TALK_SYSTEM = """You are Jason's assistant on the Agent Jobs board of his own home PC. This is a
+conversation, not a coding job.
+
+Talk the way a helpful person talks to a friend: warm, natural, plain sentences, no preamble and
+no section headings. Keep it to two or three sentences unless Jason asks for more - his replies are
+often read aloud. Plain text only: no markdown tables, no bullet lists, no code unless he asks.
+
+In this chat you have no tools: you cannot run a command, read a file or change anything, so never
+say you did. For coding work, tell him to pick a project folder in Chat or start a job on the board.
+
+The "Board right now" block below is copied out of the board's own job records. Use it for anything
+about his jobs, and never invent a job, a result, a folder or a time. If you don't know something,
+say so."""
+
+JOB_LIVE = ("running", "stopping")    # job-record states (the board block), not chat turn states
+JOB_OPEN = ("queued",) + JOB_LIVE
 
 LOCK = threading.RLock()          # one chat record is read-modified-written as a whole
 TURNS: dict[str, threading.Event] = {}    # turn id -> set when Stop was pressed for that turn
@@ -216,21 +255,35 @@ class TurnCtx:
 
 
 def turn_items(ctx, chats, cid, since=0):
-    """The live log of the turn the page is watching (U07's parser, this turn's own file)."""
+    """The live log of the turn the page is watching (U07's parser, this turn's own file). A
+    General-chat turn has a log of its own (job E), so it is parsed here instead."""
     rec, turn = current_turn(chats, cid)
     p = turn_log(chats, cid, turn.get("id"))
     if p is None:
         return [], since
+    if is_general(rec):
+        return talk_items(p, since)
     return ctx["events_at"](p, since)
 
 
 def answer_text(items):
     """The agent's own words: its assistant text, never a tool call, a tool's output or the
     summary line the runner prints at the end. A turn that never said anything has no answer -
-    that is how a turn stopped before the first words saves nothing."""
-    said = [str(it["t"]).strip() for it in items
-            if it.get("k") == "text" and str(it.get("t") or "").strip()]
-    return "\n\n".join(said).strip()
+    that is how a turn stopped before the first words saves nothing. A General-chat answer arrives
+    in streamed pieces (job E): its "delta" rows are joined as they came, with nothing between."""
+    parts, live = [], ""
+    for it in items:
+        k = it.get("k")
+        if k == "delta":
+            live += str(it.get("t") or "")
+        elif k == "text" and str(it.get("t") or "").strip():
+            if live.strip():
+                parts.append(live.strip())
+                live = ""
+            parts.append(str(it["t"]).strip())
+    if live.strip():
+        parts.append(live.strip())
+    return "\n\n".join(parts).strip()
 
 
 def speech_text(text, max_chars=SPEECH_MAX):
@@ -246,14 +299,238 @@ def speech_text(text, max_chars=SPEECH_MAX):
     return out.strip()
 
 
-def run_turn(ctx, cid, turn_id):
-    """ONE chat turn, in the thread start_turn() started. Same safety re-check and agent path as
-    a job (the record is re-read here, right before anything runs), and the turn's end state
-    comes from the same mapping run_agent_job uses - minus the gate."""
+# ---------------------------------------------------------------- general chat (job E)
+
+class TalkError(Exception):
+    """The model server could not answer a General-chat turn. The message is what the turn's note
+    says on the page, so it has to be something Jason can read."""
+
+
+def is_general(rec):
+    """A chat in the General folder is a conversation, not a coding task: no agent runs in it."""
+    return bool(rec) and rec.get("folder") == GENERAL_FOLDER
+
+
+def brief(text, max_chars=70):
+    """One record field as one short line - a job text can be a whole paragraph."""
+    return " ".join(str(text or "").split())[:max_chars]
+
+
+def approval_of(m):
+    """What U08 left decided about a finished job. Nothing on this board merges by itself, so a job
+    nobody has touched is still waiting for Jason (the same rule the morning report uses)."""
+    if m.get("decision_log"):
+        st = decisions.state(m)
+        for key, word in (("merge", "merged"), ("reject", "rejected"), ("changes", "changes"),
+                          ("conflict", "conflict")):
+            if st.get(key):
+                return word
+    return "waiting"
+
+
+def board_block(jobs, now=None, max_chars=TALK_BOARD_MAX):
+    """The "Board right now" part of the system prompt, built out of the board's job records and
+    nothing else - never out of anything a model wrote. What is running, the last five finished
+    jobs, what still waits for Jason, and the date and time. Capped: one enormous job text must
+    not push the conversation out of the prompt."""
+    now = time.time() if now is None else now
+    recs = [m for m in (jobs or ()) if isinstance(m, dict) and isinstance(m.get("status"), str)]
+    live = [m for m in recs if m["status"] in JOB_LIVE]
+    over = sorted((m for m in recs if m["status"] not in JOB_OPEN),
+                  key=lambda m: m.get("finished") or m.get("created") or 0, reverse=True)
+    waiting = sum(1 for m in over if m["status"] == "done" and approval_of(m) == "waiting")
+    safety = sum(1 for m in over if m["status"] == "safety_stop")
+    lines = ["Board right now, copied out of the board's own job records at "
+             + time.strftime("%A %d %B %Y, %H:%M", time.localtime(now)) + ":"]
+    if live:
+        m = live[0]
+        mins = int(max(0.0, now - (m.get("started") or m.get("created") or now)) // 60)
+        lines.append(f"Running: {brief(m.get('job') or m.get('id'))} in {brief(m.get('folder'), 30)}, "
+                     f"{mins} min so far" + (" (stopping)" if m["status"] == "stopping" else ""))
+    else:
+        lines.append("Running: nothing")
+    marks = []
+    for m in over[:5]:
+        mark = (f"{fmt_time(m.get('finished') or m.get('created'))} "
+                f"{'✓' if m['status'] == 'done' else '✗'} {brief(m.get('job') or m.get('id'), 50)}")
+        if len("\n".join(lines + ["Finished: " + "; ".join(marks + [mark])])) > max_chars:
+            break                                   # the list stops where the block stops fitting
+        marks.append(mark)
+    if marks:
+        lines.append("Finished: " + "; ".join(marks))
+    lines.append(f"Waiting for you: {waiting} waiting for your OK" if waiting
+                 else "Waiting for you: nothing")
+    if safety:
+        lines.append(f"Safety stops: {safety}")
+    out = "\n".join(lines)
+    return out if len(out) <= max_chars else out[:max_chars].rstrip()
+
+
+def history_messages(rec, max_msgs=TALK_HISTORY_MSGS, max_chars=TALK_HISTORY_CHARS):
+    """The conversation so far, the way the model wants it: the last max_msgs messages, then the
+    oldest dropped until what is left fits in max_chars. Never empty the chat out completely."""
+    roles = {"you": "user", "agent": "assistant"}
+    out = [{"role": roles[m["role"]], "content": str(m.get("text") or "")}
+           for m in (rec or {}).get("messages") or []
+           if isinstance(m, dict) and m.get("role") in roles]
+    out = out[-max_msgs:]
+    while len(out) > 1 and sum(len(m["content"]) for m in out) > max_chars:
+        out.pop(0)
+    return out
+
+
+def talk_messages(rec, text, jobs=None, now=None):
+    """What the model is asked: the system prompt with the board facts, the conversation so far,
+    and the new message. The board facts come from records, so a chat full of model talk cannot
+    make the model invent a job.
+
+    start_turn() has already put this turn's message into the conversation (so the page shows it
+    at once), so the copy at the end of the record is not counted twice."""
+    msgs = (rec or {}).get("messages") or []
+    if msgs and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "you" \
+            and msgs[-1].get("text") == text:
+        msgs = msgs[:-1]
+    history = history_messages(dict(rec or {}, messages=msgs))
+    system = TALK_SYSTEM + "\n\n" + board_block(jobs, now)
+    return [{"role": "system", "content": system}] + history + [{"role": "user", "content": text}]
+
+
+def talk_stream(messages, on_text, stopped=lambda: False, *, url=None, timeout=None,
+                opener=urllib.request.urlopen):
+    """Ask the local model server for an answer (OpenAI format, "stream": true) and hand every
+    piece of it to on_text as it arrives; the whole answer is returned. Nothing here runs a tool -
+    this is a plain chat request the board makes for itself, host side, with no sandbox.
+
+    A thinking model streams its reasoning separately (delta.reasoning / reasoning_content): that
+    is never passed to on_text, so it stays out of the bubble and out of the spoken reply.
+    stopped() ends the answer where it got to - the connection is closed, which is how Stop works
+    when there is no agent process to kill."""
+    body = {"model": TALK_MODEL, "stream": True, "temperature": TALK_TEMP,
+            "max_tokens": TALK_TOKENS, "messages": messages}
+    req = urllib.request.Request(url or TALK_URL, data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        resp = opener(req, timeout=timeout or TALK_TIMEOUT)
+    except urllib.error.HTTPError as ex:
+        raise TalkError(f"The model server answered HTTP {ex.code}") from ex
+    except OSError as ex:
+        raise TalkError(f"The model server did not answer ({str(ex) or type(ex).__name__})") from ex
+    said = []
+    with resp:
+        for raw in resp:
+            if stopped():
+                break                               # Stop pressed: keep what already got through
+            raw = raw.decode("utf-8", "replace").strip()
+            if not raw.startswith("data:"):
+                continue                            # "event:", a comment, a keepalive
+            part = raw[5:].strip()
+            if part == "[DONE]":
+                break
+            try:
+                part = json.loads(part)
+            except ValueError:
+                continue                            # a heartbeat, or a line cut in half
+            for choice in part.get("choices") or []:
+                bit = (choice.get("delta") or {}).get("content")
+                if isinstance(bit, str) and bit:
+                    said.append(bit)
+                    on_text(bit)
+    return "".join(said)
+
+
+def talk_items(path, since=0):
+    """The rows of a General-chat turn's own log. The same byte-offset rule jobboard.events_at
+    uses, because the SSE loop resumes with it: only whole lines count, so a chunk that was still
+    being written when the page asked shows up on the next poll."""
+    p = Path(path)
+    if not p.exists():
+        return [], since
+    with open(p, "rb") as f:
+        f.seek(since)
+        data = f.read()
+    cut = data.rfind(b"\n") + 1
+    data, nxt = data[:cut], since + cut
+    items = []
+    for raw in data.decode("utf-8", "replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("k") == "delta" and str(e.get("t") or ""):
+            items.append({"k": "delta", "t": str(e["t"])})
+    return items, nxt
+
+
+def run_talk_turn(ctx, cid, turn_id):
+    """ONE General-chat turn, in the thread start_turn() started. The same record re-check, the
+    same turn states, the same turn log the live stream reads and the same talk-back - only the
+    thing that answers is different: the model server, asked by the board itself. No agent process,
+    so no jail self-test, no watchdog and nothing for Stop to kill: the stream loop sees the stop
+    event and closes the connection."""
     chats = ctx["chats"]
     rec, turn = current_turn(chats, cid)
     if rec is None or turn.get("id") != turn_id:
         return None
+    problem = ctx["check"](turn_id, turn_meta(rec, turn))
+    if problem:
+        return patch_turn(chats, cid, turn_id, state="refused",
+                          note=f"Refused: the chat turn failed the safety check ({problem})")
+    log = turn_log(chats, cid, turn_id)
+    if log is None:
+        return patch_turn(chats, cid, turn_id, state="refused", note="Refused: bad turn log path")
+    msgs = talk_messages(rec, turn.get("text") or "", ctx["jobs"]())
+    patch_turn(chats, cid, turn_id, state="running")
+    if stop_pressed(turn_id):       # Stop landed before the request even went out
+        return patch_turn(chats, cid, turn_id, state="stopped", note="Stopped by you",
+                          finished=time.time(), how="user_stop", seconds=0)
+    started = time.time()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with log.open("w", encoding="utf-8") as fh:
+            def got(bit):
+                fh.write(json.dumps({"type": "talk", "k": "delta", "t": bit}, ensure_ascii=False)
+                         + "\n")
+                fh.flush()
+            text = talk_stream(msgs, got, lambda: stop_pressed(turn_id))
+    except TalkError as ex:
+        return patch_turn(chats, cid, turn_id, state="failed", note=str(ex), finished=time.time(),
+                          how="model_error", exit=1, seconds=int(time.time() - started))
+    except Exception as ex:            # a broken model server must not take the board down
+        return patch_turn(chats, cid, turn_id, state="failed",
+                          note=f"Could not ask the model: {str(ex)[:200]}", finished=time.time(),
+                          how="model_error", exit=1, seconds=int(time.time() - started))
+    stopped = stop_pressed(turn_id) or (current_turn(chats, cid)[1] or {}).get("state") == "stopping"
+    state, note, how = ("stopped", "Stopped by you", "user_stop") if stopped else ("done", "", None)
+    answer = text.strip()[:ANSWER_MAX]      # what answer_text() would have read back from the log
+    if not stopped and not answer:
+        state, note, how = "failed", "The model server sent no answer", "model_error"
+    with LOCK:
+        rec = load(chats, cid)
+        turn = (rec or {}).get("turn") or {}
+        if turn.get("id") == turn_id:
+            if answer:
+                rec["messages"].append({"role": "agent", "text": answer, "time": time.time()})
+            turn.update(state=state, note=note, finished=time.time(), how=how, exit=None,
+                        seconds=int(time.time() - started))
+            rec["turn"] = turn
+            rec["updated"] = time.time()
+            save(chats, rec)
+    return rec
+
+
+def run_turn(ctx, cid, turn_id):
+    """ONE chat turn, in the thread start_turn() started. Same safety re-check and agent path as
+    a job (the record is re-read here, right before anything runs), and the turn's end state
+    comes from the same mapping run_agent_job uses - minus the gate. A General-chat record goes to
+    run_talk_turn instead: no agent, no sandbox, the model server asked by the board itself."""
+    chats = ctx["chats"]
+    rec, turn = current_turn(chats, cid)
+    if rec is None or turn.get("id") != turn_id:
+        return None
+    if is_general(rec):
+        return run_talk_turn(ctx, cid, turn_id)
     meta = turn_meta(rec, turn)
     log = turn_log(chats, cid, turn_id)
     problem = ctx["check"](turn_id, meta)
@@ -396,6 +673,9 @@ def stop_turn(ctx, cid):
         rec["turn"] = turn
         rec["updated"] = time.time()
         save(chats, rec)
+        general = is_general(rec)
+    if general:       # job E: a General-chat turn has no process to kill - the stream loop sees
+        return tid    # the event above and closes the connection to the model itself
     threading.Thread(target=_kill_turn, args=(ctx, cid, tid), daemon=True).start()
     return tid
 
@@ -485,13 +765,16 @@ def chats_body(chats, here=None, limit=50):
             f'<tbody>{rows}</tbody></table></div>'
             f'<p class="hint">A chat is one continuing conversation with the agent in one project folder: '
             f'each message runs it once, in the same session, with the sandbox and the watchdog a job '
-            f'gets - but no checks and no checkpoints. Chats are saved in ~/agent-sandbox/state/chats.</p></div>')
+            f'gets - but no checks and no checkpoints. A General chat has no project, so no agent '
+            f'runs: the board asks the model itself and nothing here can change a file. Chats are '
+            f'saved in ~/agent-sandbox/state/chats.</p></div>')
 
 
 def open_chat_body(ctx, rec, note=""):
     chats = ctx["chats"]
     cid = rec["id"]
     s = turn_status(chats, rec)
+    general = is_general(rec)
     bubbles = "".join(bubble_html(m) for m in rec.get("messages") or [])
     hidden = "" if s["state"] == "waiting" else " hidden"
     waiting = (f'<div class="sys" id="waiting"{hidden}>Waiting for the model - '
@@ -500,22 +783,32 @@ def open_chat_body(ctx, rec, note=""):
                 f'<button class="ghost">Stop</button></form>') if s["can_stop"] else ""
     note_html = f'<p class="warn2">{esc(note)}</p>' if note else ""
     state_note = f" - {esc(s['note'])}" if s["note"] else ""
+    where = ("General chat (no project)" if general
+             else f'~/agent-work/{esc(rec["folder"])}')
+    ask = ("Ask anything: what is running, what happened today, what needs you. Hold the mic "
+           "button to talk, or say &quot;agent&quot; and then your question." if general
+           else "Ask the agent about this project. Hold the mic button to talk, or say "
+                "&quot;agent&quot; and then your question.")
+    hint = (f'{TALK_HINT}: the board asks the model itself, so it knows what is going on on the '
+            f'board right now, but it cannot run a command or touch a file here. For coding work, '
+            f'start a chat with a project folder picked, or start a job.') if general else (
+           f'Each message runs the agent once in this folder ({esc(rec["mode"])}, offline, in the '
+           f'sandbox, watched by the watchdog) and continues the same conversation. No checks are '
+           f'run and nothing is committed for a chat turn.')
     return f"""
-<div class="card chat"><h2>Chat <span class="mut">~/agent-work/{esc(rec["folder"])}</span>
+<div class="card chat"><h2>Chat <span class="mut">{esc(where)}</span>
  <a class="ghost2 btn-sm" href="/chat">New chat</a></h2>
 <div class="chatlog" id="chatlog">{bubbles or '<p class="mut">Say something to start the conversation.</p>'}
 <div id="live">{waiting}</div></div>
 <form method="post" action="/chat/{esc(cid)}/send" id="chatform">
 <label class="vh" for="chattext">Message</label>
 <textarea name="text" id="chattext" data-voice="chat" maxlength="{MSG_MAX}" required
- placeholder="Ask the agent about this project. Hold the mic button to talk, or say &quot;agent&quot; and then your question."></textarea>
+ placeholder="{ask}"></textarea>
 <button id="chatsend">Send</button></form>
 <div class="chatfoot"><span class="hint c-{esc(s["state"])}" id="chatstate">{esc(s["label"])}{state_note}</span>
 {stopform}{note_html}
 </div>
-<p class="hint">Each message runs the agent once in this folder ({esc(rec["mode"])}, offline, in the
-sandbox, watched by the watchdog) and continues the same conversation. No checks are run and
-nothing is committed for a chat turn.</p>
+<p class="hint">{hint}</p>
 </div>
 <script>
 {CHAT_SCRIPT.replace("@@CID@@", json.dumps(cid)).replace("@@STATE@@", json.dumps(s["state"]))}
@@ -538,7 +831,8 @@ def new_chat_body(ctx, form=None, error=""):
  placeholder="Ask the agent something about that project. You can hold the mic button and talk instead."></textarea>
 {f'<p class="bad">{esc(error)}</p>' if error else ""}
 <button>Start chat</button></form>
-<p class="hint">The first message starts a new conversation; the ones after it continue it.</p></div>"""
+<p class="hint">The first message starts a new conversation; the ones after it continue it.
+With no project picked no agent runs: {TALK_HINT}.</p></div>"""
 
 
 CHAT_SCRIPT = """
@@ -559,10 +853,12 @@ function scroll(){if(stick)log.scrollTop=log.scrollHeight}
 function textBubble(){if(!bubble){bubble=el("div","bub agent");bubble.appendChild(el("div","btext"));feed.appendChild(bubble)}return bubble}
 function add(it){
  if(it.k==="text"){const b=textBubble().lastChild;b.textContent+=(b.textContent?"\\n\\n":"")+it.t;scroll()}
+ else if(it.k==="delta"){const b=textBubble().lastChild;b.textContent+=it.t;scroll()}
  else if(it.k==="tool"){bubble=null;const d=el("div","tline "+(it.cat||"other"));d.appendChild(el("span","v",VERB[it.cat]||VERB.other));d.appendChild(el("code",null,it.t));feed.appendChild(d);scroll()}
  else if(it.k==="gate"){bubble=null;feed.appendChild(el("div","sys",it.t));scroll()}
  // a tool's output, the agent's thinking and raw log lines stay out of the chat: one tool call
- // is one line, and the answer is the agent's own words
+ // is one line, and the answer is the agent's own words. A General-chat answer arrives in pieces
+ // (job E): every delta goes onto the open bubble, with nothing added between them.
 }
 function addItems(items){items.forEach(add)}
 function apply(s){

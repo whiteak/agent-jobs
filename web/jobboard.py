@@ -811,13 +811,15 @@ def chat_ctx():
     """CHAT (job D): what chat.py may use - and it is deliberately the same agent path a job
     uses: check_record re-runs the safety check on the turn record right before it runs, launch_agent
     runs the one agent process under the watchdog, and the stop pair is the board's own Stop path.
-    chat.py never imports jobboard, so this is the only place the two are tied together."""
+    chat.py never imports jobboard, so this is the only place the two are tied together.
+    CHAT (job E): `jobs` is the job-record list the "Board right now" block of a General chat is
+    built from - records only, never anything a model wrote."""
     return dict(chats=CHATS, work=WORK, settings=SETTINGS_FILE, modes=MODES,
                 check=check_record, launch=launch_agent, argv=agent_argv,
                 stop_process=stop_agent_process, stop_containers=upgrades.stop_job_containers,
                 is_local=jailcfg.is_local, selftest=jailcfg.selftest,
                 events_at=events_at, session_at=session_at, folders=folders,
-                readonly=READONLY, mode=chat.CHAT_MODE)
+                jobs=all_jobs, readonly=READONLY, mode=chat.CHAT_MODE)
 
 def build_review_md(m):
     """Build the review bundle right after an agent job ends and save it to
